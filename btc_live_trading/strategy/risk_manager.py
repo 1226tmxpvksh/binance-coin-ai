@@ -45,3 +45,40 @@ def calculate_position_size(
 def calculate_position_value(position_size: float, entry_price: float) -> float:
     """포지션 가치 계산 (USDT)"""
     return position_size * entry_price
+
+
+def stop_loss_price_long(entry_price: float, stop_loss_pct: float) -> float:
+    """롱: 진입가 대비 -stop_loss_pct % 가격."""
+    if entry_price <= 0 or stop_loss_pct <= 0:
+        return 0.0
+    return entry_price * (1.0 - stop_loss_pct / 100.0)
+
+
+def unrealized_pnl_usdt(
+    side: str,
+    entry_price: float,
+    position_size: float,
+    mark_price: float,
+) -> float:
+    if side == "LONG":
+        return position_size * (mark_price - entry_price)
+    if side == "SHORT":
+        return position_size * (entry_price - mark_price)
+    return 0.0
+
+
+def krw_to_usdt(amount_krw: float, krw_per_usdt: float) -> float:
+    if krw_per_usdt <= 0:
+        return 0.0
+    return amount_krw / krw_per_usdt
+
+
+def tp_target_usdt_from_krw(tp_profit_krw: float, krw_per_usdt: float) -> float:
+    return krw_to_usdt(tp_profit_krw, krw_per_usdt)
+
+
+def should_take_profit_by_pnl_usdt(
+    unrealized_pnl_usdt_value: float,
+    target_profit_usdt: float,
+) -> bool:
+    return unrealized_pnl_usdt_value >= target_profit_usdt

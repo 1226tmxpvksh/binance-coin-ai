@@ -34,6 +34,7 @@
 - **성과 분석**: 수익률, 승률, 최대 낙폭, 샤프 비율 등
 - **시각화**: 자본 곡선, 거래 분포, 월별 수익 등
 - **전략 비교**: 원본 설정 vs 실전 설정 비교 (`compare_strategies.py`)
+- **전략 확장성**: 엔진은 **일봉 변동성 돌파**에 최적화되어 있으나, **지표·진입/청산·리스크 모듈을 바꿔 끼우는 구조**라서 단기 봉·금액 기준 익절 같은 **단타(Scalping) 로직도 동일한 백테스트 파이프라인으로 검증**할 수 있습니다. (실전 단타는 `btc_live_trading`의 `scalping_engine.py` / `strategy/scalping_strategy.py` 참고 — 필요 시 본 폴더에 `backtest_scalping_*.py` 등을 추가해 과거 데이터로 재현)
 
 ### 공유 모듈 (실전 매매와 공유)
 - `indicators.py` - 지표 계산 (EMA, SMA, ATR 등)
@@ -249,6 +250,9 @@ MIN_POSITION_SIZE_USDT = 20  # 바이낸스 최소
 ### Q7: 백테스트 기간을 바꾸려면?
 → `config.py`에서 `START_DATE`와 `END_DATE` 수정
 
+### Q8: 단타(AI Scalping) 전략도 여기서 백테스트하나요?
+→ 현재 기본 `main.py`는 **일봉 전략**입니다. 다만 **백테스트 엔진 + 지표/전략 모듈 분리 구조**이므로, `btc_live_trading`과 동일한 RSI·볼린저·금액 익절 규칙을 이쪽에 옮겨 **캔들 루프만 짧은 타임프레임으로 바꾼 스크립트**를 추가하면 같은 방식으로 검증할 수 있습니다.
+
 ## ⚠️ 주의사항
 
 **이 프로그램은 백테스트 전용입니다.**
@@ -261,6 +265,12 @@ MIN_POSITION_SIZE_USDT = 20  # 바이낸스 최소
 ## 🔗 참고 자료
 
 - [바이낸스 API 문서](https://binance-docs.github.io/apidocs/futures/en/)
+- 실전 **일봉 / AI 단타**: `../btc_live_trading/README2.md`
+
+## 로드맵 (참고)
+
+- [ ] 단타 전용 백테스트 스크립트 추가 시, 기존 `backtest_engine.py` 패턴 재사용
+- [ ] 운영 환경에서는 Docker·모니터링(Zabbix 등) 연동 검토
 
 ## 📝 라이선스
 
