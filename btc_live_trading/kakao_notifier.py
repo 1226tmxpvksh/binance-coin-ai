@@ -535,6 +535,16 @@ class KakaoNotifier:
             f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         return self.send_message(title, description)
+
+    def notify_no_entry(self, market_state: str, reason: str):
+        """당일 신규 진입이 없는 사유 알림"""
+        title = "ℹ️ 오늘 신규 진입 없음"
+        description = (
+            f"시장 상태: {market_state}\n"
+            f"사유: {reason}\n"
+            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        return self.send_message(title, description)
     
     def notify_daily_summary(
         self,
@@ -599,141 +609,4 @@ class KakaoNotifier:
             f"MARKET 주문으로 재시도 중...\n"
             f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        return self.send_message(title, description)
-
-    @staticmethod
-    def _scalping_goal_footer(achievement_pct: float, remaining_krw: float) -> str:
-        return (
-            f"\n\n월 목표 달성률: {achievement_pct:.1f}%\n"
-            f"이번 달 구독료 목표(10만 원)까지 남은 금액: {remaining_krw:,.0f}원"
-        )
-
-    def notify_scalping_start(
-        self,
-        achievement_pct: float,
-        remaining_krw: float,
-        dry_run: bool = False,
-    ):
-        title = "⚡ 스캘핑(AI 단타) 시작"
-        description = (
-            f"모드: TRADING_MODE=scalping\n"
-            f"DRY_RUN: {'예 (시뮬)' if dry_run else '아니오 (실주문)'}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ) + self._scalping_goal_footer(achievement_pct, remaining_krw)
-        return self.send_message(title, description)
-
-    def notify_scalping_signal(
-        self,
-        symbol: str,
-        side: str,
-        price: float,
-        rule_reason: str,
-        achievement_pct: float,
-        remaining_krw: float,
-    ):
-        title = f"📈 스캘핑 진입 신호 ({symbol})"
-        description = (
-            f"방향: {side}\n"
-            f"가격: ${price:,.2f}\n"
-            f"규칙: {rule_reason}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ) + self._scalping_goal_footer(achievement_pct, remaining_krw)
-        return self.send_message(title, description)
-
-    def notify_scalping_ai_rejected(
-        self,
-        symbol: str,
-        reason: str,
-        achievement_pct: float,
-        remaining_krw: float,
-    ):
-        title = f"🤖 AI 진입 보류 ({symbol})"
-        description = (
-            f"fail_closed: AI 미승인 또는 API 오류\n"
-            f"사유: {reason}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ) + self._scalping_goal_footer(achievement_pct, remaining_krw)
-        return self.send_message(title, description)
-
-    def notify_scalping_filled(
-        self,
-        symbol: str,
-        entry_price: float,
-        size: float,
-        stop_loss: float,
-        tp_target_usdt: float,
-        achievement_pct: float,
-        remaining_krw: float,
-    ):
-        title = f"✅ 스캘핑 체결 ({symbol})"
-        description = (
-            f"진입가: ${entry_price:,.2f}\n"
-            f"수량: {size:.6f}\n"
-            f"손절: ${stop_loss:,.2f} (-5%%)\n"
-            f"익절 목표: 약 ${tp_target_usdt:.2f} USDT (설정 원화 환산)\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ) + self._scalping_goal_footer(achievement_pct, remaining_krw)
-        return self.send_message(title, description)
-
-    def notify_scalping_closed(
-        self,
-        symbol: str,
-        entry_price: float,
-        exit_price: float,
-        pnl: float,
-        reason: str,
-        achievement_pct: float,
-        remaining_krw: float,
-        balance_usdt: float,
-    ):
-        sign = "+" if pnl >= 0 else ""
-        title = f"🏁 스캘핑 청산 ({symbol})"
-        description = (
-            f"진입: ${entry_price:,.2f} → 청산: ${exit_price:,.2f}\n"
-            f"손익: {sign}${pnl:,.2f}\n"
-            f"사유: {reason}\n"
-            f"추정 잔고: ${balance_usdt:,.2f}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ) + self._scalping_goal_footer(achievement_pct, remaining_krw)
-        return self.send_message(title, description)
-
-    def notify_scalping_confirm_wait(
-        self,
-        seconds: int,
-        achievement_pct: float,
-        remaining_krw: float,
-    ):
-        title = "⏳ 스캘핑 진입 대기"
-        description = (
-            f"{seconds}초 후 자동 진행(카카오 수신 확인 불가)\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ) + self._scalping_goal_footer(achievement_pct, remaining_krw)
-        return self.send_message(title, description)
-
-    def notify_error_scalping(
-        self,
-        message: str,
-        achievement_pct: float,
-        remaining_krw: float,
-    ):
-        title = "❌ 스캘핑 오류"
-        description = (
-            f"{message}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ) + self._scalping_goal_footer(achievement_pct, remaining_krw)
-        return self.send_message(title, description)
-
-    def notify_emergency_stop_scalping(
-        self,
-        reason: str,
-        total_loss: float,
-        achievement_pct: float,
-        remaining_krw: float,
-    ):
-        title = "🚨 스캘핑 긴급 정지"
-        description = (
-            f"사유: {reason}\n"
-            f"참고 손실: ${total_loss:,.2f}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ) + self._scalping_goal_footer(achievement_pct, remaining_krw)
         return self.send_message(title, description)

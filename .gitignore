@@ -1,0 +1,76 @@
+# 환경변수 및 민감한 정보
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 가상환경
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 로그
+*.log
+logs/
+*.log.*
+
+# 백업 파일
+*.bak
+*.backup
+*~
+
+# 거래 데이터
+trades.json
+positions.json
+*.csv
+
+# 임시 파일
+tmp/
+temp/
+*.tmp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# 테스트
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 기타
+.cache/

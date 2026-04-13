@@ -22,13 +22,12 @@ from strategy.risk_manager import calculate_position_size, calculate_position_va
 
 logger = logging.getLogger(__name__)
 
-# TRANSFER 보정 금액이 이 값(USDT) 이상일 때만 INFO 로그
 _TRANSFER_NET_LOG_THRESHOLD_USDT = 0.01
 
 
 class LiveTradingEngine:
     """실시간 매매 엔진"""
-    
+
     def __init__(
         self,
         config: Dict[str, Any],
@@ -37,69 +36,56 @@ class LiveTradingEngine:
         safety_manager,
         notifier
     ):
-        """
-        Args:
-            config: 설정 딕셔너리
-            order_executor: 주문 실행기
-            position_manager: 포지션 관리자
-            safety_manager: 안전장치 관리자
-            notifier: 알림 모듈
-        """
         self.config = config
         self.executor = order_executor
         self.position_mgr = position_manager
         self.safety = safety_manager
         self.notifier = notifier
-        
+
         self.is_running = False
         self.last_check_date = None
-    
+
     def start(self):
         """매매 엔진 시작"""
-        
         self.is_running = True
-        
-        # 시작 알림
+
         if self.config['DRY_RUN']:
             self.notifier.notify_dry_run_mode()
         else:
             self.notifier.notify_start()
-        
-        # 레버리지 설정
+
         self.executor.set_leverage(self.config['LEVERAGE'])
-        
+
         logger.info(
             f"설정: 심볼={self.config['SYMBOL']}, "
             f"레버리지={self.config['LEVERAGE']}x, "
             f"DRY_RUN={self.config['DRY_RUN']}"
         )
-    
+
     def stop(self):
         """매매 엔진 중지"""
         logger.info("매매 엔진 중지")
         self.is_running = False
-        
-        # 포지션이 있으면 경고
+
         if self.position_mgr.has_position():
             logger.warning("⚠️ 포지션이 남아있습니다!")
-    
+
     def check_and_trade(self, data_fetcher) -> bool:
         """
         시장 체크 및 거래 실행
-        
+
         Args:
             data_fetcher: 데이터 가져오기 함수
-        
+
         Returns:
             bool: 계속 실행 여부
         """
         try:
-            # 1. 계좌 잔고 조회
             balance = self.executor.get_account_balance()
             if balance is None:
                 logger.error("잔고 조회 실패")
                 return True
-            
+
             min_entry_balance = self.config['MIN_TRADING_BALANCE_USDT']
             if (
                 not self.position_mgr.has_position()
@@ -111,8 +97,7 @@ class LiveTradingEngine:
                 )
                 self.notifier.notify_insufficient_balance(balance, min_entry_balance)
                 return True
-            
-            # 2. 안전장치 체크 (긴급 정지 %: 바이낸스 TRANSFER로 입출금 보정)
+
             transfer_net = self.executor.get_futures_net_transfer_usdt_since(
                 self.safety.initial_capital_baseline_ms
             )
@@ -127,34 +112,32 @@ class LiveTradingEngine:
                     f"긴급 정지용 TRANSFER 누적(기준 시각 이후): {transfer_net:,.2f} USDT "
                     "(입금+, 출금-; 순잔고 산출 시 반영)"
                 )
+
             can_trade, reason = self.safety.can_trade(
                 balance,
                 external_transfer_net_usdt=transfer_net,
             )
             if not can_trade:
                 logger.warning(f"거래 불가: {reason}")
-                
+
                 if self.safety.emergency_stopped:
                     self.notifier.notify_emergency_stop(
                         reason,
                         self.safety.initial_capital - balance
                     )
-                    return False  # 프로그램 종료
-                
-                return True  # 계속 모니터링
-            
-            # 3. 데이터 가져오기
+                    return False
+
+                return True
+
             data = data_fetcher()
             if data is None or data.empty:
                 logger.error("데이터 가져오기 실패")
                 return True
-            
-            # 4. 데이터 검증 (최소 2행 필요: current, prev)
+
             if len(data) < 2:
                 logger.error(f"데이터 부족: {len(data)}개 캔들 (최소 2개 필요)")
                 return True
 
-            # 5. 지표 계산
             data = add_all_indicators(
                 data,
                 self.config['EMA_SHORT_PERIOD'],
@@ -163,48 +146,41 @@ class LiveTradingEngine:
                 self.config['ATR_PERIOD'],
                 self.config['VOLUME_MA_PERIOD']
             )
-            
-            # 6. 최신 데이터 (NaN 체크)
+
             current = data.iloc[-1]
             prev = data.iloc[-2]
             if (
-                current['ema_short'] != current['ema_short']  # NaN 체크
+                current['ema_short'] != current['ema_short']
                 or prev['vol_ma'] != prev['vol_ma']
                 or prev['atr'] != prev['atr']
             ):
                 logger.warning("지표 계산 미완료 (NaN): 데이터 부족. 거래 보류")
                 return True
 
-            # 7. 포지션 관리
-            
             logger.info(
                 f"현재가: ${current['close']:,.2f}, "
                 f"EMA20: ${current['ema_short']:,.2f}, "
                 f"EMA60: ${current['ema_long']:,.2f}"
             )
-            
+
             if self.position_mgr.has_position():
-                # 청산 체크
                 self._check_exit(current, prev, balance)
             else:
-                # 진입 체크
                 self._check_entry(current, prev, data, balance)
-            
+
             return True
-            
-        except Exception as e:
-            logger.error(f"체크 및 거래 중 오류: {e}", exc_info=True)
-            self.notifier.notify_error(str(e))
+
+        except Exception as exc:
+            logger.error(f"체크 및 거래 중 오류: {exc}", exc_info=True)
+            self.notifier.notify_error(str(exc))
             return True
-    
+
     def _check_entry(self, current, prev, data, balance):
         """진입 체크 및 실행"""
-        
-        # 일일 거래 횟수 체크
         if not self.safety.check_trade_limit():
+            self.notifier.notify_no_entry("LIMIT_BLOCKED", "일일 거래 횟수 한도 도달")
             return
-        
-        # 시장 상태 판단
+
         market_state = determine_market_state(
             current['close'],
             current['ema_short'],
@@ -212,12 +188,12 @@ class LiveTradingEngine:
             current['sma_long'],
             current['sma_slope']
         )
-        
+
         if market_state == MarketState.NEUTRAL:
             logger.debug("중립 구간: 거래 안 함")
+            self.notifier.notify_no_entry("NEUTRAL", "시장 국면이 중립 구간입니다")
             return
-        
-        # K값 계산
+
         atr_lookback = data['atr'].tail(self.config['ATR_PERIOD'])
         atr_max = atr_lookback.max()
         k_value = calculate_k_value(
@@ -225,8 +201,7 @@ class LiveTradingEngine:
             atr_max,
             self.config['K_MAX']
         )
-        
-        # 진입 신호 평가
+
         current_data = {
             'high': current['high'],
             'low': current['low'],
@@ -234,31 +209,98 @@ class LiveTradingEngine:
             'close': current['close'],
             'volume': current['volume']
         }
-        
+
         prev_data = {
             'high': prev['high'],
             'low': prev['low'],
             'volume': prev['volume'],
             'vol_ma': prev['vol_ma']
         }
-        
+
         signal = evaluate_entry_signal(
             market_state.value,
             current_data,
             prev_data,
             k_value
         )
-        
-        # 진입 신호가 있으면 주문 실행
-        if signal is not None and signal != PositionSide.NONE:
-            self._execute_entry(
-                signal.value,
-                current['close'],
-                current['atr'],
-                balance,
-                market_state.value
+
+        if signal is None or signal == PositionSide.NONE:
+            no_entry_reason = self._build_no_entry_reason(
+                market_state,
+                current_data,
+                prev_data,
+                k_value
             )
-    
+            self.notifier.notify_no_entry(market_state.value, no_entry_reason)
+            return
+
+        self._execute_entry(
+            signal.value,
+            current['close'],
+            current['atr'],
+            balance,
+            market_state.value
+        )
+
+    def _build_no_entry_reason(
+        self,
+        market_state: MarketState,
+        current_data: Dict[str, float],
+        prev_data: Dict[str, float],
+        k_value: float
+    ) -> str:
+        """진입 실패 사유를 사람이 읽기 쉬운 문구로 생성"""
+        vol_ma = prev_data.get('vol_ma', 0.0)
+        prev_volume = prev_data.get('volume', 0.0)
+
+        if vol_ma is None or (isinstance(vol_ma, float) and (vol_ma != vol_ma or vol_ma <= 0)):
+            return "거래량 이동평균(vol_ma)이 유효하지 않아 진입을 보류했습니다"
+
+        volume_condition = prev_volume > vol_ma
+
+        if market_state == MarketState.BULL:
+            breakout_price = current_data['open'] + (
+                (prev_data['high'] - prev_data['low']) * k_value
+            )
+            breakout_condition = current_data['high'] > breakout_price
+
+            if not volume_condition and not breakout_condition:
+                return (
+                    "롱 조건 미충족: 돌파와 거래량 조건이 모두 부족합니다 "
+                    f"(high={current_data['high']:.2f}, breakout={breakout_price:.2f}, "
+                    f"prev_volume={prev_volume:.0f}, vol_ma={vol_ma:.0f})"
+                )
+            if not breakout_condition:
+                return (
+                    "롱 돌파 미충족: "
+                    f"high({current_data['high']:.2f}) <= breakout({breakout_price:.2f})"
+                )
+            return (
+                "롱 거래량 미충족: "
+                f"prev_volume({prev_volume:.0f}) <= vol_ma({vol_ma:.0f})"
+            )
+
+        breakout_price = current_data['open'] - (
+            (prev_data['high'] - prev_data['low']) * k_value
+        )
+        breakout_condition = current_data['low'] < breakout_price
+
+        if not volume_condition and not breakout_condition:
+            return (
+                "숏 조건 미충족: 돌파와 거래량 조건이 모두 부족합니다 "
+                f"(low={current_data['low']:.2f}, breakout={breakout_price:.2f}, "
+                f"prev_volume={prev_volume:.0f}, vol_ma={vol_ma:.0f})"
+            )
+        if not breakout_condition:
+            return (
+                "숏 돌파 미충족: "
+                f"low({current_data['low']:.2f}) >= breakout({breakout_price:.2f})"
+            )
+        return (
+            "숏 거래량 미충족: "
+            f"prev_volume({prev_volume:.0f}) <= vol_ma({vol_ma:.0f})"
+        )
+
     def _execute_entry(
         self,
         side: str,
@@ -268,8 +310,6 @@ class LiveTradingEngine:
         market_state: str
     ):
         """진입 주문 실행"""
-        
-        # 손절/익절 계산
         stop_loss, take_profit = calculate_initial_stops(
             entry_price,
             atr,
@@ -277,8 +317,7 @@ class LiveTradingEngine:
             self.config['STOP_LOSS_MULTIPLIER'],
             self.config['TAKE_PROFIT_MULTIPLIER']
         )
-        
-        # 포지션 사이즈 계산
+
         position_size = calculate_position_size(
             balance,
             entry_price,
@@ -286,12 +325,11 @@ class LiveTradingEngine:
             self.config['RISK_PER_TRADE'],
             self.config['LEVERAGE']
         )
-        
+
         if position_size <= 0:
             logger.warning("포지션 사이즈가 0입니다. 진입 취소")
             return
-        
-        # 최소 주문 크기 체크
+
         position_value = calculate_position_value(position_size, entry_price)
         if position_value < self.config['MIN_POSITION_SIZE_USDT']:
             logger.warning(
@@ -299,60 +337,50 @@ class LiveTradingEngine:
                 f"${self.config['MIN_POSITION_SIZE_USDT']}"
             )
             return
-        
-        # 진입 신호 알림
+
         self.notifier.notify_entry_signal(
             side,
             entry_price,
             market_state,
             "변동성 돌파"
         )
-        
-        # 주문 실행
+
         if side == "LONG":
             order = self.executor.open_long_position(position_size)
         else:
             order = self.executor.open_short_position(position_size)
-        
+
         if order is None:
             logger.error("주문 실행 실패")
             self.notifier.notify_error("주문 실행 실패")
             return
-        
-        # 실제 체결 가격 (DRY RUN에서는 현재가 사용)
+
         filled_price = float(order.get('avgPrice', entry_price))
-        
-        # 손절/익절 주문을 바이낸스에 등록
         close_side = "SELL" if side == "LONG" else "BUY"
-        
-        # 손절 주문 등록
+
         stop_order = self.executor.place_stop_loss_order(
             close_side,
             position_size,
             stop_loss
         )
-        
-        # 익절 주문 등록
+
         tp_order = self.executor.place_take_profit_order(
             close_side,
             position_size,
             take_profit
         )
-        
-        # 주문 등록 실패 시 진입 주문 취소
+
         if stop_order is None or tp_order is None:
             logger.error("손절/익절 주문 등록 실패! 진입 주문 취소 시도...")
-            
-            # 진입 포지션 즉시 청산
+
             if side == "LONG":
                 self.executor.close_long_position(position_size)
             else:
                 self.executor.close_short_position(position_size)
-            
+
             self.notifier.notify_error("손절/익절 주문 등록 실패로 진입 취소")
             return
-        
-        # 포지션 관리자에 등록
+
         self.position_mgr.open_position(
             side=side,
             entry_price=filled_price,
@@ -363,11 +391,9 @@ class LiveTradingEngine:
             stop_order_id=stop_order.get('orderId'),
             tp_order_id=tp_order.get('orderId')
         )
-        
-        # 안전장치 업데이트
+
         self.safety.increment_daily_trades()
-        
-        # 체결 알림
+
         self.notifier.notify_order_filled(
             side,
             filled_price,
@@ -376,7 +402,7 @@ class LiveTradingEngine:
             take_profit,
             position_value
         )
-        
+
         logger.info(
             f"✅ 진입 완료 + 손절/익절 주문 바이낸스 등록 완료 "
             f"(Stop ID: {stop_order.get('orderId')}, TP ID: {tp_order.get('orderId')})"

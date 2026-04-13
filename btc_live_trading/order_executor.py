@@ -280,7 +280,7 @@ class OrderExecutor:
         except Exception as e:
             logger.error(f"지정가 주문 중 오류: {type(e).__name__}")
             return None
-    
+
     def check_order_status(self, order_id: str) -> Optional[str]:
         """
         주문 상태 확인

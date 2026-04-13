@@ -10,6 +10,3 @@ requests>=2.31.0
 
 # 환경 변수 관리
 python-dotenv>=1.0.0
-
-# OpenAI (스캘핑 AI 컨펌)
-openai>=1.12.0

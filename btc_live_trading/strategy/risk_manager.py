@@ -8,6 +8,11 @@ from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# 보수적 손절 폭 권장 범위: ATR 1.5x ~ 2.0x
+DEFAULT_ATR_STOP_MULTIPLIER = 1.8
+MIN_ATR_STOP_MULTIPLIER = 1.5
+MAX_ATR_STOP_MULTIPLIER = 2.0
+
 
 def calculate_position_size(
     account_balance: float,
@@ -28,7 +33,7 @@ def calculate_position_size(
     price_risk_per_coin = abs(entry_price - stop_loss)
 
     if price_risk_per_coin == 0:
-        logger.error("손절가와 진입가가 동일합니다")
+        logger.warning("손절가와 진입가가 동일함 -> 변동성 부족으로 인한 대기")
         return 0.0
 
     position_size = risk_amount / price_risk_per_coin
@@ -47,38 +52,12 @@ def calculate_position_value(position_size: float, entry_price: float) -> float:
     return position_size * entry_price
 
 
-def stop_loss_price_long(entry_price: float, stop_loss_pct: float) -> float:
-    """롱: 진입가 대비 -stop_loss_pct % 가격."""
-    if entry_price <= 0 or stop_loss_pct <= 0:
-        return 0.0
-    return entry_price * (1.0 - stop_loss_pct / 100.0)
-
-
-def unrealized_pnl_usdt(
-    side: str,
-    entry_price: float,
-    position_size: float,
-    mark_price: float,
-) -> float:
-    if side == "LONG":
-        return position_size * (mark_price - entry_price)
-    if side == "SHORT":
-        return position_size * (entry_price - mark_price)
-    return 0.0
-
-
-def krw_to_usdt(amount_krw: float, krw_per_usdt: float) -> float:
-    if krw_per_usdt <= 0:
-        return 0.0
-    return amount_krw / krw_per_usdt
-
-
-def tp_target_usdt_from_krw(tp_profit_krw: float, krw_per_usdt: float) -> float:
-    return krw_to_usdt(tp_profit_krw, krw_per_usdt)
-
-
-def should_take_profit_by_pnl_usdt(
-    unrealized_pnl_usdt_value: float,
-    target_profit_usdt: float,
-) -> bool:
-    return unrealized_pnl_usdt_value >= target_profit_usdt
+def calculate_stop_loss_by_atr(entry_price: float, atr: float, side: str, atr_multiplier: float = DEFAULT_ATR_STOP_MULTIPLIER) -> float:
+    """
+    ATR 기반 손절가 계산.
+    기본값은 보수적으로 1.8배를 사용하며, 권장 범위는 1.5~2.0배.
+    """
+    m = max(MIN_ATR_STOP_MULTIPLIER, min(MAX_ATR_STOP_MULTIPLIER, atr_multiplier))
+    if side.upper() == "SELL":
+        return entry_price + (atr * m)
+    return entry_price - (atr * m)

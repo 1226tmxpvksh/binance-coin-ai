@@ -57,26 +57,6 @@ logging.basicConfig(
 for handler in logging.root.handlers:
     handler.addFilter(SensitiveDataFilter())
 
-
-def _reconfigure_logging(level_str: str, log_file: str) -> None:
-    """TRADING_MODE=scalping 시 config_scalping 로그 파일로 전환."""
-    root = logging.getLogger()
-    for h in list(root.handlers):
-        root.removeHandler(h)
-    logging.basicConfig(
-        level=LOG_LEVEL_MAP.get(level_str, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file, encoding="utf-8"),
-        ],
-        force=True,
-    )
-    for handler in logging.root.handlers:
-        handler.addFilter(SensitiveDataFilter())
-
-
 logger = logging.getLogger(__name__)
 
 # API 키 마스킹하여 로그 기록
@@ -273,34 +253,34 @@ def main():
                     
                     logger.info("✅ 일일 요약 전송 완료")
                     logger.info("🔄 통계 초기화 완료")
-                    
+
                     # 다음 9시까지 정확히 대기 계산
                     from datetime import timedelta
                     next_9am = (now + timedelta(days=1)).replace(hour=config.DAILY_REPORT_HOUR, minute=0, second=0, microsecond=0)
                     wait_seconds = (next_9am - datetime.now()).total_seconds()
-                    
+
                     logger.info(f"\n💤 다음 거래: {next_9am.strftime('%Y-%m-%d %H:%M')}")
                     logger.info(f"   대기 시간: {wait_seconds/3600:.1f}시간")
-                    
+
                     time.sleep(wait_seconds)
                 else:
                     # 9시가 아니거나 이미 실행됨
                     # 다음 9시까지 대기
                     from datetime import timedelta
-                    
+
                     if current_hour < config.DAILY_REPORT_HOUR:
                         # 오늘 9시
                         next_9am = now.replace(hour=config.DAILY_REPORT_HOUR, minute=0, second=0, microsecond=0)
                     else:
                         # 내일 9시
                         next_9am = (now + timedelta(days=1)).replace(hour=config.DAILY_REPORT_HOUR, minute=0, second=0, microsecond=0)
-                    
+
                     wait_seconds = (next_9am - now).total_seconds()
-                    
+
                     logger.info(f"\n💤 거래 시간 아님 ({now.strftime('%H:%M')})")
                     logger.info(f"   다음 거래: {next_9am.strftime('%Y-%m-%d %H:%M')}")
                     logger.info(f"   대기 시간: {wait_seconds/3600:.1f}시간")
-                    
+
                     time.sleep(wait_seconds)
             except KeyboardInterrupt:
                 logger.warning("사용자에 의해 중단됨")
@@ -348,160 +328,13 @@ def main():
         sys.exit(1)
 
 
-def main_scalping():
-    """TRADING_MODE=scalping — 폴링 단타 엔진."""
-    import config_scalping as sc
-    from binance.client import Client
-    from goal_tracker import GoalTracker
-    from order_executor import OrderExecutor
-    from scalping_engine import ScalpingEngine
-    from scalping_position_manager import ScalpingPositionManager
-    from safety_manager import SafetyManager
-    from utils.ai_advisor import AiAdvisor
-
-    _reconfigure_logging(sc.LOG_LEVEL, sc.LOG_FILE)
-    log = logging.getLogger(__name__)
-    log.info("TRADING_MODE=scalping 시작 (DRY_RUN=%s)", sc.DRY_RUN)
-
-    client = Client(sc.API_KEY, sc.API_SECRET)
-    local_time = int(time.time() * 1000)
-    try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/time", timeout=5)
-        if r.status_code == 200:
-            futures_server_time = r.json()["serverTime"]
-            client.time_offset = futures_server_time - local_time - 1500
-            log.info("Futures 시간 동기화 오프셋: %sms", client.time_offset)
-        else:
-            raise ValueError("Futures time API 실패")
-    except Exception as e:
-        log.warning("Futures 시간 조회 실패, Spot 시도: %s", e)
-        server_time = client.get_server_time()
-        client.time_offset = server_time["serverTime"] - local_time - 2000
-        log.info("Spot 시간 동기화 오프셋: %sms", client.time_offset)
-
-    if sc.KAKAO_ENABLED:
-        kakao = KakaoNotifier(
-            access_token=sc.KAKAO_ACCESS_TOKEN,
-            enabled=True,
-            rest_api_key=sc.KAKAO_REST_API_KEY,
-        )
-        notifier = AsyncNotifier(kakao, max_queue_size=100)
-        notifier.start()
-        log.info("카카오톡 알림 활성화 (스캘핑)")
-    else:
-        notifier = SilentNotifier()
-        log.warning("카카오톡 비활성화")
-
-    executors = {
-        sym: OrderExecutor(client, sym, sc.DRY_RUN) for sym in sc.SCALPING_SYMBOLS
-    }
-    first_ex = next(iter(executors.values()))
-    initial_balance = first_ex.get_account_balance()
-    if initial_balance is None:
-        raise ValueError("초기 잔고 조회 실패")
-
-    safety_mgr = SafetyManager(
-        initial_capital=initial_balance,
-        daily_max_loss_percent=sc.DAILY_MAX_LOSS_PERCENT,
-        emergency_stop_loss_percent=sc.EMERGENCY_STOP_LOSS_PERCENT,
-        max_trades_per_day=sc.MAX_TRADES_PER_DAY,
-    )
-    goals = GoalTracker(sc.MONTHLY_TARGET_KRW, sc.KRW_PER_USDT)
-    pos_mgr = ScalpingPositionManager()
-    ai_adv = AiAdvisor(sc.OPENAI_API_KEY, sc.OPENAI_MODEL) if sc.USE_AI_CONFIRM else None
-
-    config_dict = {
-        "SCALPING_SYMBOLS": sc.SCALPING_SYMBOLS,
-        "TIMEFRAME": sc.TIMEFRAME,
-        "LEVERAGE": sc.LEVERAGE,
-        "RSI_PERIOD": sc.RSI_PERIOD,
-        "BB_PERIOD": sc.BB_PERIOD,
-        "BB_STD": sc.BB_STD,
-        "STOP_LOSS_PCT": sc.STOP_LOSS_PCT,
-        "TP_PROFIT_KRW": sc.TP_PROFIT_KRW,
-        "KRW_PER_USDT": sc.KRW_PER_USDT,
-        "RISK_PER_TRADE": sc.RISK_PER_TRADE,
-        "MIN_POSITION_SIZE_USDT": sc.MIN_POSITION_SIZE_USDT,
-        "MIN_TRADING_BALANCE_USDT": sc.MIN_TRADING_BALANCE_USDT,
-        "DRY_RUN": sc.DRY_RUN,
-        "USE_AI_CONFIRM": sc.USE_AI_CONFIRM,
-        "REQUIRE_USER_CONFIRM": sc.REQUIRE_USER_CONFIRM,
-        "CONFIRM_TIMEOUT_SECONDS": sc.CONFIRM_TIMEOUT_SECONDS,
-    }
-
-    engine = ScalpingEngine(
-        config=config_dict,
-        client=client,
-        executors=executors,
-        position_manager=pos_mgr,
-        safety_manager=safety_mgr,
-        notifier=notifier,
-        goal_tracker=goals,
-        ai_advisor=ai_adv,
-    )
-
-    try:
-        engine.start()
-        while True:
-            if not engine.run_once():
-                log.critical("스캘핑 긴급 정지로 종료")
-                break
-            time.sleep(sc.POLL_INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        log.warning("사용자 중단")
-    finally:
-        engine.stop()
-        if hasattr(notifier, "stop"):
-            notifier.stop()
-
-    log.info("스캘핑 메인 종료")
-
-
 if __name__ == "__main__":
-    trading_mode = os.getenv("TRADING_MODE", "day").strip().lower()
-
-    if trading_mode == "scalping":
-        import config_scalping as sc
-
-        print("\n" + "=" * 60)
-        print("⚠️  TRADING_MODE=scalping (AI 단타)")
-        print("=" * 60)
-        print(f"DRY_RUN: {sc.DRY_RUN}")
-        print(f"USE_AI_CONFIRM: {sc.USE_AI_CONFIRM} (장애 시 fail_closed)")
-
-        if sc.DRY_RUN:
-            print("✅ 테스트 모드: 실제 주문 없음.")
-        else:
-            print("🚨 실전 스캘핑: 실제 주문이 나갈 수 있습니다.")
-            if sys.stdin.isatty():
-                print("\n계속하려면 'YES' 입력:")
-                confirm = input().strip()
-                if not SecureComparison.constant_time_compare(confirm, "YES"):
-                    print("취소합니다.")
-                    sys.exit(0)
-            else:
-                raw = os.environ.get(
-                    sc.SCALPING_LIVE_CONFIRMED_ENV, ""
-                ).strip()
-                if not SecureComparison.constant_time_compare(
-                    raw, sc.SCALPING_LIVE_CONFIRMED_VALUE
-                ):
-                    print(
-                        "비대화형 실전 거부. 설정: "
-                        f"Environment={sc.SCALPING_LIVE_CONFIRMED_ENV}="
-                        f"{sc.SCALPING_LIVE_CONFIRMED_VALUE}"
-                    )
-                    sys.exit(1)
-
-        main_scalping()
-        sys.exit(0)
-
-    # 일봉 변동성 돌파 (기본)
+    # 최종 확인
     print("\n" + "=" * 60)
     print("⚠️⚠️⚠️  경고  ⚠️⚠️⚠️")
     print("=" * 60)
     print(f"DRY_RUN 모드: {config.DRY_RUN}")
-
+    
     if config.DRY_RUN:
         print("✅ 테스트 모드: 실제 주문이 실행되지 않습니다.")
     else:
@@ -530,5 +363,5 @@ if __name__ == "__main__":
                     "를 정확히 설정하세요."
                 )
                 sys.exit(1)
-
+    
     main()
