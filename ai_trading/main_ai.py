@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
-
-from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
@@ -50,20 +49,116 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
+ENV_LINE_MAP: Dict[str, int] = {}
 
 
 def _load_env() -> None:
-    # 우선순위: ai_trading/.env > btc_live_trading/.env > root/.env
-    candidates = [BASE_DIR / ".env", LIVE_DIR / ".env", ROOT_DIR / ".env"]
-    for path in candidates:
-        if path.exists():
-            load_dotenv(path, override=False)
+    explicit_env = Path(r"C:\Users\1226t\Desktop\Coin\btc_live_trading\.env")
+    target_env = explicit_env if explicit_env.exists() else (LIVE_DIR / ".env")
+    if not target_env.exists():
+        logger.error(".env not found at expected path: %s", target_env)
+        return
+    _index_env_lines(target_env)
+    _diagnose_env_section_4(target_env)
+    _load_env_file_safely(target_env)
+
+
+def _index_env_lines(env_path: Path) -> None:
+    ENV_LINE_MAP.clear()
+    key_pattern = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
+    with open(env_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for i, line in enumerate(f, start=1):
+            m = key_pattern.match(line)
+            if m:
+                ENV_LINE_MAP[m.group(1)] = i
+
+
+def _load_env_file_safely(env_path: Path) -> None:
+    with open(env_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for i, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "=" not in stripped:
+                logger.error("Malformed .env line %d: missing '='", i)
+                continue
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if not key:
+                logger.error("Malformed .env line %d: empty key", i)
+                continue
+            os.environ.setdefault(key, value)
+
+
+def _diagnose_env_section_4(env_path: Path) -> None:
+    """
+    '# 4.' 운영 설정 섹션에서 인코딩 문제가 의심되는 라인을 라인번호와 함께 로그.
+    """
+    in_section_4 = False
+    with open(env_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for i, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if stripped.startswith("# 4."):
+                in_section_4 = True
+                continue
+            if in_section_4 and stripped.startswith("# ") and re.match(r"#\s*\d+\.", stripped):
+                in_section_4 = False
+            if not in_section_4:
+                continue
+            if "\ufffd" in line:
+                logger.error("Encoding issue near section 4 at line %d: replacement character detected", i)
+
+
+def _sanitize_env_value(name: str, value: str) -> str:
+    raw = value or ""
+    cleaned = "".join(ch for ch in raw if ch.isascii() and (ch.isprintable() or ch in "\t ")).strip()
+    if cleaned != raw.strip():
+        line = ENV_LINE_MAP.get(name, -1)
+        line_info = f" (line {line})" if line > 0 else ""
+        logger.warning(
+            "Sanitized non-ASCII/invisible chars from %s%s. Keep .env values ASCII-only.",
+            name,
+            line_info,
+        )
+    return cleaned
+
+
+def _env_str(name: str, default: str) -> str:
+    return _sanitize_env_value(name, os.getenv(name, default))
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _sanitize_env_value(name, os.getenv(name, str(default)))
+    try:
+        return float(raw)
+    except ValueError:
+        line = ENV_LINE_MAP.get(name, -1)
+        line_info = f" at line {line}" if line > 0 else ""
+        logger.error("Invalid float for %s%s: %r. Using default=%s", name, line_info, raw, default)
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _sanitize_env_value(name, os.getenv(name, str(default)))
+    try:
+        return int(raw)
+    except ValueError:
+        line = ENV_LINE_MAP.get(name, -1)
+        line_info = f" at line {line}" if line > 0 else ""
+        logger.error("Invalid int for %s%s: %r. Using default=%s", name, line_info, raw, default)
+        return int(default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _sanitize_env_value(name, os.getenv(name, str(default).lower())).lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _build_stop_loss(snapshot: Dict[str, float], decision: str) -> float:
     price = float(snapshot["price"])
     atr = float(snapshot["atr14"])
-    atr_multiplier = float(os.getenv("AI_ATR_STOP_MULTIPLIER", "1.8"))
+    atr_multiplier = _env_float("AI_ATR_STOP_MULTIPLIER", 1.8)
     if decision == "BUY":
         return price - (atr * atr_multiplier)
     if decision == "SELL":
@@ -186,15 +281,15 @@ def _today_decision_counters() -> Tuple[int, int]:
 def run_once() -> Dict[str, Any]:
     _load_env()
 
-    symbol = os.getenv("AI_SYMBOL", "BTCUSDT")
-    interval = os.getenv("AI_TIMEFRAME", "5m")
-    account_balance = float(os.getenv("AI_ACCOUNT_BALANCE_USDT", "1000"))
-    leverage = int(os.getenv("AI_LEVERAGE", "3"))
-    risk_per_trade = float(os.getenv("AI_RISK_PER_TRADE", "0.01"))
-    dry_run = os.getenv("AI_DRY_RUN", "true").lower() == "true"
-    model = os.getenv("OPENAI_MODEL", "gpt-4o")
-    monthly_profit_krw = float(os.getenv("AI_MONTHLY_PROFIT_KRW", "0"))
-    krw_per_usdt = float(os.getenv("KRW_PER_USDT", "1350"))
+    symbol = _env_str("AI_SYMBOL", "BTCUSDT")
+    interval = _env_str("AI_TIMEFRAME", "5m")
+    account_balance = _env_float("AI_ACCOUNT_BALANCE_USDT", 1000.0)
+    leverage = _env_int("AI_LEVERAGE", 3)
+    risk_per_trade = _env_float("AI_RISK_PER_TRADE", 0.01)
+    dry_run = _env_bool("AI_DRY_RUN", True)
+    model = _env_str("OPENAI_MODEL", "gpt-4o")
+    monthly_profit_krw = _env_float("AI_MONTHLY_PROFIT_KRW", 0.0)
+    krw_per_usdt = _env_float("KRW_PER_USDT", 1350.0)
 
     backtest_summary = load_backtest_summary(str(BACKTEST_DIR))
     snapshot = fetch_market_snapshot(symbol=symbol, interval=interval, limit=250)
