@@ -43,8 +43,11 @@ from strategy.risk_manager import calculate_position_size
 
 try:
     from kakao_notifier import KakaoNotifier
+    from kakao_utils import get_access_token, hydrate_tokens_from_json as _hydrate_kakao_tokens
 except Exception:
     KakaoNotifier = None
+    _hydrate_kakao_tokens = None  # type: ignore
+    get_access_token = None  # type: ignore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -167,13 +170,18 @@ def _build_stop_loss(snapshot: Dict[str, float], decision: str) -> float:
 
 
 def _notify_kakao(title: str, body: str) -> None:
-    if KakaoNotifier is None:
+    if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
         return
-    access = os.getenv("KAKAO_ACCESS_TOKEN", "")
-    rest = os.getenv("KAKAO_REST_API_KEY", "")
-    if not access:
+    _hydrate_kakao_tokens()
+    access = get_access_token()
+    rest = os.getenv("KAKAO_REST_API_KEY", "").strip()
+    if not access or not rest:
         return
-    notifier = KakaoNotifier(access_token=access, enabled=True, rest_api_key=rest)
+    notifier = KakaoNotifier(
+        access_token=access,
+        enabled=True,
+        rest_api_key=rest,
+    )
     notifier.send_message(title, body)
 
 
@@ -280,6 +288,8 @@ def _today_decision_counters() -> Tuple[int, int]:
 
 def run_once() -> Dict[str, Any]:
     _load_env()
+    if _hydrate_kakao_tokens is not None:
+        _hydrate_kakao_tokens()
 
     symbol = _env_str("AI_SYMBOL", "BTCUSDT")
     interval = _env_str("AI_TIMEFRAME", "5m")

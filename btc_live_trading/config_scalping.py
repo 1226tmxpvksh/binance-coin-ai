@@ -7,6 +7,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+try:
+    from kakao_utils import hydrate_tokens_from_json
+
+    hydrate_tokens_from_json()
+except Exception:
+    pass
+
 API_KEY = os.getenv("BINANCE_API_KEY", os.getenv("API_KEY", ""))
 API_SECRET = os.getenv("BINANCE_API_SECRET", os.getenv("API_SECRET", ""))
 

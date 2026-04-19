@@ -9,7 +9,15 @@ import json
 import os
 from typing import Optional
 from datetime import datetime
-from getpass import getpass
+
+from kakao_utils import (
+    apply_token_response,
+    exchange_authorization_code,
+    get_redirect_uri,
+    get_refresh_token,
+    hydrate_tokens_from_json,
+    refresh_access_token_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,18 +28,26 @@ MAX_MESSAGE_LENGTH = 1000
 class KakaoNotifier:
     """카카오톡 알림 클래스"""
     
-    def __init__(self, access_token: str, enabled: bool = True, rest_api_key: str = ""):
+    def __init__(
+        self,
+        access_token: str,
+        enabled: bool = True,
+        rest_api_key: str = "",
+        redirect_uri: Optional[str] = None,
+    ):
         """
         Args:
             access_token: 카카오 REST API 액세스 토큰
             enabled: 알림 활성화 여부
             rest_api_key: 카카오 REST API 키 (토큰 재발급용)
+            redirect_uri: OAuth 리다이렉트 URI (미지정 시 KAKAO_REDIRECT_URI 또는 기본값)
         """
         self.access_token = access_token
         self.enabled = enabled
         self.rest_api_key = rest_api_key
         self.api_url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
-        self.redirect_uri = "https://example.com/oauth"
+        self.redirect_uri = (redirect_uri or get_redirect_uri()).strip()
+        self._first_403_disable = True
     
     def send_message(self, title: str, description: str, retry_count: int = 0) -> bool:
         """
@@ -116,40 +132,21 @@ class KakaoNotifier:
                 logger.error("⚠️ 카카오톡 메시지 전송 권한이 없습니다! (403)")
                 logger.error("=" * 80)
                 logger.error("")
+                auth_url = ""
                 if self.rest_api_key and self.rest_api_key != "your_rest_api_key_here":
-                    auth_url = f"https://kauth.kakao.com/oauth/authorize?client_id={self.rest_api_key}&redirect_uri={self.redirect_uri}&response_type=code"
+                    auth_url = (
+                        f"https://kauth.kakao.com/oauth/authorize?"
+                        f"client_id={self.rest_api_key}&redirect_uri={self.redirect_uri}&response_type=code"
+                    )
                 logger.error("🔗 토큰 재발급 URL (브라우저에서 열기):")
                 logger.error(f"   {auth_url}")
                 logger.error("=" * 80)
-                
-                if not skip_403_prompt:
-                    # 첫 번째 403 에러에서만 알림 비활성화
+
+                if self._first_403_disable:
                     self.enabled = False
+                    self._first_403_disable = False
                     logger.warning("카카오톡 알림이 자동으로 비활성화되었습니다.")
-                
-                return False
-            elif response.status_code == 401:
-                
-                if self.rest_api_key and self.rest_api_key != "your_rest_api_key_here":
-                    auth_url = f"https://kauth.kakao.com/oauth/authorize?client_id={self.rest_api_key}&redirect_uri={self.redirect_uri}&response_type=code"
-                    logger.error("🔗 토큰 재발급 URL (브라우저에서 열기):")
-                    logger.error(f"   {auth_url}")
-                    logger.error("")
-                    logger.error("📝 토큰 재발급 방법:")
-                    logger.error("   3. 리다이렉트된 URL에서 'code=' 뒤의 값 복사")
-                    logger.error("   4. 아래에서 새 토큰 입력")
-                    logger.error("=" * 80)
-                    
-                    # 토큰 재발급 시도
-                    self._prompt_token_refresh()
-                else:
-                    logger.error("🔗 토큰 재발급 URL 형식:")
-                    logger.error("   https://kauth.kakao.com/oauth/authorize?")
-                    logger.error("     client_id={YOUR_REST_API_KEY}")
-                    logger.error("     &redirect_uri=https://example.com/oauth")
-                    logger.error("     &response_type=code")
-                    logger.error("=" * 80)
-                
+
                 return False
             else:
                 # 응답 내용에서 민감한 정보 제거
@@ -178,21 +175,19 @@ class KakaoNotifier:
         Returns:
             bool: 갱신 성공 여부
         """
-        # 리프레시 토큰이 환경변수에 있는지 확인
-        refresh_token = os.getenv("KAKAO_REFRESH_TOKEN", "")
-        
+        hydrate_tokens_from_json()
+        refresh_token = get_refresh_token()
+
         if refresh_token and refresh_token != "your_refresh_token_here":
-            # 리프레시 토큰으로 자동 갱신
             logger.info("리프레시 토큰을 사용하여 액세스 토큰 자동 갱신 중...")
             new_token = self._refresh_access_token(refresh_token)
-            
+
             if new_token:
                 self.access_token = new_token
-                self._update_env_file(new_token)
                 logger.info("✅ 액세스 토큰 자동 갱신 완료")
                 return True
-            else:
-                logger.warning("리프레시 토큰 갱신 실패, 수동 갱신 필요")
+
+            logger.warning("리프레시 토큰 갱신 실패, 수동 갱신 필요")
         
         # 리프레시 토큰이 없으면 수동 갱신 프롬프트
         logger.warning("리프레시 토큰이 없습니다. 수동 토큰 갱신이 필요합니다.")
@@ -221,73 +216,20 @@ class KakaoNotifier:
         Returns:
             새로운 액세스 토큰 (실패 시 None)
         """
-        try:
-            token_url = "https://kauth.kakao.com/oauth/token"
-            data = {
-                "grant_type": "refresh_token",
-                "client_id": self.rest_api_key,
-                "refresh_token": refresh_token
-            }
-            
-            response = requests.post(token_url, data=data, timeout=10)
-            
-            if response.status_code == 200:
-                token_data = response.json()
-                access_token = token_data.get("access_token")
-                
-                # 새 리프레시 토큰도 있으면 업데이트
-                new_refresh_token = token_data.get("refresh_token")
-                if new_refresh_token:
-                    logger.info("새 리프레시 토큰도 발급되었습니다 (자동 저장됨)")
-                    self._update_refresh_token(new_refresh_token)
-                
-                return access_token
-            else:
-                # 보안: 에러 메시지에서 민감한 정보 제거
-                try:
-                    error_data = response.json()
-                    error_type = error_data.get("error", "unknown_error")
-                    logger.error(f"토큰 갱신 실패: {error_type}")
-                except:
-                    logger.error(f"토큰 갱신 실패: HTTP {response.status_code}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"토큰 갱신 요청 오류: {type(e).__name__}")
+        if not self.rest_api_key or self.rest_api_key == "your_rest_api_key_here":
+            logger.error("KAKAO_REST_API_KEY가 없어 토큰을 갱신할 수 없습니다.")
             return None
-    
-    def _update_refresh_token(self, refresh_token: str):
-        """리프레시 토큰을 .env 파일에 업데이트"""
         try:
-            env_path = os.path.join(os.path.dirname(__file__), '.env')
-            
-            if not os.path.exists(env_path):
-                return
-            
-            # .env 파일 읽기
-            with open(env_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            # KAKAO_REFRESH_TOKEN 줄 찾아서 업데이트
-            updated = False
-            for i, line in enumerate(lines):
-                if line.strip().startswith('KAKAO_REFRESH_TOKEN='):
-                    lines[i] = f'KAKAO_REFRESH_TOKEN={refresh_token}\n'
-                    updated = True
-                    break
-            
-            # 없으면 추가
-            if not updated:
-                lines.append(f'\nKAKAO_REFRESH_TOKEN={refresh_token}\n')
-            
-            # .env 파일 쓰기
-            with open(env_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            
-            logger.info("리프레시 토큰 업데이트 완료")
-            
+            token_data = refresh_access_token_request(self.rest_api_key, refresh_token)
+            access_token = token_data.get("access_token")
+            if token_data.get("refresh_token"):
+                logger.info("새 리프레시 토큰도 발급되었습니다 (자동 저장됨)")
+            if access_token:
+                apply_token_response(token_data)
+            return access_token
         except Exception as e:
-            logger.error(f"리프레시 토큰 업데이트 실패: {type(e).__name__}")
+            logger.error("토큰 갱신 요청 오류: %s", type(e).__name__)
+            return None
     
     def _prompt_token_refresh(self):
         """토큰 재발급 인터랙티브 프롬프트"""
@@ -319,20 +261,13 @@ class KakaoNotifier:
             new_token = self._get_access_token_from_code(auth_code)
             
             if new_token:
-                # .env 파일 업데이트
-                self._update_env_file(new_token)
-                
-                # 현재 인스턴스 토큰 업데이트
+                # 현재 인스턴스 토큰 업데이트 (_get_access_token_from_code에서 이미 저장됨)
                 self.access_token = new_token
                 self.enabled = True
 
                 print("=" * 80)
                 logger.info("카카오톡 토큰 갱신 완료")
-                
-                # 갱신 후 테스트 메시지 전송 (403 에러 무시)
-                print("\n🧪 새 토큰으로 테스트 메시지 전송 중...")
-                
-                # 테스트 메시지 전송
+
                 print("\n🧪 새 토큰으로 테스트 메시지 전송 중...")
                 
                 self.enabled = True  # 테스트를 위해 활성화
@@ -363,73 +298,25 @@ class KakaoNotifier:
     def _get_access_token_from_code(self, auth_code: str) -> Optional[str]:
         """Authorization Code로 액세스 토큰 발급"""
         try:
-            token_url = "https://kauth.kakao.com/oauth/token"
-            data = {
-                "grant_type": "authorization_code",
-                "client_id": self.rest_api_key,
-                "redirect_uri": self.redirect_uri,
-                "code": auth_code
-            }
-            
-            response = requests.post(token_url, data=data, timeout=10)
-            
-            if response.status_code == 200:
-                token_data = response.json()
-                access_token = token_data.get("access_token")
-                
-                # 리프레시 토큰도 자동 저장 (장기 사용 가능)
-                refresh_token = token_data.get("refresh_token")
-                if refresh_token:
-                    # 보안: 토큰 일부만 로그에 표시
-                    masked_token = refresh_token[:8] + "..." + refresh_token[-4:] if len(refresh_token) > 12 else "***"
-                    logger.info(f"리프레시 토큰도 발급되었습니다: {masked_token}")
-                    self._update_refresh_token(refresh_token)
-                    logger.info("💡 리프레시 토큰이 .env에 저장되어 다음부터 자동 갱신됩니다!")
-                
-                return access_token
-            else:
-                error_data = response.json()
-                error_msg = error_data.get("error_description", "알 수 없는 오류")
-                logger.error(f"토큰 발급 실패: {error_msg}")
-                return None
-                
+            token_data = exchange_authorization_code(
+                self.rest_api_key, self.redirect_uri, auth_code
+            )
+            access_token = token_data.get("access_token")
+            refresh_token = token_data.get("refresh_token")
+            if refresh_token:
+                masked_token = (
+                    refresh_token[:8] + "..." + refresh_token[-4:]
+                    if len(refresh_token) > 12
+                    else "***"
+                )
+                logger.info("리프레시 토큰도 발급되었습니다: %s", masked_token)
+                logger.info("리프레시 토큰이 저장되어 다음부터 자동 갱신됩니다.")
+            if access_token:
+                apply_token_response(token_data)
+            return access_token
         except Exception as e:
-            logger.error(f"토큰 발급 요청 오류: {type(e).__name__}")
+            logger.error("토큰 발급 요청 오류: %s", type(e).__name__)
             return None
-    
-    def _update_env_file(self, new_token: str):
-        """..env 파일에 새 토큰 저장"""
-        try:
-            env_path = os.path.join(os.path.dirname(__file__), '.env')
-            
-            if not os.path.exists(env_path):
-                logger.warning(".env 파일을 찾을 수 없습니다")
-                return
-            
-            # .env 파일 읽기
-            with open(env_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            # KAKAO_ACCESS_TOKEN 줄 찾아서 업데이트
-            updated = False
-            for i, line in enumerate(lines):
-                if line.strip().startswith('KAKAO_ACCESS_TOKEN='):
-                    lines[i] = f'KAKAO_ACCESS_TOKEN={new_token}\n'
-                    updated = True
-                    break
-            
-            # 없으면 추가
-            if not updated:
-                lines.append(f'\nKAKAO_ACCESS_TOKEN={new_token}\n')
-            
-            # .env 파일 쓰기
-            with open(env_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            
-            logger.info(".env 파일 업데이트 완료")
-            
-        except Exception as e:
-            logger.error(f".env 파일 업데이트 실패: {type(e).__name__}")
     
     def notify_start(self):
         """프로그램 시작 알림"""
