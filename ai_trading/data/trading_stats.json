@@ -1,5 +1,26 @@
 {
+  "period": "2026-04",
+  "last_reset_at_kst": "2026-04-19T22:49:27.718222+09:00",
+  "initial_balance_krw": 500000.0,
+  "initial_balance_usdt": 362.0,
+  "virtual_balance_krw": 500000.0,
+  "virtual_balance_usdt": 362.0,
+  "total_realized_pnl_krw": 0.0,
+  "total_realized_pnl_usdt": 0.0,
+  "monthly_realized_pnl_krw": 0.0,
+  "monthly_realized_pnl_usdt": 0.0,
   "cumulative_profit_krw": 0.0,
-  "run_count": 17,
-  "period": "2026-04"
+  "run_count": 32,
+  "trade_count": 0,
+  "win_count": 0,
+  "loss_count": 0,
+  "monthly_trade_count": 0,
+  "monthly_win_count": 0,
+  "monthly_loss_count": 0,
+  "unique_failure_count": 0,
+  "last_reflection_summary": "",
+  "last_cycle_at_kst": "2026-04-19T23:54:27.723158+09:00",
+  "last_trade_closed_at_kst": "",
+  "last_report_at_kst": "2026-04-19T23:49:27.723530+09:00",
+  "open_position": null
 }

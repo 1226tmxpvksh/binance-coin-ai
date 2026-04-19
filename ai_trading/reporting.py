@@ -15,6 +15,21 @@ class SubscriptionGoalReport:
     status: str
 
 
+@dataclass
+class LedgerSummary:
+    balance_krw: float
+    balance_usdt: float
+    total_profit_krw: float
+    total_profit_usdt: float
+    total_profit_pct: float
+    monthly_profit_krw: float
+    trade_count: int
+    win_count: int
+    loss_count: int
+    unique_failure_count: int
+    last_reflection_summary: str
+
+
 KST = timezone(timedelta(hours=9))
 
 
@@ -34,6 +49,55 @@ def _monthly_reset_cutoff(now_kst: datetime) -> datetime:
     return now_kst.replace(day=1, hour=9, minute=0, second=0, microsecond=0)
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def default_trading_stats(
+    *,
+    initial_balance_krw: float,
+    initial_balance_usdt: float,
+    now_kst: datetime | None = None,
+) -> Dict[str, Any]:
+    now = now_kst or datetime.now(KST)
+    return {
+        "period": _current_period(now),
+        "last_reset_at_kst": now.isoformat(),
+        "initial_balance_krw": float(initial_balance_krw),
+        "initial_balance_usdt": float(initial_balance_usdt),
+        "virtual_balance_krw": float(initial_balance_krw),
+        "virtual_balance_usdt": float(initial_balance_usdt),
+        "total_realized_pnl_krw": 0.0,
+        "total_realized_pnl_usdt": 0.0,
+        "monthly_realized_pnl_krw": 0.0,
+        "monthly_realized_pnl_usdt": 0.0,
+        "cumulative_profit_krw": 0.0,
+        "run_count": 0,
+        "trade_count": 0,
+        "win_count": 0,
+        "loss_count": 0,
+        "monthly_trade_count": 0,
+        "monthly_win_count": 0,
+        "monthly_loss_count": 0,
+        "unique_failure_count": 0,
+        "last_reflection_summary": "",
+        "last_cycle_at_kst": "",
+        "last_trade_closed_at_kst": "",
+        "last_report_at_kst": "",
+        "open_position": None,
+    }
+
+
 def _backup_stats(stats: Dict[str, Any], *, backup_period: str) -> None:
     history_dir = _history_dir()
     history_dir.mkdir(parents=True, exist_ok=True)
@@ -44,63 +108,156 @@ def _backup_stats(stats: Dict[str, Any], *, backup_period: str) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _normalize_stats(
+    data: Dict[str, Any],
+    *,
+    initial_balance_krw: float,
+    initial_balance_usdt: float,
+    now_kst: datetime,
+) -> Dict[str, Any]:
+    stats = default_trading_stats(
+        initial_balance_krw=initial_balance_krw,
+        initial_balance_usdt=initial_balance_usdt,
+        now_kst=now_kst,
+    )
+    legacy_profit = _safe_float(data.get("cumulative_profit_krw", 0.0))
+    stats["period"] = str(data.get("period", stats["period"]))
+    stats["last_reset_at_kst"] = str(data.get("last_reset_at_kst", stats["last_reset_at_kst"]))
+    stats["initial_balance_krw"] = _safe_float(data.get("initial_balance_krw", initial_balance_krw), initial_balance_krw)
+    stats["initial_balance_usdt"] = _safe_float(data.get("initial_balance_usdt", initial_balance_usdt), initial_balance_usdt)
+    stats["virtual_balance_krw"] = _safe_float(
+        data.get("virtual_balance_krw", stats["initial_balance_krw"] + legacy_profit),
+        stats["initial_balance_krw"] + legacy_profit,
+    )
+    stats["virtual_balance_usdt"] = _safe_float(
+        data.get("virtual_balance_usdt", stats["initial_balance_usdt"]),
+        stats["initial_balance_usdt"],
+    )
+    stats["total_realized_pnl_krw"] = _safe_float(data.get("total_realized_pnl_krw", legacy_profit), legacy_profit)
+    stats["total_realized_pnl_usdt"] = _safe_float(data.get("total_realized_pnl_usdt", 0.0))
+    stats["monthly_realized_pnl_krw"] = _safe_float(data.get("monthly_realized_pnl_krw", legacy_profit), legacy_profit)
+    stats["monthly_realized_pnl_usdt"] = _safe_float(data.get("monthly_realized_pnl_usdt", 0.0))
+    stats["cumulative_profit_krw"] = _safe_float(data.get("cumulative_profit_krw", stats["total_realized_pnl_krw"]))
+    stats["run_count"] = _safe_int(data.get("run_count", 0))
+    stats["trade_count"] = _safe_int(data.get("trade_count", 0))
+    stats["win_count"] = _safe_int(data.get("win_count", 0))
+    stats["loss_count"] = _safe_int(data.get("loss_count", 0))
+    stats["monthly_trade_count"] = _safe_int(data.get("monthly_trade_count", stats["trade_count"]))
+    stats["monthly_win_count"] = _safe_int(data.get("monthly_win_count", stats["win_count"]))
+    stats["monthly_loss_count"] = _safe_int(data.get("monthly_loss_count", stats["loss_count"]))
+    stats["unique_failure_count"] = _safe_int(data.get("unique_failure_count", 0))
+    stats["last_reflection_summary"] = str(data.get("last_reflection_summary", ""))
+    stats["last_cycle_at_kst"] = str(data.get("last_cycle_at_kst", ""))
+    stats["last_trade_closed_at_kst"] = str(data.get("last_trade_closed_at_kst", ""))
+    stats["last_report_at_kst"] = str(data.get("last_report_at_kst", ""))
+    open_position = data.get("open_position")
+    stats["open_position"] = open_position if isinstance(open_position, dict) else None
+    return stats
+
+
 def _maybe_monthly_reset(stats: Dict[str, Any], now_kst: datetime) -> Dict[str, Any]:
     current_period = _current_period(now_kst)
     stored_period = str(stats.get("period", current_period))
     cutoff = _monthly_reset_cutoff(now_kst)
     if now_kst >= cutoff and stored_period != current_period:
         _backup_stats(stats, backup_period=stored_period)
-        return {
-            "cumulative_profit_krw": 0.0,
-            "run_count": 0,
-            "period": current_period,
-            "last_reset_at_kst": now_kst.isoformat(),
-        }
-    if "period" not in stats:
+        stats["period"] = current_period
+        stats["monthly_realized_pnl_krw"] = 0.0
+        stats["monthly_realized_pnl_usdt"] = 0.0
+        stats["monthly_trade_count"] = 0
+        stats["monthly_win_count"] = 0
+        stats["monthly_loss_count"] = 0
+        stats["last_reset_at_kst"] = now_kst.isoformat()
+    elif "period" not in stats:
         stats["period"] = current_period
     return stats
 
 
-def load_trading_stats(path: Path | None = None) -> Dict[str, Any]:
+def load_trading_stats(
+    path: Path | None = None,
+    *,
+    initial_balance_krw: float = 500_000.0,
+    initial_balance_usdt: float = 362.0,
+) -> Dict[str, Any]:
     p = path or _stats_path()
     now_kst = datetime.now(KST)
     if not p.exists():
-        return {"cumulative_profit_krw": 0.0, "run_count": 0, "period": _current_period(now_kst)}
+        return default_trading_stats(
+            initial_balance_krw=initial_balance_krw,
+            initial_balance_usdt=initial_balance_usdt,
+            now_kst=now_kst,
+        )
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"cumulative_profit_krw": 0.0, "run_count": 0, "period": _current_period(now_kst)}
-        normalized = {
-            "cumulative_profit_krw": float(data.get("cumulative_profit_krw", 0.0)),
-            "run_count": int(data.get("run_count", 0)),
-            "period": str(data.get("period", _current_period(now_kst))),
-        }
+            return default_trading_stats(
+                initial_balance_krw=initial_balance_krw,
+                initial_balance_usdt=initial_balance_usdt,
+                now_kst=now_kst,
+            )
+        normalized = _normalize_stats(
+            data,
+            initial_balance_krw=initial_balance_krw,
+            initial_balance_usdt=initial_balance_usdt,
+            now_kst=now_kst,
+        )
         return _maybe_monthly_reset(normalized, now_kst)
     except Exception:
-        return {"cumulative_profit_krw": 0.0, "run_count": 0, "period": _current_period(now_kst)}
+        return default_trading_stats(
+            initial_balance_krw=initial_balance_krw,
+            initial_balance_usdt=initial_balance_usdt,
+            now_kst=now_kst,
+        )
 
 
 def save_trading_stats(stats: Dict[str, Any], path: Path | None = None) -> None:
     p = path or _stats_path()
     p.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(stats)
+    payload["cumulative_profit_krw"] = _safe_float(payload.get("total_realized_pnl_krw", payload.get("cumulative_profit_krw", 0.0)))
     with open(p, "w", encoding="utf-8") as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def summarize_ledger(stats: Dict[str, Any]) -> LedgerSummary:
+    initial_krw = _safe_float(stats.get("initial_balance_krw", 0.0))
+    initial_usdt = _safe_float(stats.get("initial_balance_usdt", 0.0))
+    balance_krw = _safe_float(stats.get("virtual_balance_krw", initial_krw))
+    balance_usdt = _safe_float(stats.get("virtual_balance_usdt", initial_usdt))
+    total_profit_krw = balance_krw - initial_krw
+    total_profit_usdt = balance_usdt - initial_usdt
+    total_profit_pct = (total_profit_krw / initial_krw * 100.0) if initial_krw > 0 else 0.0
+    return LedgerSummary(
+        balance_krw=balance_krw,
+        balance_usdt=balance_usdt,
+        total_profit_krw=total_profit_krw,
+        total_profit_usdt=total_profit_usdt,
+        total_profit_pct=total_profit_pct,
+        monthly_profit_krw=_safe_float(stats.get("monthly_realized_pnl_krw", 0.0)),
+        trade_count=_safe_int(stats.get("trade_count", 0)),
+        win_count=_safe_int(stats.get("win_count", 0)),
+        loss_count=_safe_int(stats.get("loss_count", 0)),
+        unique_failure_count=_safe_int(stats.get("unique_failure_count", 0)),
+        last_reflection_summary=str(stats.get("last_reflection_summary", "")).strip(),
+    )
 
 
 def build_goal_report(realized_profit_krw: float, monthly_target_krw: int = 100_000) -> SubscriptionGoalReport:
     if monthly_target_krw <= 0:
         monthly_target_krw = 100_000
     stats = load_trading_stats()
-    cumulative = float(stats.get("cumulative_profit_krw", 0.0)) + realized_profit_krw
-    stats["cumulative_profit_krw"] = cumulative
-    stats["run_count"] = int(stats.get("run_count", 0)) + 1
+    stats["total_realized_pnl_krw"] = _safe_float(stats.get("total_realized_pnl_krw", 0.0)) + realized_profit_krw
+    stats["monthly_realized_pnl_krw"] = _safe_float(stats.get("monthly_realized_pnl_krw", 0.0)) + realized_profit_krw
+    stats["virtual_balance_krw"] = _safe_float(stats.get("virtual_balance_krw", stats.get("initial_balance_krw", 0.0))) + realized_profit_krw
+    stats["cumulative_profit_krw"] = _safe_float(stats.get("total_realized_pnl_krw", 0.0))
+    stats["run_count"] = _safe_int(stats.get("run_count", 0)) + 1
     save_trading_stats(stats)
-    achievement = max(0.0, cumulative / monthly_target_krw * 100)
+    achievement = max(0.0, _safe_float(stats.get("monthly_realized_pnl_krw", 0.0)) / monthly_target_krw * 100)
     status = "달성" if achievement >= 100 else "진행중"
     return SubscriptionGoalReport(
         monthly_target_krw=monthly_target_krw,
-        realized_profit_krw=cumulative,
+        realized_profit_krw=_safe_float(stats.get("monthly_realized_pnl_krw", 0.0)),
         achievement_rate=achievement,
         status=status,
     )

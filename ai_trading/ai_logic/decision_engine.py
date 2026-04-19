@@ -45,16 +45,25 @@ def _load_env_file_safely(path: Path) -> None:
         logger.error("Failed reading env file %s: %s", path, type(e).__name__)
 
 
-def _build_messages(backtest_context: str, market_snapshot: Dict[str, float], similar_cases: List[Dict[str, float]]) -> List[Dict[str, str]]:
+def _build_messages(
+    backtest_context: str,
+    market_snapshot: Dict[str, float],
+    similar_cases: List[Dict[str, float]],
+    failure_memory: str = "",
+) -> List[Dict[str, str]]:
     system_prompt = (
         "You are a crypto scalp trading assistant. "
         "You must output only valid JSON with schema: "
         '{"decision":"BUY|SELL|HOLD","reason":"string","confidence":0.0}. '
         "Decision must use both current indicators and backtest similarity evidence."
     )
+    memory_block = ""
+    if failure_memory.strip():
+        memory_block = f"Past failure to avoid:\n{failure_memory.strip()}\n\n"
     user_prompt = (
         "Context from backtest analysis:\n"
         f"{backtest_context}\n\n"
+        f"{memory_block}"
         "Current market snapshot:\n"
         f"{json.dumps(market_snapshot, ensure_ascii=False)}\n\n"
         "Most similar backtest cases:\n"
@@ -79,25 +88,50 @@ def _parse_decision(text: str) -> Dict[str, Any]:
     return {"decision": decision, "reason": reason, "confidence": confidence}
 
 
-def get_ai_decision(
-    backtest_context: str,
-    market_snapshot: Dict[str, float],
-    similar_cases: List[Dict[str, float]],
-    model: str = "gpt-4o",
-) -> Dict[str, Any]:
+def _load_openai_api_key() -> str:
     base_dir = Path(__file__).resolve().parents[1]
     root_dir = base_dir.parent
     env_candidates = [base_dir / ".env", root_dir / ".env", root_dir / "btc_live_trading" / ".env"]
     for path in env_candidates:
         _load_env_file_safely(path)
-
     api_key_raw = os.getenv("OPENAI_API_KEY", "")
-    api_key = _sanitize_ascii("OPENAI_API_KEY", api_key_raw)
+    return _sanitize_ascii("OPENAI_API_KEY", api_key_raw)
+
+
+def _call_openai_json(messages: List[Dict[str, str]], model: str, timeout: int = 25) -> Dict[str, Any]:
+    api_key = _load_openai_api_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY missing")
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    response = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    body = response.json()
+    content = body["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+
+def get_ai_decision(
+    backtest_context: str,
+    market_snapshot: Dict[str, float],
+    similar_cases: List[Dict[str, float]],
+    model: str = "gpt-4o",
+    failure_memory: str = "",
+) -> Dict[str, Any]:
+    api_key = _load_openai_api_key()
     if not api_key:
         logger.error(
-            "OpenAI 호출 불가: 누락 환경변수 OPENAI_API_KEY "
-            "(확인 경로: %s)",
-            ", ".join(str(p) for p in env_candidates),
+            "OpenAI 호출 불가: 누락 환경변수 OPENAI_API_KEY"
         )
         return {
             "decision": "HOLD",
@@ -105,27 +139,70 @@ def get_ai_decision(
             "confidence": 0.0,
         }
 
-    payload = {
-        "model": model,
-        "messages": _build_messages(backtest_context, market_snapshot, similar_cases),
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            data=json.dumps(payload),
+        data = _call_openai_json(
+            _build_messages(backtest_context, market_snapshot, similar_cases, failure_memory),
+            model=model,
             timeout=25,
         )
-        response.raise_for_status()
-        body = response.json()
-        content = body["choices"][0]["message"]["content"]
-        return _parse_decision(content)
+        return _parse_decision(json.dumps(data, ensure_ascii=False))
     except requests.exceptions.HTTPError as e:
         logger.error("OpenAI request failed: %s", e)
         return {"decision": "HOLD", "reason": "OpenAI 인증/요청 실패로 HOLD 처리", "confidence": 0.0}
     except requests.RequestException as e:
         logger.error("OpenAI network error: %s", type(e).__name__)
         return {"decision": "HOLD", "reason": "OpenAI 네트워크 오류로 HOLD 처리", "confidence": 0.0}
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        logger.error("OpenAI invalid JSON response: %s", type(e).__name__)
+        return {"decision": "HOLD", "reason": "모델 응답 파싱 실패로 HOLD 처리", "confidence": 0.0}
+    except RuntimeError:
+        return {"decision": "HOLD", "reason": "OPENAI_API_KEY 미설정으로 HOLD 처리", "confidence": 0.0}
+
+
+def analyze_trade_failure(
+    entry_snapshot: Dict[str, Any],
+    exit_snapshot: Dict[str, Any],
+    trade_context: Dict[str, Any],
+    model: str = "gpt-4o",
+) -> Dict[str, str]:
+    fallback_reason = "시간 청산 결과 예측 방향과 실제 가격 흐름이 어긋남"
+    fallback_summary = "추세 확인이 약한 상태에서 진입해 반대 방향 움직임을 허용함"
+    price_move_pct = float(trade_context.get("price_move_pct", 0.0))
+    side = str(trade_context.get("side", "HOLD")).upper()
+    system_prompt = (
+        "You are a trading post-mortem analyst. "
+        "Return strict JSON only with keys: market_context, failure_reason, reflection_summary, warning."
+    )
+    user_prompt = (
+        "Analyze why this virtual scalp trade failed or underperformed.\n\n"
+        f"Trade context:\n{json.dumps(trade_context, ensure_ascii=False)}\n\n"
+        f"Entry snapshot:\n{json.dumps(entry_snapshot, ensure_ascii=False)}\n\n"
+        f"Exit snapshot:\n{json.dumps(exit_snapshot, ensure_ascii=False)}\n\n"
+        "Focus on market structure, volatility, trend mismatch, and overfitting to a single indicator."
+    )
+    try:
+        data = _call_openai_json(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            model=model,
+            timeout=30,
+        )
+        return {
+            "market_context": str(data.get("market_context", "")).strip()[:280] or "시장 컨텍스트 분석 실패",
+            "failure_reason": str(data.get("failure_reason", "")).strip()[:280] or fallback_reason,
+            "reflection_summary": str(data.get("reflection_summary", "")).strip()[:280] or fallback_summary,
+            "warning": str(data.get("warning", "")).strip()[:280]
+            or "다음 유사 상황에서는 추세와 변동성 확인 후 진입 여부를 재검토할 것",
+        }
+    except Exception as e:
+        logger.warning("Failure reflection fallback used: %s", type(e).__name__)
+        direction_text = "상승" if price_move_pct > 0 else "하락" if price_move_pct < 0 else "횡보"
+        return {
+            "market_context": (
+                f"{side} 판단 후 15분 동안 가격이 {price_move_pct:.2f}% {direction_text}했고 "
+                f"RSI={float(entry_snapshot.get('rsi', 0.0)):.1f}, "
+                f"BB={float(entry_snapshot.get('bb_position', 0.0)):.2f}"
+            ),
+            "failure_reason": fallback_reason,
+            "reflection_summary": fallback_summary,
+            "warning": "단일 지표보다 추세 방향과 변동성 확장 여부를 함께 확인할 것",
+        }
