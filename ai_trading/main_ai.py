@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import json
 import logging
 import os
@@ -11,6 +12,9 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.parse import quote
+
+import requests
 
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
@@ -36,6 +40,9 @@ def _bootstrap_sys_path() -> None:
                     sys.path.insert(0, str(cur))
                 if str(candidate) not in sys.path:
                     sys.path.insert(0, str(candidate))
+                day_candidate = cur / "btc_day_strategy"
+                if day_candidate.exists() and str(day_candidate) not in sys.path:
+                    sys.path.insert(0, str(day_candidate))
                 return
             if cur.parent == cur:
                 break
@@ -49,20 +56,43 @@ from data.backtest_data import find_similar_backtest_cases, load_backtest_summar
 from data.market_data import fetch_market_snapshot
 from reporting import days_left_in_month_kst, load_trading_stats, save_trading_stats, summarize_ledger
 from risk_guard import assess_trade_risk, ensure_min_stop_gap
-from btc_live_trading.strategy.risk_manager import calculate_position_size
+
+try:
+    from btc_live_trading.strategy.risk_manager import calculate_position_size
+    _POSITION_SIZE_IMPORT_ERROR = None
+except Exception as exc:
+    calculate_position_size = None  # type: ignore[assignment]
+    _POSITION_SIZE_IMPORT_ERROR = exc
 
 try:
     from btc_live_trading.kakao_notifier import KakaoNotifier
-    from btc_live_trading.kakao_utils import get_access_token, hydrate_tokens_from_json as _hydrate_kakao_tokens
+    from btc_live_trading.kakao_utils import (
+        apply_token_response as _apply_kakao_token_response,
+        exchange_authorization_code as _exchange_kakao_authorization_code,
+        get_access_token,
+        get_redirect_uri as _get_kakao_redirect_uri,
+        get_refresh_token as _get_kakao_refresh_token,
+        hydrate_tokens_from_json as _hydrate_kakao_tokens,
+        refresh_access_token_request as _refresh_kakao_access_token_request,
+    )
 except Exception:
     KakaoNotifier = None
+    _apply_kakao_token_response = None  # type: ignore
+    _exchange_kakao_authorization_code = None  # type: ignore
+    _get_kakao_redirect_uri = None  # type: ignore
+    _get_kakao_refresh_token = None  # type: ignore
     _hydrate_kakao_tokens = None  # type: ignore
+    _refresh_kakao_access_token_request = None  # type: ignore
     get_access_token = None  # type: ignore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 ENV_LINE_MAP: Dict[str, int] = {}
+KAKAO_AUTH_LINK_LOGGED = False
+STARTUP_REPORT_SENT = False
+STARTUP_HEALTH_CHECK_DONE = False
+STARTUP_HEALTH_CHECK_OK = False
 LEARNING_FIELDNAMES = [
     "logged_at_kst",
     "trade_id",
@@ -93,6 +123,70 @@ def _load_env() -> None:
     _index_env_lines(target_env)
     _diagnose_env_section_4(target_env)
     _load_env_file_safely(target_env)
+
+
+def _check_project_connectivity() -> bool:
+    """운영 시작 시 핵심 프로젝트 폴더의 모듈 로드 가능 여부를 확인."""
+    global STARTUP_HEALTH_CHECK_DONE, STARTUP_HEALTH_CHECK_OK
+    if STARTUP_HEALTH_CHECK_DONE:
+        return STARTUP_HEALTH_CHECK_OK
+
+    checks = [
+        (
+            "btc_live_trading",
+            "연결 확인: btc_live_trading 모듈 로드 완료",
+            [
+                "btc_live_trading.kakao_notifier",
+                "btc_live_trading.kakao_utils",
+                "btc_live_trading.strategy.risk_manager",
+            ],
+        ),
+        (
+            "btc_day_strategy",
+            "연결 확인: btc_day_strategy 전략 로드 완료",
+            [
+                "btc_day_strategy.strategy_entry",
+                "btc_day_strategy.risk_manager",
+                "btc_day_strategy.backtest_engine",
+            ],
+        ),
+    ]
+
+    all_ok = True
+    rows: List[Tuple[str, str, str]] = []
+    for group_name, success_message, module_names in checks:
+        try:
+            for module_name in module_names:
+                importlib.import_module(module_name)
+            logger.info(success_message)
+            rows.append((group_name, "OK", f"{len(module_names)} modules loaded"))
+        except Exception as exc:
+            all_ok = False
+            rows.append((group_name, "FAIL", f"{type(exc).__name__}: {exc}"))
+            logger.error(
+                "연결 확인 실패: %s 필수 모듈 로드 실패 (%s: %s)",
+                group_name,
+                type(exc).__name__,
+                exc,
+            )
+
+    _print_connectivity_table(rows)
+    STARTUP_HEALTH_CHECK_DONE = True
+    STARTUP_HEALTH_CHECK_OK = all_ok
+    return all_ok
+
+
+def _print_connectivity_table(rows: List[Tuple[str, str, str]]) -> None:
+    if not rows:
+        return
+    print("\n[Project Connectivity Health Check]")
+    print("+------------------+--------+--------------------------+")
+    print("| Folder           | Status | Detail                   |")
+    print("+------------------+--------+--------------------------+")
+    for folder, status, detail in rows:
+        safe_detail = detail if len(detail) <= 24 else detail[:21] + "..."
+        print(f"| {folder:<16} | {status:<6} | {safe_detail:<24} |")
+    print("+------------------+--------+--------------------------+\n")
 
 
 def _index_env_lines(env_path: Path) -> None:
@@ -198,10 +292,155 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _format_price(value: Any) -> str:
+    return f"{_safe_float(value):,.2f} USDT"
+
+
+def _format_krw(value: Any) -> str:
+    return f"{_safe_float(value):,.0f}원"
+
+
+def _format_usd(value: Any) -> str:
+    return f"${_safe_float(value):,.4f}"
+
+
+def _is_korean_text(text: str) -> bool:
+    return any("\uac00" <= ch <= "\ud7a3" for ch in text)
+
+
+def _report_text(text: Any, fallback: str = "기록 없음") -> str:
+    cleaned = str(text or "").replace("\n", " ").strip()
+    if not cleaned:
+        return fallback
+    if _is_korean_text(cleaned):
+        return cleaned
+    return "기존 영문 기록은 한국어 리포트 적용 전 데이터라 다음 학습부터 한국어로 갱신됩니다."
+
+
+def _trend_aligned(side: str, snapshot: Dict[str, Any]) -> bool:
+    ema20 = _safe_float(snapshot.get("ema20", 0.0))
+    ema60 = _safe_float(snapshot.get("ema60", 0.0))
+    rsi = _safe_float(snapshot.get("rsi", 50.0), 50.0)
+    bb = _safe_float(snapshot.get("bb_position", 0.5), 0.5)
+    direction = (side or "").upper()
+    if direction == "SELL":
+        return ema20 < ema60 and rsi <= 50.0 and bb <= 0.55
+    return ema20 > ema60 and rsi >= 50.0 and bb >= 0.45
+
+
+def _technical_signal_decision(snapshot: Dict[str, Any], sample_size: int, similar_avg_pnl: float) -> Dict[str, Any]:
+    rsi = _safe_float(snapshot.get("rsi", 50.0), 50.0)
+    bb = _safe_float(snapshot.get("bb_position", 0.5), 0.5)
+    ema_gap_pct = _safe_float(snapshot.get("ema_gap_pct", 0.0))
+    atr_pct = _safe_float(snapshot.get("atr_pct", 0.0))
+    ema20 = _safe_float(snapshot.get("ema20", 0.0))
+    ema60 = _safe_float(snapshot.get("ema60", 0.0))
+
+    buy_score = 0.0
+    sell_score = 0.0
+    buy_reasons: List[str] = []
+    sell_reasons: List[str] = []
+
+    if ema20 > ema60 and ema_gap_pct >= 0.03:
+        buy_score += 0.34
+        buy_reasons.append(f"EMA20이 EMA60 위({ema_gap_pct:+.2f}%)")
+    elif ema20 < ema60 and ema_gap_pct <= -0.03:
+        sell_score += 0.34
+        sell_reasons.append(f"EMA20이 EMA60 아래({ema_gap_pct:+.2f}%)")
+
+    if 52.0 <= rsi <= 74.0:
+        buy_score += 0.26
+        buy_reasons.append(f"RSI {rsi:.1f}로 상승 모멘텀")
+    elif 26.0 <= rsi <= 48.0:
+        sell_score += 0.26
+        sell_reasons.append(f"RSI {rsi:.1f}로 하락 모멘텀")
+    elif rsi > 74.0 and ema_gap_pct > 0:
+        buy_score += 0.16
+        buy_reasons.append(f"RSI {rsi:.1f} 과열이나 상승 추세 지속")
+    elif rsi < 26.0 and ema_gap_pct < 0:
+        sell_score += 0.16
+        sell_reasons.append(f"RSI {rsi:.1f} 과매도이나 하락 추세 지속")
+
+    if 0.58 <= bb <= 1.08:
+        buy_score += 0.22
+        buy_reasons.append(f"볼린저 위치 {bb:.2f}로 상단 돌파권")
+    elif -0.08 <= bb <= 0.42:
+        sell_score += 0.22
+        sell_reasons.append(f"볼린저 위치 {bb:.2f}로 하단 이탈권")
+
+    if atr_pct >= 0.05:
+        buy_score += 0.08
+        sell_score += 0.08
+    if sample_size == 0 and max(buy_score, sell_score) >= 0.56:
+        buy_score += 0.06
+        sell_score += 0.06
+    if similar_avg_pnl > 0:
+        buy_score += 0.04
+        sell_score += 0.04
+    elif similar_avg_pnl < -0.05:
+        buy_score -= 0.06
+        sell_score -= 0.06
+
+    side = "BUY" if buy_score >= sell_score else "SELL"
+    score = max(buy_score, sell_score)
+    reasons = buy_reasons if side == "BUY" else sell_reasons
+    threshold = _env_float("AI_TECHNICAL_ENTRY_THRESHOLD", 0.60)
+    if score < threshold or abs(buy_score - sell_score) < 0.12:
+        return {
+            "decision": "HOLD",
+            "confidence": max(0.0, min(1.0, score)),
+            "reason": "기술 지표 방향성이 아직 충분히 한쪽으로 모이지 않음",
+            "score": score,
+        }
+    confidence = max(0.0, min(1.0, 0.52 + score * 0.42))
+    return {
+        "decision": side,
+        "confidence": confidence,
+        "reason": " / ".join(reasons[:3]) or "기술 지표 정렬",
+        "score": score,
+    }
+
+
+def _blend_ai_and_technical_decision(
+    ai_decision: Dict[str, Any],
+    technical_decision: Dict[str, Any],
+) -> Dict[str, Any]:
+    ai_side = str(ai_decision.get("decision", "HOLD")).upper()
+    tech_side = str(technical_decision.get("decision", "HOLD")).upper()
+    ai_conf = _safe_float(ai_decision.get("confidence", 0.0))
+    tech_conf = _safe_float(technical_decision.get("confidence", 0.0))
+    entry_threshold = _env_float("AI_AGGRESSIVE_CONFIDENCE_THRESHOLD", 0.62)
+
+    if tech_side in {"BUY", "SELL"} and tech_conf >= entry_threshold:
+        if ai_side == tech_side:
+            return {
+                "decision": tech_side,
+                "confidence": min(1.0, max(ai_conf, tech_conf) + 0.08),
+                "reason": f"{_report_text(ai_decision.get('reason'))} + 기술 지표 확인: {technical_decision['reason']}",
+            }
+        if ai_side == "HOLD" or ai_conf < 0.72:
+            return {
+                "decision": tech_side,
+                "confidence": tech_conf,
+                "reason": f"백테스트 근거가 부족해도 기술 지표가 명확함: {technical_decision['reason']}",
+            }
+    if ai_side in {"BUY", "SELL"} and ai_conf >= entry_threshold:
+        return {
+            "decision": ai_side,
+            "confidence": ai_conf,
+            "reason": _report_text(ai_decision.get("reason")),
+        }
+    return {
+        "decision": "HOLD",
+        "confidence": max(ai_conf, tech_conf),
+        "reason": _report_text(ai_decision.get("reason"), technical_decision.get("reason", "대기")),
+    }
+
+
 def _build_stop_loss(snapshot: Dict[str, float], decision: str) -> float:
     price = float(snapshot["price"])
     atr = float(snapshot["atr14"])
-    atr_multiplier = _env_float("AI_ATR_STOP_MULTIPLIER", 1.8)
+    atr_multiplier = _env_float("AI_ATR_STOP_MULTIPLIER", 1.6)
     if decision == "BUY":
         return price - (atr * atr_multiplier)
     if decision == "SELL":
@@ -209,15 +448,330 @@ def _build_stop_loss(snapshot: Dict[str, float], decision: str) -> float:
     return price
 
 
+def _build_take_profit(snapshot: Dict[str, float], decision: str) -> float:
+    price = float(snapshot["price"])
+    atr = float(snapshot["atr14"])
+    multiplier = _env_float("AI_ATR_TAKE_PROFIT_MULTIPLIER", 3.2)
+    min_profit_ratio = _env_float("AI_MIN_TAKE_PROFIT_RATIO", 0.012)
+    if _trend_aligned(decision, snapshot):
+        multiplier += 0.5
+    distance = max(atr * multiplier, price * min_profit_ratio)
+    if decision == "SELL":
+        return price - distance
+    if decision == "BUY":
+        return price + distance
+    return price
+
+
+def _unrealized_move_pct(open_position: Dict[str, Any], snapshot: Dict[str, Any]) -> float:
+    side = str(open_position.get("side", "BUY")).upper()
+    entry = _safe_float(open_position.get("entry_price", 0.0))
+    price = _safe_float(snapshot.get("price", 0.0))
+    if entry <= 0:
+        return 0.0
+    if side == "SELL":
+        return (entry - price) / entry * 100.0
+    return (price - entry) / entry * 100.0
+
+
+def _extend_winning_position(
+    stats: Dict[str, Any],
+    open_position: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    now_kst: datetime,
+    hold_minutes: int,
+    reason: str,
+) -> bool:
+    side = str(open_position.get("side", "BUY")).upper()
+    if not _trend_aligned(side, snapshot):
+        return False
+    extensions = _safe_int(open_position.get("hold_extensions", 0))
+    max_extensions = _env_int("AI_MAX_HOLD_EXTENSIONS", 4)
+    if extensions >= max_extensions:
+        return False
+
+    price = _safe_float(snapshot.get("price", 0.0))
+    atr = _safe_float(snapshot.get("atr14", 0.0))
+    if price <= 0 or atr <= 0:
+        return False
+    trail_multiplier = _env_float("AI_TRAILING_STOP_ATR_MULTIPLIER", 1.25)
+    extend_multiplier = _env_float("AI_TAKE_PROFIT_EXTEND_ATR_MULTIPLIER", 1.6)
+    min_extend_ratio = _env_float("AI_MIN_TAKE_PROFIT_RATIO", 0.012) * 0.8
+
+    if side == "SELL":
+        new_stop = min(_safe_float(open_position.get("stop_loss", price)), price + atr * trail_multiplier)
+        new_take_profit = price - max(atr * extend_multiplier, price * min_extend_ratio)
+    else:
+        new_stop = max(_safe_float(open_position.get("stop_loss", price)), price - atr * trail_multiplier)
+        new_take_profit = price + max(atr * extend_multiplier, price * min_extend_ratio)
+
+    open_position["stop_loss"] = float(new_stop)
+    open_position["take_profit"] = float(new_take_profit)
+    open_position["expires_at_kst"] = (now_kst + timedelta(minutes=hold_minutes)).isoformat()
+    open_position["hold_extensions"] = extensions + 1
+    open_position["last_extension_reason"] = reason
+    stats["open_position"] = open_position
+    return True
+
+
+def _position_exit_reason(
+    stats: Dict[str, Any],
+    open_position: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    now_kst: datetime,
+    hold_minutes: int,
+) -> str | None:
+    side = str(open_position.get("side", "BUY")).upper()
+    price = _safe_float(snapshot.get("price", 0.0))
+    stop_loss = _safe_float(open_position.get("stop_loss", 0.0))
+    take_profit = _safe_float(open_position.get("take_profit", 0.0))
+    move_pct = _unrealized_move_pct(open_position, snapshot)
+
+    stop_hit = (side == "SELL" and price >= stop_loss > 0) or (side != "SELL" and 0 < price <= stop_loss)
+    if stop_hit:
+        return "stop_loss"
+
+    tp_hit = (side == "SELL" and 0 < price <= take_profit) or (side != "SELL" and price >= take_profit > 0)
+    if tp_hit:
+        if move_pct > 0 and _extend_winning_position(stats, open_position, snapshot, now_kst, hold_minutes, "익절선 도달 후 추세 지속"):
+            return None
+        return "take_profit"
+
+    if _position_due(open_position, now_kst):
+        if move_pct > 0 and _extend_winning_position(stats, open_position, snapshot, now_kst, hold_minutes, "시간 만기 후 추세 지속"):
+            return None
+        return "time_exit"
+    return None
+
+
+def _kakao_auth_url(rest_api_key: str) -> str:
+    redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else os.getenv("KAKAO_REDIRECT_URI", "")
+    if not rest_api_key or not redirect_uri:
+        return ""
+    encoded_redirect_uri = quote(redirect_uri, safe="")
+    return (
+        "https://kauth.kakao.com/oauth/authorize?"
+        f"client_id={rest_api_key}&redirect_uri={encoded_redirect_uri}&response_type=code"
+    )
+
+
+def _validate_kakao_redirect_uri_config() -> bool:
+    env_redirect_uri = _env_str("KAKAO_REDIRECT_URI", "")
+    helper_redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else env_redirect_uri
+    if not env_redirect_uri:
+        logger.error("KAKAO_REDIRECT_URI가 비어 있습니다. 카카오 개발자 콘솔 Redirect URI와 동일하게 설정하세요.")
+        return False
+    if env_redirect_uri in {"https://example.com/oauth", "your_redirect_uri_here"}:
+        logger.error("KAKAO_REDIRECT_URI가 기본 예시값입니다. 카카오 개발자 콘솔에 등록된 실제 URI로 변경하세요.")
+        return False
+    if not env_redirect_uri.startswith(("http://", "https://")):
+        logger.error("KAKAO_REDIRECT_URI 형식이 올바르지 않습니다: %s", env_redirect_uri)
+        return False
+    if helper_redirect_uri != env_redirect_uri:
+        logger.error(
+            "KAKAO_REDIRECT_URI 불일치: env=%s, kakao_utils=%s. KOE205 방지를 위해 한 값으로 통일하세요.",
+            env_redirect_uri,
+            helper_redirect_uri,
+        )
+        return False
+    return True
+
+
+def _log_kakao_manual_auth_link(reason: str) -> None:
+    global KAKAO_AUTH_LINK_LOGGED
+    if KAKAO_AUTH_LINK_LOGGED:
+        return
+    rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
+    redirect_ok = _validate_kakao_redirect_uri_config()
+    auth_url = _kakao_auth_url(rest_api_key)
+    logger.error("=" * 80)
+    logger.error("카카오 자동 토큰 갱신 실패: %s", reason)
+    logger.error("운영 조치: 리프레시 토큰까지 만료된 상태이므로 새 인가 코드 발급이 필요합니다.")
+    if auth_url:
+        logger.error("1) 아래 URL을 브라우저에서 열고 카카오 로그인을 완료하세요.")
+        logger.error("%s", auth_url)
+        logger.error("2) 리다이렉트된 URL의 code= 뒤 값을 복사해 토큰 재발급 절차에 입력하세요.")
+        logger.error("3) KOE205가 발생하면 KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인하세요.")
+    else:
+        logger.error("KAKAO_REST_API_KEY 또는 KAKAO_REDIRECT_URI가 없어 인가 URL을 만들 수 없습니다.")
+    if not redirect_ok:
+        logger.error("현재 redirect_uri 설정 검증에 실패했습니다. URI를 먼저 수정한 뒤 새 인가 코드를 발급하세요.")
+    logger.error("=" * 80)
+    KAKAO_AUTH_LINK_LOGGED = True
+
+
+def _extract_kakao_error(exc: Exception) -> Tuple[str, str]:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return "", ""
+    try:
+        error_payload = response.json()
+        return (
+            str(error_payload.get("error") or "").strip(),
+            str(error_payload.get("error_description") or "").strip(),
+        )
+    except Exception:
+        return "", str(getattr(response, "text", "") or "").strip()
+
+
+def _manual_kakao_authorization_recovery(rest_api_key: str, reason: str) -> str:
+    if (
+        _exchange_kakao_authorization_code is None
+        or _apply_kakao_token_response is None
+        or not rest_api_key
+    ):
+        logger.error("카카오 수동 인증을 실행할 수 없습니다. KAKAO_REST_API_KEY와 kakao_utils import 상태를 확인하세요.")
+        return ""
+
+    redirect_ok = _validate_kakao_redirect_uri_config()
+    redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else os.getenv("KAKAO_REDIRECT_URI", "")
+    auth_url = _kakao_auth_url(rest_api_key)
+
+    print("\n" + "=" * 80)
+    print("리프레시 토큰이 만료되었습니다. 아래 URL에서 새 인가 코드를 발급받아 입력해주세요.")
+    print("=" * 80)
+    print(f"사유: {reason}")
+    print(f"현재 KAKAO_REDIRECT_URI: {redirect_uri or '(비어 있음)'}")
+    if redirect_ok:
+        print("KOE205 사전 점검: redirect_uri 형식과 로컬 설정 일치 여부 확인 완료")
+    else:
+        print("경고: KAKAO_REDIRECT_URI 설정을 먼저 확인하세요. 카카오 개발자 콘솔 등록값과 다르면 KOE205가 발생합니다.")
+    if auth_url:
+        print("\n인가 URL:")
+        print(auth_url)
+    else:
+        print("\n인가 URL을 생성할 수 없습니다. KAKAO_REST_API_KEY 또는 KAKAO_REDIRECT_URI를 확인하세요.")
+        print("=" * 80)
+        return ""
+    print("\n브라우저 인증 후 리다이렉트 URL의 code= 뒤 값을 붙여넣으세요.")
+    print("입력하지 않고 Enter를 누르면 카카오 알림만 건너뛰고 매매 루프는 계속 진행됩니다.")
+
+    try:
+        auth_code = input("인가 코드(code): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n카카오 수동 인증 입력이 취소되었습니다. 카카오 알림 없이 루프를 계속합니다.")
+        return ""
+
+    if not auth_code:
+        print("인가 코드가 입력되지 않았습니다. 카카오 알림 없이 루프를 계속합니다.")
+        return ""
+
+    try:
+        token_data = _exchange_kakao_authorization_code(rest_api_key, redirect_uri, auth_code)
+        access_token = _apply_kakao_token_response(token_data)
+        if access_token:
+            print("카카오 토큰 수동 복구 완료: 새 토큰이 .env와 kakao_code.json에 저장되었습니다.")
+            logger.info("카카오 수동 인증 복구 완료")
+            return access_token
+        logger.error("카카오 토큰 응답에 access_token이 없습니다.")
+        return ""
+    except Exception as exc:
+        error_code, error_description = _extract_kakao_error(exc)
+        if error_code == "KOE205" or "KOE205" in error_description:
+            logger.error("카카오 수동 인증 실패(KOE205): KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 다릅니다.")
+        elif error_code:
+            logger.error("카카오 수동 인증 실패: %s (%s)", error_code, error_description or type(exc).__name__)
+        else:
+            logger.error("카카오 수동 인증 실패: %s", type(exc).__name__)
+        return ""
+
+
+def _validate_kakao_access_token(access_token: str) -> bool:
+    if not access_token:
+        return False
+    try:
+        response = requests.get(
+            "https://kapi.kakao.com/v1/user/access_token_info",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=8,
+        )
+        if response.status_code == 200:
+            return True
+        logger.warning("카카오 액세스 토큰 유효성 확인 실패: HTTP %s", response.status_code)
+        return False
+    except requests.RequestException as exc:
+        logger.warning("카카오 액세스 토큰 유효성 확인 생략: %s", type(exc).__name__)
+        return bool(access_token)
+
+
+def _refresh_kakao_access_token(refresh_token: str, rest_api_key: str) -> str:
+    if (
+        _refresh_kakao_access_token_request is None
+        or _apply_kakao_token_response is None
+        or not refresh_token
+        or not rest_api_key
+    ):
+        return ""
+    try:
+        token_data = _refresh_kakao_access_token_request(rest_api_key, refresh_token)
+        access_token = str(token_data.get("access_token") or "").strip()
+        if access_token:
+            _apply_kakao_token_response(token_data)
+            logger.info("카카오 액세스 토큰 자동 갱신 완료")
+        return access_token
+    except Exception as exc:
+        error_code, error_description = _extract_kakao_error(exc)
+        if error_code == "expired_or_invalid_refresh_token":
+            logger.error("카카오 리프레시 토큰 만료/무효: 새 인가 코드 발급이 필요합니다.")
+        elif error_code:
+            logger.warning("카카오 리프레시 토큰 갱신 실패: %s (%s)", error_code, error_description or type(exc).__name__)
+        else:
+            logger.warning("카카오 리프레시 토큰 갱신 실패: %s", type(exc).__name__)
+        return ""
+
+
+def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
+    if (
+        KakaoNotifier is None
+        or _hydrate_kakao_tokens is None
+        or get_access_token is None
+        or _get_kakao_refresh_token is None
+    ):
+        return ""
+
+    _hydrate_kakao_tokens()
+    rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
+    access_token = get_access_token().strip()
+    if _validate_kakao_access_token(access_token):
+        return access_token
+
+    refresh_token = _get_kakao_refresh_token().strip()
+    if refresh_token and rest_api_key:
+        refreshed = _refresh_kakao_access_token(refresh_token, rest_api_key)
+        if refreshed and _validate_kakao_access_token(refreshed):
+            return refreshed
+        if show_auth_link:
+            _log_kakao_manual_auth_link("리프레시 토큰이 만료되었거나 유효하지 않습니다.")
+            recovered = _manual_kakao_authorization_recovery(rest_api_key, "리프레시 토큰이 만료되었거나 유효하지 않습니다.")
+            if recovered and _validate_kakao_access_token(recovered):
+                return recovered
+            if recovered:
+                return recovered
+        return ""
+
+    if show_auth_link:
+        _log_kakao_manual_auth_link("사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
+        recovered = _manual_kakao_authorization_recovery(rest_api_key, "사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
+        if recovered and _validate_kakao_access_token(recovered):
+            return recovered
+        if recovered:
+            return recovered
+    return ""
+
+
 def _notify_kakao(title: str, body: str) -> None:
     if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
         return
-    _hydrate_kakao_tokens()
-    access = get_access_token()
+    access = _ensure_kakao_access_token(show_auth_link=True)
     rest = os.getenv("KAKAO_REST_API_KEY", "").strip()
     if not access or not rest:
         return
-    notifier = KakaoNotifier(access_token=access, enabled=True, rest_api_key=rest)
+    notifier = KakaoNotifier(
+        access_token=access,
+        enabled=True,
+        rest_api_key=rest,
+        prompt_on_refresh_failure=False,
+    )
     notifier.send_message(title, body)
 
 
@@ -439,6 +993,7 @@ def _close_position(
     now_kst: datetime,
     krw_per_usdt: float,
     model: str,
+    exit_reason: str = "time_exit",
 ) -> Dict[str, Any]:
     side = str(open_position.get("side", "HOLD")).upper()
     entry_price = _safe_float(open_position.get("entry_price", 0.0))
@@ -483,6 +1038,7 @@ def _close_position(
         "pnl_usdt": pnl_usdt,
         "pnl_krw": pnl_krw,
         "price_move_pct": price_move_pct,
+        "exit_reason": exit_reason,
     }
     _append_trade_event(close_event)
     entry_snapshot = open_position.get("entry_snapshot", {}) if isinstance(open_position.get("entry_snapshot"), dict) else {}
@@ -562,6 +1118,7 @@ def _open_position(
         "expires_at_kst": (now_kst + timedelta(minutes=hold_minutes)).isoformat(),
         "entry_price": float(snapshot["price"]),
         "stop_loss": float(stop_loss),
+        "take_profit": float(_build_take_profit(snapshot, decision["decision"])),
         "position_size": float(position_size),
         "leverage": leverage,
         "notional_usdt": float(snapshot["price"]) * float(position_size),
@@ -569,6 +1126,7 @@ def _open_position(
         "confidence": float(decision["confidence"]),
         "similar_avg_pnl": float(similar_avg_pnl),
         "failure_memory_summary": memory_summary,
+        "hold_extensions": 0,
         "entry_snapshot": dict(snapshot),
     }
     stats["open_position"] = position
@@ -582,6 +1140,7 @@ def _open_position(
             "side": decision["decision"],
             "entry_price": float(snapshot["price"]),
             "stop_loss": float(stop_loss),
+            "take_profit": float(position["take_profit"]),
             "position_size": float(position_size),
             "leverage": leverage,
             "reason": str(decision["reason"]),
@@ -605,6 +1164,97 @@ def _should_send_periodic_report(stats: Dict[str, Any], now_kst: datetime, inter
     return now_kst - last_report >= timedelta(minutes=interval_minutes)
 
 
+def _extract_openai_cost_usd(payload: Any) -> float:
+    total = 0.0
+    if isinstance(payload, dict):
+        amount = payload.get("amount")
+        if isinstance(amount, dict):
+            currency = str(amount.get("currency", "usd")).lower()
+            if currency == "usd":
+                total += _safe_float(amount.get("value", 0.0))
+        for value in payload.values():
+            total += _extract_openai_cost_usd(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            total += _extract_openai_cost_usd(item)
+    return total
+
+
+def _fetch_openai_api_usage(now_kst: datetime) -> Dict[str, Any]:
+    api_key = _sanitize_env_value("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+    if not api_key:
+        return {
+            "available": False,
+            "status": "OPENAI_API_KEY 미설정",
+            "month_cost_usd": None,
+            "remaining_credit_usd": None,
+        }
+
+    monthly_budget = _env_float("OPENAI_MONTHLY_BUDGET_USD", 0.0)
+    start_month_kst = now_kst.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    start_ts = int(start_month_kst.astimezone(timezone.utc).timestamp())
+    end_ts = int(now_kst.astimezone(timezone.utc).timestamp())
+    headers = {"Authorization": f"Bearer {api_key}"}
+    params = {"start_time": start_ts, "end_time": end_ts, "bucket_width": "1d", "limit": 31}
+
+    try:
+        response = requests.get(
+            "https://api.openai.com/v1/organization/costs",
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        month_cost = _extract_openai_cost_usd(payload)
+        remaining = (monthly_budget - month_cost) if monthly_budget > 0 else None
+        return {
+            "available": True,
+            "status": "조회 성공",
+            "month_cost_usd": month_cost,
+            "remaining_credit_usd": remaining,
+            "monthly_budget_usd": monthly_budget if monthly_budget > 0 else None,
+        }
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        if status in {401, 403}:
+            status_text = "API 권한 설정 확인 필요 - OpenAI Usage Read 권한 또는 조직 관리자 권한을 확인하세요"
+        else:
+            status_text = f"조회 실패(HTTP {status}) - OpenAI Usage/Costs API 설정 확인 필요"
+        return {
+            "available": False,
+            "status": status_text,
+            "month_cost_usd": None,
+            "remaining_credit_usd": None,
+            "monthly_budget_usd": monthly_budget if monthly_budget > 0 else None,
+            "usage_api_endpoint": "/v1/organization/costs",
+        }
+    except requests.RequestException as exc:
+        return {
+            "available": False,
+            "status": f"조회 실패({type(exc).__name__})",
+            "month_cost_usd": None,
+            "remaining_credit_usd": None,
+            "monthly_budget_usd": monthly_budget if monthly_budget > 0 else None,
+            "usage_api_endpoint": "/v1/organization/costs",
+        }
+
+
+def _format_openai_usage(api_usage: Dict[str, Any]) -> List[str]:
+    if not api_usage.get("available"):
+        budget = api_usage.get("monthly_budget_usd")
+        budget_text = f" / 월 예산 {_format_usd(budget)}" if budget else ""
+        return [f"상태: {api_usage.get('status', '조회 불가')}{budget_text}"]
+    cost = api_usage.get("month_cost_usd")
+    remaining = api_usage.get("remaining_credit_usd")
+    lines = [f"이번 달 사용액: {_format_usd(cost)}"]
+    if remaining is None:
+        lines.append("남은 크레딧: 월 예산 미설정(OPENAI_MONTHLY_BUDGET_USD)")
+    else:
+        lines.append(f"남은 예산/크레딧: {_format_usd(remaining)}")
+    return lines
+
+
 def _build_kakao_message(
     *,
     report: Dict[str, Any],
@@ -612,49 +1262,121 @@ def _build_kakao_message(
     learning_summary: str,
     close_info: Dict[str, Any] | None,
     open_position: Dict[str, Any] | None,
+    api_usage: Dict[str, Any],
 ) -> str:
     ledger = summarize_ledger(stats)
     sign = "+" if ledger.total_profit_pct >= 0 else ""
     total_count, attempt_count = _today_decision_counters()
+    market = report.get("market", {})
+    close_event = close_info.get("close_event", {}) if close_info else {}
+    api_lines = _format_openai_usage(api_usage)
     lines = [
-        f"{_decision_emoji(report['decision'], not bool(report['risk_allowed']))} [AI 단타] {report['decision']} ({report['confidence']:.2f})",
-        f"- 사유: {report['reason']}",
-        f"- [현재 잔고/수익률]: {ledger.balance_krw:,.0f}원 ({sign}{ledger.total_profit_pct:.2f}%) / {ledger.balance_usdt:,.2f} USDT",
-        f"- [AI 학습 상태]: 누적 유니크 실패 사례 {ledger.unique_failure_count}건 학습 완료",
-        f"- [최근 반성]: {ledger.last_reflection_summary or '아직 기록된 반성 없음'}",
-        f"- 유사 실패 경고: {learning_summary or '현재 유사한 실패 사례 없음'}",
-        f"- 오늘 총 AI 판단 횟수: {total_count}회 / 진입 시도: {attempt_count}회",
-        f"- 이번 달 남은 기간: D-{days_left_in_month_kst()}일",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"{_decision_emoji(report['decision'], not bool(report['risk_allowed']))} AI 가상 매매 리포트",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📌 최종 판단: {report['decision']} / 신뢰도 {report['confidence']:.2f}",
+        f"💬 판단 사유: {_report_text(report['reason'])}",
+        "",
+        "🟢 [매매 알림]",
+        f"코인: {market.get('symbol', 'BTCUSDT')} ({market.get('interval', '')})",
+        f"현재 가격: {_format_price(market.get('price', 0.0))}",
+        f"매수/매도 이유: {_report_text(report['reason'])}",
+        f"기술 지표: RSI {_safe_float(market.get('rsi', 0.0)):.1f} / BB {_safe_float(market.get('bb_position', 0.0)):.2f} / EMA갭 {_safe_float(market.get('ema_gap_pct', 0.0)):+.2f}%",
+        "",
+        "🔴 [매도 알림]",
+        (
+            f"청산 시각: {close_event.get('exit_at_kst', '')} / 사유: {close_event.get('exit_reason', '')} / "
+            f"확정 수익: {_format_krw(close_event.get('pnl_krw', 0.0))} ({_safe_float(close_event.get('pnl_usdt', 0.0)):+.4f} USDT)"
+            if close_event
+            else "이번 사이클 청산 없음"
+        ),
+        "",
+        "🧠 [학습 상태]",
+        f"누적 유니크 실패 사례: {ledger.unique_failure_count}건",
+        f"최근 개선점: {_report_text(ledger.last_reflection_summary, '아직 기록된 반성 없음')}",
+        f"유사 실패 경고: {_report_text(learning_summary, '현재 유사한 실패 사례 없음')}",
+        f"오늘 판단/진입: {total_count}회 / {attempt_count}회",
+        "",
+        "💳 [API 잔액]",
+        *api_lines,
+        "",
+        "📊 [원장]",
+        f"잔고/수익률: {ledger.balance_krw:,.0f}원 ({sign}{ledger.total_profit_pct:.2f}%) / {ledger.balance_usdt:,.2f} USDT",
+        f"월 목표 100,000원까지 남은 기간: D-{days_left_in_month_kst()}일",
     ]
-    if close_info:
-        close_event = close_info.get("close_event", {})
-        lines.append(
-            f"- 최근 청산: {close_event.get('side', '')} {close_event.get('pnl_krw', 0.0):,.0f}원 / {close_event.get('pnl_usdt', 0.0):,.3f} USDT"
-        )
-        reflection = close_info.get("reflection_result", {})
-        if reflection.get("summary"):
-            lines.append(f"- 반성 요약: {reflection['summary']}")
     if open_position:
-        lines.append(
-            f"- 보유 포지션: {open_position.get('side', '')} @ {float(open_position.get('entry_price', 0.0)):.2f} "
-            f"(만기 {open_position.get('expires_at_kst', '')})"
+        lines.extend(
+            [
+                "",
+                "📍 [보유 포지션]",
+                f"방향: {open_position.get('side', '')} / 진입가: {_format_price(open_position.get('entry_price', 0.0))}",
+                f"손절: {_format_price(open_position.get('stop_loss', 0.0))} / 익절: {_format_price(open_position.get('take_profit', 0.0))}",
+                f"만기: {open_position.get('expires_at_kst', '')} / 연장 {open_position.get('hold_extensions', 0)}회",
+            ]
         )
+    if close_info and close_info.get("reflection_result", {}).get("summary"):
+        lines.extend(["", f"📝 반성 요약: {_report_text(close_info['reflection_result']['summary'])}"])
     return "\n".join(lines)
+
+
+def _send_startup_report() -> None:
+    global STARTUP_REPORT_SENT
+    if STARTUP_REPORT_SENT:
+        return
+
+    _load_env()
+    if _hydrate_kakao_tokens is not None:
+        _hydrate_kakao_tokens()
+    health_ok = _check_project_connectivity()
+
+    krw_per_usdt = _env_float("KRW_PER_USDT", 1380.0)
+    initial_krw, initial_usdt = _initial_balances(krw_per_usdt)
+    stats = load_trading_stats(
+        initial_balance_krw=initial_krw,
+        initial_balance_usdt=initial_usdt,
+    )
+    ledger = summarize_ledger(stats)
+    started_at = datetime.now(KST)
+    model = _env_str("OPENAI_MODEL", "gpt-4o")
+    dry_run = _env_bool("AI_DRY_RUN", True)
+    mode = "가상 매매(DRY RUN)" if dry_run else "실거래 모드"
+    loop_seconds = max(30, _env_int("AI_LOOP_SECONDS", 300))
+
+    body = "\n".join(
+        [
+            "━━━━━━━━━━━━━━━━━━━━",
+            "🚀 [운영 시작 보고]",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"시스템 가동 시각: {started_at.strftime('%Y-%m-%d %H:%M:%S KST')}",
+            f"현재 가상 잔고: {ledger.balance_krw:,.0f}원 / {ledger.balance_usdt:,.4f} USDT",
+            f"적용 모델: {model}",
+            f"매매 모드: {mode}",
+            f"감시 주기 설정: {loop_seconds}초",
+            f"프로젝트 연결 상태: {'정상' if health_ok else '점검 필요'}",
+            "",
+            "시스템이 정상적으로 기동되었으며, 5분 주기로 시장 감시를 시작합니다.",
+        ]
+    )
+    _notify_kakao("🚀 AI 가상 매매 운영 시작", body)
+    STARTUP_REPORT_SENT = True
 
 
 def run_cycle() -> Dict[str, Any]:
     _load_env()
     if _hydrate_kakao_tokens is not None:
         _hydrate_kakao_tokens()
+    _check_project_connectivity()
+    if calculate_position_size is None:
+        raise RuntimeError("btc_live_trading.strategy.risk_manager 모듈을 로드할 수 없습니다.") from _POSITION_SIZE_IMPORT_ERROR
 
     symbol = _env_str("AI_SYMBOL", "BTCUSDT")
     interval = _env_str("AI_TIMEFRAME", "5m")
     leverage = _env_int("AI_LEVERAGE", 3)
-    risk_per_trade = _env_float("AI_RISK_PER_TRADE", 0.01)
+    risk_per_trade = _env_float("AI_RISK_PER_TRADE", 0.015)
     dry_run = _env_bool("AI_DRY_RUN", True)
     model = _env_str("OPENAI_MODEL", "gpt-4o")
     krw_per_usdt = _env_float("KRW_PER_USDT", 1380.0)
-    hold_minutes = _env_int("AI_PAPER_HOLD_MINUTES", 15)
+    hold_minutes = _env_int("AI_PAPER_HOLD_MINUTES", 30)
     status_report_minutes = _env_int("AI_STATUS_REPORT_MINUTES", 60)
     initial_krw, initial_usdt = _initial_balances(krw_per_usdt)
     stats = load_trading_stats(
@@ -678,7 +1400,12 @@ def run_cycle() -> Dict[str, Any]:
 
     close_info: Dict[str, Any] | None = None
     open_position = stats.get("open_position") if isinstance(stats.get("open_position"), dict) else None
-    if open_position and _position_due(open_position, now_kst):
+    if open_position:
+        exit_reason = _position_exit_reason(stats, open_position, snapshot, now_kst, hold_minutes)
+        open_position = stats.get("open_position") if isinstance(stats.get("open_position"), dict) else open_position
+    else:
+        exit_reason = None
+    if open_position and exit_reason:
         close_info = _close_position(
             stats=stats,
             open_position=open_position,
@@ -686,20 +1413,32 @@ def run_cycle() -> Dict[str, Any]:
             now_kst=now_kst,
             krw_per_usdt=krw_per_usdt,
             model=model,
+            exit_reason=exit_reason,
         )
         open_position = None
 
     memory_block, memory_summary, memory_similarity = _find_closest_failure_memory(snapshot)
     context_text = backtest_summary.to_context_text() + f"\nSimilar-case mean pnl: {similar_avg_pnl:.4f}\n"
-    raw_ai_decision = get_ai_decision(
+    model_ai_decision = get_ai_decision(
         context_text,
         snapshot,
         similar_cases,
         model=model,
         failure_memory=memory_block,
     )
+    technical_decision = _technical_signal_decision(snapshot, backtest_summary.sample_size, similar_avg_pnl)
+    raw_ai_decision = _blend_ai_and_technical_decision(model_ai_decision, technical_decision)
     _append_structured_ai_log(
         phase="RAW",
+        timestamp=now_kst,
+        snapshot=snapshot,
+        decision=model_ai_decision["decision"],
+        confidence=float(model_ai_decision["confidence"]),
+        risk_allowed=True,
+        reason=model_ai_decision["reason"],
+    )
+    _append_structured_ai_log(
+        phase="ADJUSTED",
         timestamp=now_kst,
         snapshot=snapshot,
         decision=raw_ai_decision["decision"],
@@ -731,7 +1470,7 @@ def run_cycle() -> Dict[str, Any]:
             entry_price=float(snapshot["price"]),
             stop_loss_price=stop_loss,
             proposed_position_size=position_size,
-            max_risk_ratio=0.01,
+            max_risk_ratio=_env_float("AI_MAX_RISK_RATIO", 0.025),
             on_block=lambda text: _notify_kakao("⚠️ AI 리스크 경고", text),
         )
     else:
@@ -791,7 +1530,9 @@ def run_cycle() -> Dict[str, Any]:
         "failure_memory_similarity": memory_similarity,
         "open_position": open_position,
         "close_event": close_info["close_event"] if close_info else None,
-        "raw_model_decision": raw_ai_decision,
+        "raw_model_decision": model_ai_decision,
+        "adjusted_decision": raw_ai_decision,
+        "technical_decision": technical_decision,
     }
     _append_structured_ai_log(
         phase="FINAL",
@@ -805,12 +1546,15 @@ def run_cycle() -> Dict[str, Any]:
 
     send_report = bool(opened_position or close_info or _should_send_periodic_report(stats, now_kst, status_report_minutes))
     if send_report:
+        api_usage = _fetch_openai_api_usage(now_kst)
+        stats["last_openai_api_usage"] = api_usage
         msg = _build_kakao_message(
             report=report,
             stats=stats,
             learning_summary=memory_summary,
             close_info=close_info,
             open_position=open_position,
+            api_usage=api_usage,
         )
         _notify_kakao("📊 AI Self-Learning Paper Engine", msg)
         stats["last_report_at_kst"] = now_kst.isoformat()
@@ -825,6 +1569,7 @@ def run_once() -> Dict[str, Any]:
 def run_forever() -> None:
     _load_env()
     loop_seconds = max(30, _env_int("AI_LOOP_SECONDS", 300))
+    _send_startup_report()
     while True:
         cycle_started = time.time()
         try:
@@ -842,6 +1587,8 @@ def run_forever() -> None:
 
 if __name__ == "__main__":
     _load_env()
+    _check_project_connectivity()
+    _send_startup_report()
     if _env_bool("AI_RUN_ONCE", False):
         print(json.dumps(run_cycle(), ensure_ascii=False))
     else:

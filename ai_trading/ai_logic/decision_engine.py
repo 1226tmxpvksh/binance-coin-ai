@@ -55,7 +55,10 @@ def _build_messages(
         "You are a crypto scalp trading assistant. "
         "You must output only valid JSON with schema: "
         '{"decision":"BUY|SELL|HOLD","reason":"string","confidence":0.0}. '
-        "Decision must use both current indicators and backtest similarity evidence."
+        "Operate with an aggressive paper-trading profile targeting monthly 20% growth. "
+        "When RSI, Bollinger Band position, and EMA trend clearly agree, you may enter even if "
+        "backtest similarity evidence is sparse. Use HOLD only when the signal is mixed or risk/reward is poor. "
+        "The reason field must be written in Korean for a human operator."
     )
     memory_block = ""
     if failure_memory.strip():
@@ -68,7 +71,7 @@ def _build_messages(
         f"{json.dumps(market_snapshot, ensure_ascii=False)}\n\n"
         "Most similar backtest cases:\n"
         f"{json.dumps(similar_cases, ensure_ascii=False)}\n\n"
-        "Return strict JSON only."
+        "Return strict JSON only. Confidence should reflect current technical clarity, not only backtest sample size."
     )
     return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
@@ -171,14 +174,16 @@ def analyze_trade_failure(
     side = str(trade_context.get("side", "HOLD")).upper()
     system_prompt = (
         "You are a trading post-mortem analyst. "
-        "Return strict JSON only with keys: market_context, failure_reason, reflection_summary, warning."
+        "Return strict JSON only with keys: market_context, failure_reason, reflection_summary, warning. "
+        "All values must be written in Korean."
     )
     user_prompt = (
         "Analyze why this virtual scalp trade failed or underperformed.\n\n"
         f"Trade context:\n{json.dumps(trade_context, ensure_ascii=False)}\n\n"
         f"Entry snapshot:\n{json.dumps(entry_snapshot, ensure_ascii=False)}\n\n"
         f"Exit snapshot:\n{json.dumps(exit_snapshot, ensure_ascii=False)}\n\n"
-        "Focus on market structure, volatility, trend mismatch, and overfitting to a single indicator."
+        "Focus on market structure, volatility, trend mismatch, and overfitting to a single indicator. "
+        "Write concise Korean sentences for a KakaoTalk report."
     )
     try:
         data = _call_openai_json(

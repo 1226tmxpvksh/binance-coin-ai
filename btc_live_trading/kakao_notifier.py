@@ -9,6 +9,7 @@ import json
 import os
 from typing import Optional
 from datetime import datetime
+from urllib.parse import quote
 
 from kakao_utils import (
     apply_token_response,
@@ -25,6 +26,47 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 1000
 
 
+def _build_kakao_auth_url(rest_api_key: str, redirect_uri: str) -> str:
+    if not rest_api_key or not redirect_uri:
+        return ""
+    encoded_redirect_uri = quote(redirect_uri.strip(), safe="")
+    return (
+        "https://kauth.kakao.com/oauth/authorize?"
+        f"client_id={rest_api_key}&redirect_uri={encoded_redirect_uri}&response_type=code"
+    )
+
+
+def _validate_redirect_uri_config(redirect_uri: str) -> bool:
+    env_redirect_uri = os.getenv("KAKAO_REDIRECT_URI", "").strip()
+    if not redirect_uri:
+        logger.error("KAKAO_REDIRECT_URI가 비어 있습니다. 카카오 개발자 콘솔 Redirect URI와 동일하게 설정하세요.")
+        return False
+    if redirect_uri in {"https://example.com/oauth", "your_redirect_uri_here"}:
+        logger.error("KAKAO_REDIRECT_URI가 기본 예시값입니다. 실제 등록 URI로 변경하세요.")
+        return False
+    if not redirect_uri.startswith(("http://", "https://")):
+        logger.error("KAKAO_REDIRECT_URI 형식이 올바르지 않습니다: %s", redirect_uri)
+        return False
+    if env_redirect_uri and env_redirect_uri != redirect_uri:
+        logger.error("KAKAO_REDIRECT_URI 불일치: env=%s, notifier=%s", env_redirect_uri, redirect_uri)
+        return False
+    return True
+
+
+def _response_error_payload(exc: Exception) -> tuple[str, str]:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return "", ""
+    try:
+        payload = response.json()
+        return (
+            str(payload.get("error") or "").strip(),
+            str(payload.get("error_description") or "").strip(),
+        )
+    except Exception:
+        return "", str(getattr(response, "text", "") or "").strip()
+
+
 class KakaoNotifier:
     """카카오톡 알림 클래스"""
     
@@ -34,6 +76,7 @@ class KakaoNotifier:
         enabled: bool = True,
         rest_api_key: str = "",
         redirect_uri: Optional[str] = None,
+        prompt_on_refresh_failure: bool = True,
     ):
         """
         Args:
@@ -47,6 +90,7 @@ class KakaoNotifier:
         self.rest_api_key = rest_api_key
         self.api_url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
         self.redirect_uri = (redirect_uri or get_redirect_uri()).strip()
+        self.prompt_on_refresh_failure = prompt_on_refresh_failure
         self._first_403_disable = True
     
     def send_message(self, title: str, description: str, retry_count: int = 0) -> bool:
@@ -134,12 +178,11 @@ class KakaoNotifier:
                 logger.error("")
                 auth_url = ""
                 if self.rest_api_key and self.rest_api_key != "your_rest_api_key_here":
-                    auth_url = (
-                        f"https://kauth.kakao.com/oauth/authorize?"
-                        f"client_id={self.rest_api_key}&redirect_uri={self.redirect_uri}&response_type=code"
-                    )
+                    _validate_redirect_uri_config(self.redirect_uri)
+                    auth_url = _build_kakao_auth_url(self.rest_api_key, self.redirect_uri)
                 logger.error("🔗 토큰 재발급 URL (브라우저에서 열기):")
                 logger.error(f"   {auth_url}")
+                logger.error("KOE205 발생 시 KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인하세요.")
                 logger.error("=" * 80)
 
                 if self._first_403_disable:
@@ -190,19 +233,28 @@ class KakaoNotifier:
             logger.warning("리프레시 토큰 갱신 실패, 수동 갱신 필요")
         
         # 리프레시 토큰이 없으면 수동 갱신 프롬프트
-        logger.warning("리프레시 토큰이 없습니다. 수동 토큰 갱신이 필요합니다.")
+        logger.warning("리프레시 토큰이 없거나 만료되었습니다. 수동 토큰 갱신이 필요합니다.")
         
         if self.rest_api_key and self.rest_api_key != "your_rest_api_key_here":
-            auth_url = f"https://kauth.kakao.com/oauth/authorize?client_id={self.rest_api_key}&redirect_uri={self.redirect_uri}&response_type=code"
+            _validate_redirect_uri_config(self.redirect_uri)
+            auth_url = _build_kakao_auth_url(self.rest_api_key, self.redirect_uri)
             logger.error("=" * 80)
             logger.error("⚠️ 카카오톡 액세스 토큰이 만료되었습니다!")
+            logger.error("리프레시 토큰까지 만료된 경우 새 인가 코드 발급이 필요합니다.")
             logger.error("=" * 80)
             logger.error("🔗 토큰 재발급 URL (브라우저에서 열기):")
             logger.error(f"   {auth_url}")
+            logger.error("절차: URL 접속 → 로그인/동의 → 리다이렉트 URL의 code= 값 복사 → 프롬프트에 입력")
+            logger.error("KOE205 발생 시 KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인하세요.")
             logger.error("=" * 80)
             
-            self._prompt_token_refresh()
-            return True  # 프롬프트 실행됨
+            if self.prompt_on_refresh_failure:
+                self._prompt_token_refresh()
+                return True  # 프롬프트 실행됨
+
+            logger.warning("무인 실행 모드라 토큰 갱신 프롬프트를 생략합니다.")
+            self.enabled = False
+            return False
         
         return False
     
@@ -228,7 +280,13 @@ class KakaoNotifier:
                 apply_token_response(token_data)
             return access_token
         except Exception as e:
-            logger.error("토큰 갱신 요청 오류: %s", type(e).__name__)
+            error_code, error_description = _response_error_payload(e)
+            if error_code == "expired_or_invalid_refresh_token":
+                logger.error("카카오 리프레시 토큰 만료/무효: 새 인가 코드 발급이 필요합니다.")
+            elif error_code:
+                logger.error("토큰 갱신 요청 오류: %s (%s)", error_code, error_description or type(e).__name__)
+            else:
+                logger.error("토큰 갱신 요청 오류: %s", type(e).__name__)
             return None
     
     def _prompt_token_refresh(self):
@@ -247,6 +305,8 @@ class KakaoNotifier:
             
             # Authorization Code 입력
             print("\n📝 Authorization Code 입력")
+            print(f"   현재 redirect_uri: {self.redirect_uri}")
+            print("   카카오 개발자 콘솔 Redirect URI와 위 값이 1글자도 다르면 KOE205가 발생합니다.")
             print("   (브라우저에서 리다이렉트된 URL의 'code=' 뒤 값을 복사하세요)")
             print("   💡 붙여넣기: 마우스 우클릭 또는 Ctrl+V")
             auth_code = input("Code: ").strip()
@@ -315,7 +375,13 @@ class KakaoNotifier:
                 apply_token_response(token_data)
             return access_token
         except Exception as e:
-            logger.error("토큰 발급 요청 오류: %s", type(e).__name__)
+            error_code, error_description = _response_error_payload(e)
+            if error_code == "KOE205" or "KOE205" in error_description:
+                logger.error("토큰 발급 실패(KOE205): KAKAO_REDIRECT_URI가 카카오 개발자 콘솔 Redirect URI와 다릅니다.")
+            elif error_code:
+                logger.error("토큰 발급 요청 오류: %s (%s)", error_code, error_description or type(e).__name__)
+            else:
+                logger.error("토큰 발급 요청 오류: %s", type(e).__name__)
             return None
     
     def notify_start(self):
