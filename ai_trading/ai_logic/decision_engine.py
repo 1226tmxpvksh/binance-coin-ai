@@ -63,15 +63,35 @@ def _build_messages(
     memory_block = ""
     if failure_memory.strip():
         memory_block = f"Past failure to avoid:\n{failure_memory.strip()}\n\n"
+    compact_snapshot = {
+        "price": market_snapshot.get("price"),
+        "rsi": market_snapshot.get("rsi"),
+        "ema20": market_snapshot.get("ema20"),
+        "ema60": market_snapshot.get("ema60"),
+        "ema_gap_pct": market_snapshot.get("ema_gap_pct"),
+        "bb_position": market_snapshot.get("bb_position"),
+        "atr_pct": market_snapshot.get("atr_pct"),
+    }
+    compact_cases = []
+    for case in similar_cases[:3]:
+        compact_cases.append(
+            {
+                "side": case.get("side"),
+                "pnl": case.get("pnl"),
+                "rsi": case.get("rsi"),
+                "ema_gap_pct": case.get("ema_gap_pct"),
+                "atr_pct": case.get("atr_pct"),
+            }
+        )
     user_prompt = (
-        "Context from backtest analysis:\n"
-        f"{backtest_context}\n\n"
+        "Backtest context(summary):\n"
+        f"{backtest_context[:700]}\n\n"
         f"{memory_block}"
-        "Current market snapshot:\n"
-        f"{json.dumps(market_snapshot, ensure_ascii=False)}\n\n"
-        "Most similar backtest cases:\n"
-        f"{json.dumps(similar_cases, ensure_ascii=False)}\n\n"
-        "Return strict JSON only. Confidence should reflect current technical clarity, not only backtest sample size."
+        "Snapshot JSON:\n"
+        f"{json.dumps(compact_snapshot, ensure_ascii=False, separators=(',', ':'))}\n"
+        "Similar cases JSON:\n"
+        f"{json.dumps(compact_cases, ensure_ascii=False, separators=(',', ':'))}\n"
+        "Return strict JSON only."
     )
     return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
@@ -160,6 +180,45 @@ def get_ai_decision(
         return {"decision": "HOLD", "reason": "모델 응답 파싱 실패로 HOLD 처리", "confidence": 0.0}
     except RuntimeError:
         return {"decision": "HOLD", "reason": "OPENAI_API_KEY 미설정으로 HOLD 처리", "confidence": 0.0}
+
+
+def get_market_monitor_summary(
+    market_snapshot: Dict[str, float],
+    model: str = "gpt-4o-mini",
+) -> Dict[str, str]:
+    api_key = _load_openai_api_key()
+    if not api_key:
+        return {"summary": "OPENAI_API_KEY 미설정으로 시장 요약 생략", "model": model}
+
+    system_prompt = (
+        "You are a crypto monitoring assistant. "
+        "Return strict JSON only with keys: summary, tone. "
+        "summary must be Korean and <= 90 chars."
+    )
+    compact_snapshot = {
+        "price": market_snapshot.get("price"),
+        "rsi": market_snapshot.get("rsi"),
+        "ema_gap_pct": market_snapshot.get("ema_gap_pct"),
+        "bb_position": market_snapshot.get("bb_position"),
+        "atr_pct": market_snapshot.get("atr_pct"),
+    }
+    user_prompt = (
+        "Market snapshot JSON:\n"
+        f"{json.dumps(compact_snapshot, ensure_ascii=False, separators=(',', ':'))}"
+    )
+    try:
+        data = _call_openai_json(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            model=model,
+            timeout=20,
+        )
+        summary = str(data.get("summary", "")).strip()
+        if not summary:
+            summary = "시장 요약 생성 실패"
+        return {"summary": summary[:90], "model": model}
+    except Exception as e:
+        logger.warning("Market monitor summary fallback used: %s", type(e).__name__)
+        return {"summary": "시장 요약 생성 실패(로컬 모니터링 유지)", "model": model}
 
 
 def analyze_trade_failure(

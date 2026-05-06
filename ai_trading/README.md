@@ -5,6 +5,7 @@
 ## 주요 기능
 
 - 5분 주기 시장 감시와 단발 점검 실행을 지원합니다.
+- RSI/EMA/Bollinger 로컬 게이트를 먼저 통과한 경우에만 진입용 AI 판단을 호출해 OpenAI 토큰 사용량을 줄입니다.
 - `trading_stats.json`, `virtual_trades.jsonl`, `ai_learning_logs.csv`에 운영 상태와 학습 기록을 저장합니다.
 - 카카오 액세스 토큰 만료 시 refresh-token으로 자동 갱신하고, 새 토큰을 `.env`와 `kakao_code.json`에 동기화합니다.
 - refresh-token까지 만료되면 터미널에 인가 URL을 표시하고 새 인가 코드를 입력받아 즉시 세션을 복구합니다.
@@ -37,30 +38,61 @@ py -3 -m pip install openai requests
 운영 환경변수는 기본적으로 `btc_live_trading\.env`를 사용합니다. 파일이 없다면 같은 경로에 새로 만듭니다.
 
 ```env
-OPENAI_API_KEY=sk-...
+# ==========================================
+# 4. 시스템 운영 설정
+# ==========================================
+
+# 9번 라인 모델명 (따옴표, 공백, 주석 절대 금지)
 OPENAI_MODEL=gpt-4o
-
-AI_SYMBOL=BTCUSDT
-AI_TIMEFRAME=5m
-AI_LOOP_SECONDS=300
-AI_RUN_ONCE=false
+# 거래 모드 (scalping = 단타)
+TRADING_MODE=scalping
+# 실전 매매 승인 (YES로 설정해야 작동)
+SCALPING_LIVE_CONFIRMED=YES
+# AI 판단 사용 여부
+USE_AI_CONFIRM=true
+# 테스트 모드 (true면 가상 매매)
 AI_DRY_RUN=true
-
-AI_LEVERAGE=3
-AI_RISK_PER_TRADE=0.015
-AI_MAX_RISK_RATIO=0.025
-AI_ATR_STOP_MULTIPLIER=1.6
-AI_ATR_TAKE_PROFIT_MULTIPLIER=3.2
-AI_MIN_TAKE_PROFIT_RATIO=0.012
-AI_PAPER_HOLD_MINUTES=30
-
+# 현재 환율 (수익 계산용)
 KRW_PER_USDT=1380
-OPENAI_MONTHLY_BUDGET_USD=10
+# 손절폭 배수 (1.5~2.0 권장)
+AI_ATR_STOP_MULTIPLIER=1.2
+# 월 목표 수익금 (원 단위)
+MONTHLY_TARGET_KRW=100000
+# 한 달 OpenAI 사용 예산 (예: 10달러)
+OPENAI_MONTHLY_BUDGET_USD=4.50
 
-KAKAO_REST_API_KEY=...
-KAKAO_REDIRECT_URI=https://your-registered-redirect-uri
-KAKAO_ACCESS_TOKEN=...
-KAKAO_REFRESH_TOKEN=...
+# ==========================================
+# 5. 가상 자산 및 루프 엔진 설정
+# ==========================================
+
+# 초기 가상 자산 설정 (50만 원)
+AI_VIRTUAL_INITIAL_KRW=500000
+# 초기 가상 달러 설정 (약 362 USDT)
+AI_VIRTUAL_INITIAL_USDT=362
+
+# 루프 주기 (300초 = 5분마다 시장 감시)
+AI_LOOP_SECONDS=300
+# 가상 포지션 최대 보유 시간 (15분 후 자동 청산)
+AI_PAPER_HOLD_MINUTES=15
+# 카카오톡 상태 보고 주기 (60분마다 현재 수익률 보고)
+AI_STATUS_REPORT_MINUTES=60
+# 1회 실행 후 종료 여부 (무한 루프를 위해 false 설정)
+AI_RUN_ONCE=false
+
+# ==========================================
+# 6. 운영 비용 및 수익 최적화 설정
+# ==========================================
+
+# 예상 일일 서버 비용 (원 단위, 예: 500원)
+AI_EST_DAILY_SERVER_COST_KRW=500
+
+# 월간 총 구독료 (커서 $20 + 넷플릭스 + 제미나이 등 합산 원화)
+# 예: 약 80,000원 (환율 1400원 가정)
+AI_MONTHLY_SUBSCRIPTION_COST_KRW=80000
+
+# 모델 분기 운영 (기본 mini 사용, 진입 시에만 gpt-4o 호출 권장)
+AI_MONITOR_MODEL=gpt-4o-mini
+AI_ENTRY_MODEL=gpt-4o
 ```
 
 ### 카카오 인증 값
@@ -108,13 +140,27 @@ py -3 ai_trading\main_ai.py
 
 카카오 401 또는 `expired_or_invalid_refresh_token`이 발생하면 refresh-token까지 만료된 상태입니다. 이는 코드 문제가 아니라 카카오 OAuth 보안 정책에 따른 정상 만료 상황입니다.
 
+이 경우 프로그램은 종료하지 않고 터미널에서 수동 복구 모드로 전환합니다.
+
 1. 터미널에 출력된 카카오 인가 URL을 브라우저에서 엽니다.
 2. 카카오 로그인 및 동의를 완료합니다.
 3. 리다이렉트된 URL에서 `code=` 뒤 값을 복사합니다.
 4. 터미널의 `인가 코드(code):` 입력란에 새 인가 코드를 붙여넣습니다.
 5. 새 refresh-token이 저장되면 이후 액세스 토큰 만료는 다시 자동 갱신됩니다.
 
+새 토큰은 `btc_live_trading\.env`와 `btc_live_trading\kakao_code.json`에 함께 저장됩니다. 인가 코드를 입력하지 않고 Enter를 누르면 카카오 알림만 건너뛰고 매매 루프는 계속 진행됩니다.
+
 KOE205가 발생하면 `KAKAO_REDIRECT_URI`와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인한 뒤 새 인가 코드를 다시 발급하세요.
+
+## 운영 가이드 (비용 최적화)
+
+- AI 호출 게이트: `RSI<=35` 또는 `RSI>=65`, `BB<=0.20` 또는 `BB>=0.80`, `|EMA_GAP|>=0.03%` 중 하나라도 충족할 때만 진입 AI를 호출합니다.
+- 중립 구간(`RSI/EMA/BB` 모두 평탄)에서는 AI를 호출하지 않고 즉시 `HOLD` 처리합니다.
+- 모델 분기: 모니터링 요약은 `OPENAI_MONITOR_MODEL` 또는 `AI_MONITOR_MODEL`(권장 `gpt-4o-mini`), 진입 판단은 `OPENAI_ENTRY_MODEL` 또는 `AI_ENTRY_MODEL`(권장 `gpt-4o`)을 사용합니다.
+- 프롬프트 경량화: 진입 판단 시 스냅샷 핵심 필드만 전달하고 유사 케이스는 상위 3개 핵심 컬럼만 전송합니다.
+- 월 순수익(Net Profit) 계산식:
+  - `월 순수익 = monthly_realized_pnl_krw - ((estimated_daily_server_cost_krw * 30) + monthly_subscription_cost_krw)`
+  - `AI_DAILY_SERVER_COST_KRW`(또는 `AI_EST_DAILY_SERVER_COST_KRW`), `AI_MONTHLY_SUBSCRIPTION_COST_KRW` 값은 `trading_stats.json` 집계에 반영됩니다.
 
 ## 운영 데이터
 

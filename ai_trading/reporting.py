@@ -23,6 +23,10 @@ class LedgerSummary:
     total_profit_usdt: float
     total_profit_pct: float
     monthly_profit_krw: float
+    estimated_daily_server_cost_krw: float
+    monthly_subscription_cost_krw: float
+    monthly_operating_cost_krw: float
+    monthly_net_profit_krw: float
     trade_count: int
     win_count: int
     loss_count: int
@@ -81,6 +85,8 @@ def default_trading_stats(
         "total_realized_pnl_usdt": 0.0,
         "monthly_realized_pnl_krw": 0.0,
         "monthly_realized_pnl_usdt": 0.0,
+        "estimated_daily_server_cost_krw": 0.0,
+        "monthly_subscription_cost_krw": 0.0,
         "cumulative_profit_krw": 0.0,
         "run_count": 0,
         "trade_count": 0,
@@ -94,6 +100,10 @@ def default_trading_stats(
         "last_cycle_at_kst": "",
         "last_trade_closed_at_kst": "",
         "last_report_at_kst": "",
+        "ai_entry_calls": 0,
+        "ai_monitor_calls": 0,
+        "ai_calls_saved_by_gate": 0,
+        "estimated_tokens_saved": 0,
         "open_position": None,
     }
 
@@ -137,6 +147,8 @@ def _normalize_stats(
     stats["total_realized_pnl_usdt"] = _safe_float(data.get("total_realized_pnl_usdt", 0.0))
     stats["monthly_realized_pnl_krw"] = _safe_float(data.get("monthly_realized_pnl_krw", legacy_profit), legacy_profit)
     stats["monthly_realized_pnl_usdt"] = _safe_float(data.get("monthly_realized_pnl_usdt", 0.0))
+    stats["estimated_daily_server_cost_krw"] = _safe_float(data.get("estimated_daily_server_cost_krw", 0.0))
+    stats["monthly_subscription_cost_krw"] = _safe_float(data.get("monthly_subscription_cost_krw", 0.0))
     stats["cumulative_profit_krw"] = _safe_float(data.get("cumulative_profit_krw", stats["total_realized_pnl_krw"]))
     stats["run_count"] = _safe_int(data.get("run_count", 0))
     stats["trade_count"] = _safe_int(data.get("trade_count", 0))
@@ -150,6 +162,10 @@ def _normalize_stats(
     stats["last_cycle_at_kst"] = str(data.get("last_cycle_at_kst", ""))
     stats["last_trade_closed_at_kst"] = str(data.get("last_trade_closed_at_kst", ""))
     stats["last_report_at_kst"] = str(data.get("last_report_at_kst", ""))
+    stats["ai_entry_calls"] = _safe_int(data.get("ai_entry_calls", 0))
+    stats["ai_monitor_calls"] = _safe_int(data.get("ai_monitor_calls", 0))
+    stats["ai_calls_saved_by_gate"] = _safe_int(data.get("ai_calls_saved_by_gate", 0))
+    stats["estimated_tokens_saved"] = _safe_int(data.get("estimated_tokens_saved", 0))
     open_position = data.get("open_position")
     stats["open_position"] = open_position if isinstance(open_position, dict) else None
     return stats
@@ -167,6 +183,10 @@ def _maybe_monthly_reset(stats: Dict[str, Any], now_kst: datetime) -> Dict[str, 
         stats["monthly_trade_count"] = 0
         stats["monthly_win_count"] = 0
         stats["monthly_loss_count"] = 0
+        stats["ai_entry_calls"] = 0
+        stats["ai_monitor_calls"] = 0
+        stats["ai_calls_saved_by_gate"] = 0
+        stats["estimated_tokens_saved"] = 0
         stats["last_reset_at_kst"] = now_kst.isoformat()
     elif "period" not in stats:
         stats["period"] = current_period
@@ -228,6 +248,10 @@ def summarize_ledger(stats: Dict[str, Any]) -> LedgerSummary:
     total_profit_krw = balance_krw - initial_krw
     total_profit_usdt = balance_usdt - initial_usdt
     total_profit_pct = (total_profit_krw / initial_krw * 100.0) if initial_krw > 0 else 0.0
+    estimated_daily_server_cost_krw = _safe_float(stats.get("estimated_daily_server_cost_krw", 0.0))
+    monthly_subscription_cost_krw = _safe_float(stats.get("monthly_subscription_cost_krw", 0.0))
+    monthly_operating_cost_krw = estimated_daily_server_cost_krw * 30.0 + monthly_subscription_cost_krw
+    monthly_net_profit_krw = _safe_float(stats.get("monthly_realized_pnl_krw", 0.0)) - monthly_operating_cost_krw
     return LedgerSummary(
         balance_krw=balance_krw,
         balance_usdt=balance_usdt,
@@ -235,6 +259,10 @@ def summarize_ledger(stats: Dict[str, Any]) -> LedgerSummary:
         total_profit_usdt=total_profit_usdt,
         total_profit_pct=total_profit_pct,
         monthly_profit_krw=_safe_float(stats.get("monthly_realized_pnl_krw", 0.0)),
+        estimated_daily_server_cost_krw=estimated_daily_server_cost_krw,
+        monthly_subscription_cost_krw=monthly_subscription_cost_krw,
+        monthly_operating_cost_krw=monthly_operating_cost_krw,
+        monthly_net_profit_krw=monthly_net_profit_krw,
         trade_count=_safe_int(stats.get("trade_count", 0)),
         win_count=_safe_int(stats.get("win_count", 0)),
         loss_count=_safe_int(stats.get("loss_count", 0)),

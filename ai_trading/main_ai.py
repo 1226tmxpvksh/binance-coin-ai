@@ -51,7 +51,7 @@ def _bootstrap_sys_path() -> None:
 
 _bootstrap_sys_path()
 
-from ai_logic.decision_engine import analyze_trade_failure, get_ai_decision
+from ai_logic.decision_engine import analyze_trade_failure, get_ai_decision, get_market_monitor_summary
 from data.backtest_data import find_similar_backtest_cases, load_backtest_summary
 from data.market_data import fetch_market_snapshot
 from reporting import days_left_in_month_kst, load_trading_stats, save_trading_stats, summarize_ledger
@@ -399,6 +399,34 @@ def _technical_signal_decision(snapshot: Dict[str, Any], sample_size: int, simil
         "reason": " / ".join(reasons[:3]) or "기술 지표 정렬",
         "score": score,
     }
+
+
+def _ai_entry_gate(snapshot: Dict[str, Any]) -> Tuple[bool, str]:
+    rsi = _safe_float(snapshot.get("rsi", 50.0), 50.0)
+    bb = _safe_float(snapshot.get("bb_position", 0.5), 0.5)
+    ema_gap_pct = _safe_float(snapshot.get("ema_gap_pct", 0.0))
+
+    rsi_low = _env_float("AI_GATE_RSI_LOW", 35.0)
+    rsi_high = _env_float("AI_GATE_RSI_HIGH", 65.0)
+    bb_low = _env_float("AI_GATE_BB_LOW", 0.20)
+    bb_high = _env_float("AI_GATE_BB_HIGH", 0.80)
+    ema_gap_min = _env_float("AI_GATE_EMA_GAP_MIN_PCT", 0.03)
+
+    reasons: List[str] = []
+    if rsi <= rsi_low:
+        reasons.append(f"RSI 과매도({rsi:.1f}<={rsi_low:.1f})")
+    elif rsi >= rsi_high:
+        reasons.append(f"RSI 과매수({rsi:.1f}>={rsi_high:.1f})")
+    if bb <= bb_low:
+        reasons.append(f"BB 하단권({bb:.2f}<={bb_low:.2f})")
+    elif bb >= bb_high:
+        reasons.append(f"BB 상단권({bb:.2f}>={bb_high:.2f})")
+    if abs(ema_gap_pct) >= ema_gap_min:
+        reasons.append(f"EMA 갭({ema_gap_pct:+.2f}%)")
+
+    if reasons:
+        return True, " / ".join(reasons)
+    return False, "중립 구간(RSI/EMA/BB)으로 AI 호출 생략"
 
 
 def _blend_ai_and_technical_decision(
@@ -1276,6 +1304,7 @@ def _build_kakao_message(
         "━━━━━━━━━━━━━━━━━━━━",
         f"📌 최종 판단: {report['decision']} / 신뢰도 {report['confidence']:.2f}",
         f"💬 판단 사유: {_report_text(report['reason'])}",
+        f"🧭 모니터링 요약({report.get('monitor_model', 'gpt-4o-mini')}): {_report_text(report.get('monitor_summary', ''), '시장 요약 없음')}",
         "",
         "🟢 [매매 알림]",
         f"코인: {market.get('symbol', 'BTCUSDT')} ({market.get('interval', '')})",
@@ -1302,6 +1331,9 @@ def _build_kakao_message(
         "",
         "📊 [원장]",
         f"잔고/수익률: {ledger.balance_krw:,.0f}원 ({sign}{ledger.total_profit_pct:.2f}%) / {ledger.balance_usdt:,.2f} USDT",
+        f"월 실현손익: {ledger.monthly_profit_krw:,.0f}원 / 월 운영비: {ledger.monthly_operating_cost_krw:,.0f}원",
+        f"월 순수익(Net): {ledger.monthly_net_profit_krw:,.0f}원",
+        f"AI 게이트 절감 호출: {_safe_int(stats.get('ai_calls_saved_by_gate', 0))}회 / 예상 절감 토큰: {_safe_int(stats.get('estimated_tokens_saved', 0)):,}",
         f"월 목표 100,000원까지 남은 기간: D-{days_left_in_month_kst()}일",
     ]
     if open_position:
@@ -1337,7 +1369,7 @@ def _send_startup_report() -> None:
     )
     ledger = summarize_ledger(stats)
     started_at = datetime.now(KST)
-    model = _env_str("OPENAI_MODEL", "gpt-4o")
+    model = _env_str("OPENAI_ENTRY_MODEL", _env_str("AI_ENTRY_MODEL", _env_str("OPENAI_MODEL", "gpt-4o")))
     dry_run = _env_bool("AI_DRY_RUN", True)
     mode = "가상 매매(DRY RUN)" if dry_run else "실거래 모드"
     loop_seconds = max(30, _env_int("AI_LOOP_SECONDS", 300))
@@ -1374,7 +1406,8 @@ def run_cycle() -> Dict[str, Any]:
     leverage = _env_int("AI_LEVERAGE", 3)
     risk_per_trade = _env_float("AI_RISK_PER_TRADE", 0.015)
     dry_run = _env_bool("AI_DRY_RUN", True)
-    model = _env_str("OPENAI_MODEL", "gpt-4o")
+    entry_model = _env_str("OPENAI_ENTRY_MODEL", _env_str("AI_ENTRY_MODEL", _env_str("OPENAI_MODEL", "gpt-4o")))
+    monitor_model = _env_str("OPENAI_MONITOR_MODEL", _env_str("AI_MONITOR_MODEL", "gpt-4o-mini"))
     krw_per_usdt = _env_float("KRW_PER_USDT", 1380.0)
     hold_minutes = _env_int("AI_PAPER_HOLD_MINUTES", 30)
     status_report_minutes = _env_int("AI_STATUS_REPORT_MINUTES", 60)
@@ -1384,6 +1417,14 @@ def run_cycle() -> Dict[str, Any]:
         initial_balance_usdt=initial_usdt,
     )
     stats["run_count"] = _safe_int(stats.get("run_count", 0)) + 1
+    stats["estimated_daily_server_cost_krw"] = _env_float(
+        "AI_DAILY_SERVER_COST_KRW",
+        _env_float("AI_EST_DAILY_SERVER_COST_KRW", _safe_float(stats.get("estimated_daily_server_cost_krw", 0.0))),
+    )
+    stats["monthly_subscription_cost_krw"] = _env_float(
+        "AI_MONTHLY_SUBSCRIPTION_COST_KRW",
+        _safe_float(stats.get("monthly_subscription_cost_krw", 0.0)),
+    )
     now_kst = datetime.now(KST)
     stats["last_cycle_at_kst"] = now_kst.isoformat()
 
@@ -1412,20 +1453,32 @@ def run_cycle() -> Dict[str, Any]:
             snapshot=snapshot,
             now_kst=now_kst,
             krw_per_usdt=krw_per_usdt,
-            model=model,
+            model=entry_model,
             exit_reason=exit_reason,
         )
         open_position = None
 
+    gate_open, gate_reason = _ai_entry_gate(snapshot)
     memory_block, memory_summary, memory_similarity = _find_closest_failure_memory(snapshot)
     context_text = backtest_summary.to_context_text() + f"\nSimilar-case mean pnl: {similar_avg_pnl:.4f}\n"
-    model_ai_decision = get_ai_decision(
-        context_text,
-        snapshot,
-        similar_cases,
-        model=model,
-        failure_memory=memory_block,
-    )
+    if gate_open:
+        model_ai_decision = get_ai_decision(
+            context_text,
+            snapshot,
+            similar_cases,
+            model=entry_model,
+            failure_memory=memory_block,
+        )
+        stats["ai_entry_calls"] = _safe_int(stats.get("ai_entry_calls", 0)) + 1
+    else:
+        model_ai_decision = {
+            "decision": "HOLD",
+            "reason": f"{gate_reason} - 로컬 게이트에서 HOLD",
+            "confidence": 1.0,
+        }
+        stats["ai_calls_saved_by_gate"] = _safe_int(stats.get("ai_calls_saved_by_gate", 0)) + 1
+        estimated_saved = _env_int("AI_EST_TOKENS_PER_ENTRY_CALL", 900)
+        stats["estimated_tokens_saved"] = _safe_int(stats.get("estimated_tokens_saved", 0)) + max(0, estimated_saved)
     technical_decision = _technical_signal_decision(snapshot, backtest_summary.sample_size, similar_avg_pnl)
     raw_ai_decision = _blend_ai_and_technical_decision(model_ai_decision, technical_decision)
     _append_structured_ai_log(
@@ -1533,6 +1586,11 @@ def run_cycle() -> Dict[str, Any]:
         "raw_model_decision": model_ai_decision,
         "adjusted_decision": raw_ai_decision,
         "technical_decision": technical_decision,
+        "entry_gate_open": gate_open,
+        "entry_gate_reason": gate_reason,
+        "entry_model": entry_model,
+        "monitor_model": monitor_model,
+        "estimated_tokens_saved": _safe_int(stats.get("estimated_tokens_saved", 0)),
     }
     _append_structured_ai_log(
         phase="FINAL",
@@ -1546,8 +1604,11 @@ def run_cycle() -> Dict[str, Any]:
 
     send_report = bool(opened_position or close_info or _should_send_periodic_report(stats, now_kst, status_report_minutes))
     if send_report:
+        monitor_summary = get_market_monitor_summary(snapshot, model=monitor_model)
+        stats["ai_monitor_calls"] = _safe_int(stats.get("ai_monitor_calls", 0)) + 1
         api_usage = _fetch_openai_api_usage(now_kst)
         stats["last_openai_api_usage"] = api_usage
+        report["monitor_summary"] = monitor_summary.get("summary", "")
         msg = _build_kakao_message(
             report=report,
             stats=stats,
