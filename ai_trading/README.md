@@ -1,6 +1,6 @@
 # AI Trading 운영 가이드
 
-`ai_trading`은 Binance 시장 데이터, `btc_day_strategy` 백테스트 자료, OpenAI 판단 로직을 결합해 BTC 가상 매매를 운영하는 엔진입니다. 처음 실행하는 운영자가 바로 따라 할 수 있도록 설치, 환경변수 설정, 실행 방법만 정리합니다.
+`ai_trading`은 Binance 시장 데이터, `btc_day_strategy` 백테스트 자료, OpenAI 판단 로직을 결합해 BTC **가상·실전** 매매를 운영하는 엔진입니다. `AI_DRY_RUN`에 따라 리포트 문구·잔고 출처가 자동 전환됩니다. 처음 실행하는 운영자가 바로 따라 할 수 있도록 설치, 환경변수 설정, 실행 방법만 정리합니다.
 
 ## 주요 기능
 
@@ -10,7 +10,9 @@
 - 카카오 액세스 토큰 만료 시 refresh-token으로 자동 갱신하고, 새 토큰을 `.env`와 `kakao_code.json`에 동기화합니다.
 - refresh-token까지 만료되면 터미널에 인가 URL을 표시하고 새 인가 코드를 입력받아 즉시 세션을 복구합니다.
 - 실행 시작 시 `btc_live_trading`, `btc_day_strategy` 핵심 모듈이 정상 로드되는지 표 형태로 폴더 연결성 체크를 수행합니다.
-- OpenAI Usage/Costs 조회 권한이 없어도 매매 루프는 중단하지 않고 안내 상태만 남깁니다.
+- **USDT→KRW**는 CoinGecko `tether` 대비 `krw` 시세를 주기적으로 조회합니다(`btc_live_trading/fx_rates.py`). 수동 `KRW_PER_USDT` 설정은 제거되었습니다.
+- **실전(`AI_DRY_RUN=false`)**일 때 카카오 리포트의 잔고·수익률 줄은 Binance **USDT-M 선물 지갑** `futures_account_balance`의 USDT를 사용합니다. 조회 실패 시에만 원장(`virtual_balance_*`)으로 표시합니다.
+- 카카오 제목·본문 첫머리는 `[실전 매매 리포트]` / `[가상 매매 리포트]`로 구분됩니다.
 
 ## 설치
 
@@ -52,14 +54,10 @@ SCALPING_LIVE_CONFIRMED=YES
 USE_AI_CONFIRM=true
 # 테스트 모드 (true면 가상 매매)
 AI_DRY_RUN=true
-# 현재 환율 (수익 계산용)
-KRW_PER_USDT=1380
 # 손절폭 배수 (1.5~2.0 권장)
 AI_ATR_STOP_MULTIPLIER=1.2
 # 월 목표 수익금 (원 단위)
 MONTHLY_TARGET_KRW=100000
-# 한 달 OpenAI 사용 예산 (예: 10달러)
-OPENAI_MONTHLY_BUDGET_USD=4.50
 
 # ==========================================
 # 5. 가상 자산 및 루프 엔진 설정
@@ -87,7 +85,6 @@ AI_RUN_ONCE=false
 AI_EST_DAILY_SERVER_COST_KRW=500
 
 # 월간 총 구독료 (커서 $20 + 넷플릭스 + 제미나이 등 합산 원화)
-# 예: 약 80,000원 (환율 1400원 가정)
 AI_MONTHLY_SUBSCRIPTION_COST_KRW=80000
 
 # 모델 분기 운영 (기본 mini 사용, 진입 시에만 gpt-4o 호출 권장)
@@ -152,6 +149,17 @@ py -3 ai_trading\main_ai.py
 
 KOE205가 발생하면 `KAKAO_REDIRECT_URI`와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인한 뒤 새 인가 코드를 다시 발급하세요.
 
+## 실전(`AI_DRY_RUN=false`) 동작 요약
+
+| 구분 | 구현 위치 |
+|------|-----------|
+| 리포트 꼭지·카카오 제목의 `[실전 매매 리포트]` / `[가상 매매 리포트]` | `main_ai._report_bracket_title`, 알림 제목·`_build_kakao_message` 첫 줄 |
+| 실잔고(USDT-M 선물) | `main_ai._fetch_binance_futures_usdt_balance` → `reporting.resolve_report_balances` |
+| 원화 표시용 환율 | `btc_live_trading.fx_rates.fetch_usdt_krw` (CoinGecko), `main_ai._krw_per_usdt` |
+| 포지션 크기 산정용 잔고 | `run_cycle` 내 `live_wallet_usdt` / `account_balance_usdt` |
+
+제거됨: OpenAI Organization Costs 조회(`main_ai`의 `_fetch_openai_api_usage` 등), `.env`의 `KRW_PER_USDT`·`OPENAI_MONTHLY_BUDGET_USD`.
+
 ## 운영 가이드 (비용 최적화)
 
 - AI 호출 게이트: `RSI<=35` 또는 `RSI>=65`, `BB<=0.20` 또는 `BB>=0.80`, `|EMA_GAP|>=0.03%` 중 하나라도 충족할 때만 진입 AI를 호출합니다.
@@ -164,9 +172,9 @@ KOE205가 발생하면 `KAKAO_REDIRECT_URI`와 카카오 개발자 콘솔 Redire
 
 ## 운영 데이터
 
-- `ai_trading\data\trading_stats.json`: 가상 잔고, 누적 손익, 월간 집계, 오픈 포지션 상태
-- `ai_trading\data\virtual_trades.jsonl`: 가상 진입/청산 이벤트
+- `ai_trading\data\trading_stats.json`: 원장(가상 잔고·실현 손익 집계 등), 월간 집계, 오픈 포지션 상태. 실전 리포트 표시 잔고는 Binance API가 우선입니다.
+- `ai_trading\data\virtual_trades.jsonl`: 진입/청산 이벤트(가상·실전 공통 로그 형식)
 - `ai_trading\data\ai_learning_logs.csv`: 손실 거래 사후분석과 재발 방지 메모
 - `ai_trading\data\ai_decisions.log`: AI 원판단과 최종 판단 감사 로그
 
-운영 중 카카오 알림이나 OpenAI Usage 조회가 실패해도 위 로컬 데이터 파일은 계속 저장됩니다.
+운영 중 카카오 알림이 실패해도 위 로컬 데이터 파일은 계속 저장됩니다.

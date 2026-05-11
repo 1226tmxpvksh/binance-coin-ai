@@ -54,8 +54,19 @@ _bootstrap_sys_path()
 from ai_logic.decision_engine import analyze_trade_failure, get_ai_decision, get_market_monitor_summary
 from data.backtest_data import find_similar_backtest_cases, load_backtest_summary
 from data.market_data import fetch_market_snapshot
-from reporting import days_left_in_month_kst, load_trading_stats, save_trading_stats, summarize_ledger
+from reporting import (
+    days_left_in_month_kst,
+    load_trading_stats,
+    resolve_report_balances,
+    save_trading_stats,
+    summarize_ledger,
+)
 from risk_guard import assess_trade_risk, ensure_min_stop_gap
+
+try:
+    from btc_live_trading.fx_rates import fetch_usdt_krw as _fetch_usdt_krw
+except ImportError:
+    _fetch_usdt_krw = None  # type: ignore[assignment]
 
 try:
     from btc_live_trading.strategy.risk_manager import calculate_position_size
@@ -278,6 +289,42 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _krw_per_usdt() -> float:
+    if _fetch_usdt_krw is not None:
+        try:
+            return float(_fetch_usdt_krw())
+        except Exception as exc:
+            logger.warning("USDT/KRW 자동 조회 실패(%s), 1380 폴백", type(exc).__name__)
+    return 1380.0
+
+
+def _fetch_binance_futures_usdt_balance() -> float | None:
+    api_key = _sanitize_env_value("BINANCE_API_KEY", os.getenv("BINANCE_API_KEY", os.getenv("API_KEY", "")))
+    api_secret = _sanitize_env_value("BINANCE_API_SECRET", os.getenv("BINANCE_API_SECRET", os.getenv("API_SECRET", "")))
+    if not api_key or not api_secret:
+        logger.warning("BINANCE_API_KEY/SECRET 미설정: 선물 USDT 잔고를 조회할 수 없습니다.")
+        return None
+    try:
+        from binance.client import Client
+    except ImportError:
+        logger.warning("python-binance 미설치: 선물 USDT 잔고를 조회할 수 없습니다.")
+        return None
+    try:
+        client = Client(api_key, api_secret)
+        account = client.futures_account_balance()
+        for row in account:
+            if str(row.get("asset", "")).upper() == "USDT":
+                bal = _safe_float(row.get("balance"), 0.0)
+                return bal if bal >= 0 else None
+    except Exception as exc:
+        logger.warning("futures_account_balance 조회 실패: %s", type(exc).__name__)
+    return None
+
+
+def _report_bracket_title(dry_run: bool) -> str:
+    return "[가상 매매 리포트]" if dry_run else "[실전 매매 리포트]"
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -298,10 +345,6 @@ def _format_price(value: Any) -> str:
 
 def _format_krw(value: Any) -> str:
     return f"{_safe_float(value):,.0f}원"
-
-
-def _format_usd(value: Any) -> str:
-    return f"${_safe_float(value):,.4f}"
 
 
 def _is_korean_text(text: str) -> bool:
@@ -1192,97 +1235,6 @@ def _should_send_periodic_report(stats: Dict[str, Any], now_kst: datetime, inter
     return now_kst - last_report >= timedelta(minutes=interval_minutes)
 
 
-def _extract_openai_cost_usd(payload: Any) -> float:
-    total = 0.0
-    if isinstance(payload, dict):
-        amount = payload.get("amount")
-        if isinstance(amount, dict):
-            currency = str(amount.get("currency", "usd")).lower()
-            if currency == "usd":
-                total += _safe_float(amount.get("value", 0.0))
-        for value in payload.values():
-            total += _extract_openai_cost_usd(value)
-    elif isinstance(payload, list):
-        for item in payload:
-            total += _extract_openai_cost_usd(item)
-    return total
-
-
-def _fetch_openai_api_usage(now_kst: datetime) -> Dict[str, Any]:
-    api_key = _sanitize_env_value("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    if not api_key:
-        return {
-            "available": False,
-            "status": "OPENAI_API_KEY 미설정",
-            "month_cost_usd": None,
-            "remaining_credit_usd": None,
-        }
-
-    monthly_budget = _env_float("OPENAI_MONTHLY_BUDGET_USD", 0.0)
-    start_month_kst = now_kst.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    start_ts = int(start_month_kst.astimezone(timezone.utc).timestamp())
-    end_ts = int(now_kst.astimezone(timezone.utc).timestamp())
-    headers = {"Authorization": f"Bearer {api_key}"}
-    params = {"start_time": start_ts, "end_time": end_ts, "bucket_width": "1d", "limit": 31}
-
-    try:
-        response = requests.get(
-            "https://api.openai.com/v1/organization/costs",
-            headers=headers,
-            params=params,
-            timeout=10,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        month_cost = _extract_openai_cost_usd(payload)
-        remaining = (monthly_budget - month_cost) if monthly_budget > 0 else None
-        return {
-            "available": True,
-            "status": "조회 성공",
-            "month_cost_usd": month_cost,
-            "remaining_credit_usd": remaining,
-            "monthly_budget_usd": monthly_budget if monthly_budget > 0 else None,
-        }
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "?"
-        if status in {401, 403}:
-            status_text = "API 권한 설정 확인 필요 - OpenAI Usage Read 권한 또는 조직 관리자 권한을 확인하세요"
-        else:
-            status_text = f"조회 실패(HTTP {status}) - OpenAI Usage/Costs API 설정 확인 필요"
-        return {
-            "available": False,
-            "status": status_text,
-            "month_cost_usd": None,
-            "remaining_credit_usd": None,
-            "monthly_budget_usd": monthly_budget if monthly_budget > 0 else None,
-            "usage_api_endpoint": "/v1/organization/costs",
-        }
-    except requests.RequestException as exc:
-        return {
-            "available": False,
-            "status": f"조회 실패({type(exc).__name__})",
-            "month_cost_usd": None,
-            "remaining_credit_usd": None,
-            "monthly_budget_usd": monthly_budget if monthly_budget > 0 else None,
-            "usage_api_endpoint": "/v1/organization/costs",
-        }
-
-
-def _format_openai_usage(api_usage: Dict[str, Any]) -> List[str]:
-    if not api_usage.get("available"):
-        budget = api_usage.get("monthly_budget_usd")
-        budget_text = f" / 월 예산 {_format_usd(budget)}" if budget else ""
-        return [f"상태: {api_usage.get('status', '조회 불가')}{budget_text}"]
-    cost = api_usage.get("month_cost_usd")
-    remaining = api_usage.get("remaining_credit_usd")
-    lines = [f"이번 달 사용액: {_format_usd(cost)}"]
-    if remaining is None:
-        lines.append("남은 크레딧: 월 예산 미설정(OPENAI_MONTHLY_BUDGET_USD)")
-    else:
-        lines.append(f"남은 예산/크레딧: {_format_usd(remaining)}")
-    return lines
-
-
 def _build_kakao_message(
     *,
     report: Dict[str, Any],
@@ -1290,17 +1242,26 @@ def _build_kakao_message(
     learning_summary: str,
     close_info: Dict[str, Any] | None,
     open_position: Dict[str, Any] | None,
-    api_usage: Dict[str, Any],
+    dry_run: bool,
+    live_futures_usdt: float | None,
+    krw_per_usdt: float,
 ) -> str:
     ledger = summarize_ledger(stats)
-    sign = "+" if ledger.total_profit_pct >= 0 else ""
+    rb_krw, rb_usdt, rb_pct = resolve_report_balances(
+        stats,
+        dry_run=dry_run,
+        live_futures_usdt=live_futures_usdt,
+        krw_per_usdt=krw_per_usdt,
+    )
+    sign = "+" if rb_pct >= 0 else ""
     total_count, attempt_count = _today_decision_counters()
     market = report.get("market", {})
     close_event = close_info.get("close_event", {}) if close_info else {}
-    api_lines = _format_openai_usage(api_usage)
+    bracket = _report_bracket_title(dry_run)
+    bal_label = "가상 잔고/가상 수익률" if dry_run else "현재 잔고/누적 수익률"
     lines = [
         "━━━━━━━━━━━━━━━━━━━━",
-        f"{_decision_emoji(report['decision'], not bool(report['risk_allowed']))} AI 가상 매매 리포트",
+        f"{_decision_emoji(report['decision'], not bool(report['risk_allowed']))} {bracket}",
         "━━━━━━━━━━━━━━━━━━━━",
         f"📌 최종 판단: {report['decision']} / 신뢰도 {report['confidence']:.2f}",
         f"💬 판단 사유: {_report_text(report['reason'])}",
@@ -1326,11 +1287,8 @@ def _build_kakao_message(
         f"유사 실패 경고: {_report_text(learning_summary, '현재 유사한 실패 사례 없음')}",
         f"오늘 판단/진입: {total_count}회 / {attempt_count}회",
         "",
-        "💳 [API 잔액]",
-        *api_lines,
-        "",
         "📊 [원장]",
-        f"잔고/수익률: {ledger.balance_krw:,.0f}원 ({sign}{ledger.total_profit_pct:.2f}%) / {ledger.balance_usdt:,.2f} USDT",
+        f"{bal_label}: {rb_krw:,.0f}원 ({sign}{rb_pct:.2f}%) / {rb_usdt:,.2f} USDT",
         f"월 실현손익: {ledger.monthly_profit_krw:,.0f}원 / 월 운영비: {ledger.monthly_operating_cost_krw:,.0f}원",
         f"월 순수익(Net): {ledger.monthly_net_profit_krw:,.0f}원",
         f"AI 게이트 절감 호출: {_safe_int(stats.get('ai_calls_saved_by_gate', 0))}회 / 예상 절감 토큰: {_safe_int(stats.get('estimated_tokens_saved', 0)):,}",
@@ -1361,26 +1319,39 @@ def _send_startup_report() -> None:
         _hydrate_kakao_tokens()
     health_ok = _check_project_connectivity()
 
-    krw_per_usdt = _env_float("KRW_PER_USDT", 1380.0)
+    krw_per_usdt = _krw_per_usdt()
     initial_krw, initial_usdt = _initial_balances(krw_per_usdt)
     stats = load_trading_stats(
         initial_balance_krw=initial_krw,
         initial_balance_usdt=initial_usdt,
     )
-    ledger = summarize_ledger(stats)
+    dry_run = _env_bool("AI_DRY_RUN", True)
+    live_usdt = None if dry_run else _fetch_binance_futures_usdt_balance()
+    rb_krw, rb_usdt, rb_pct = resolve_report_balances(
+        stats, dry_run=dry_run, live_futures_usdt=live_usdt, krw_per_usdt=krw_per_usdt
+    )
     started_at = datetime.now(KST)
     model = _env_str("OPENAI_ENTRY_MODEL", _env_str("AI_ENTRY_MODEL", _env_str("OPENAI_MODEL", "gpt-4o")))
-    dry_run = _env_bool("AI_DRY_RUN", True)
     mode = "가상 매매(DRY RUN)" if dry_run else "실거래 모드"
     loop_seconds = max(30, _env_int("AI_LOOP_SECONDS", 300))
+    bracket = _report_bracket_title(dry_run)
+    bal_line = (
+        f"현재 가상 잔고/가상 수익률: {rb_krw:,.0f}원 ({rb_pct:+.2f}%) / {rb_usdt:,.4f} USDT"
+        if dry_run
+        else (
+            f"현재 잔고/누적 수익률: {rb_krw:,.0f}원 ({rb_pct:+.2f}%) / {rb_usdt:,.4f} USDT (바이낸스 USDT-M 선물 지갑)"
+            if live_usdt is not None
+            else f"현재 잔고/누적 수익률: 바이낸스 조회 실패 — 원장 기준 {rb_krw:,.0f}원 ({rb_pct:+.2f}%) / {rb_usdt:,.4f} USDT"
+        )
+    )
 
     body = "\n".join(
         [
             "━━━━━━━━━━━━━━━━━━━━",
-            "🚀 [운영 시작 보고]",
+            f"🚀 {bracket} 운영 시작 보고",
             "━━━━━━━━━━━━━━━━━━━━",
             f"시스템 가동 시각: {started_at.strftime('%Y-%m-%d %H:%M:%S KST')}",
-            f"현재 가상 잔고: {ledger.balance_krw:,.0f}원 / {ledger.balance_usdt:,.4f} USDT",
+            bal_line,
             f"적용 모델: {model}",
             f"매매 모드: {mode}",
             f"감시 주기 설정: {loop_seconds}초",
@@ -1389,7 +1360,7 @@ def _send_startup_report() -> None:
             "시스템이 정상적으로 기동되었으며, 5분 주기로 시장 감시를 시작합니다.",
         ]
     )
-    _notify_kakao("🚀 AI 가상 매매 운영 시작", body)
+    _notify_kakao(f"🚀 {bracket} 운영 시작", body)
     STARTUP_REPORT_SENT = True
 
 
@@ -1408,7 +1379,7 @@ def run_cycle() -> Dict[str, Any]:
     dry_run = _env_bool("AI_DRY_RUN", True)
     entry_model = _env_str("OPENAI_ENTRY_MODEL", _env_str("AI_ENTRY_MODEL", _env_str("OPENAI_MODEL", "gpt-4o")))
     monitor_model = _env_str("OPENAI_MONITOR_MODEL", _env_str("AI_MONITOR_MODEL", "gpt-4o-mini"))
-    krw_per_usdt = _env_float("KRW_PER_USDT", 1380.0)
+    krw_per_usdt = _krw_per_usdt()
     hold_minutes = _env_int("AI_PAPER_HOLD_MINUTES", 30)
     status_report_minutes = _env_int("AI_STATUS_REPORT_MINUTES", 60)
     initial_krw, initial_usdt = _initial_balances(krw_per_usdt)
@@ -1500,7 +1471,15 @@ def run_cycle() -> Dict[str, Any]:
         reason=raw_ai_decision["reason"],
     )
 
-    account_balance_usdt = _safe_float(stats.get("virtual_balance_usdt", initial_usdt), initial_usdt)
+    live_wallet_usdt: float | None = None
+    if not dry_run:
+        live_wallet_usdt = _fetch_binance_futures_usdt_balance()
+    if not dry_run and live_wallet_usdt is not None and live_wallet_usdt > 0:
+        account_balance_usdt = float(live_wallet_usdt)
+    else:
+        if not dry_run:
+            logger.warning("실전 모드에서 바이낸스 선물 USDT 잔고 조회 실패 — 원장 가상 잔고로 포지션 크기를 산출합니다.")
+        account_balance_usdt = _safe_float(stats.get("virtual_balance_usdt", initial_usdt), initial_usdt)
     stop_loss = _build_stop_loss(snapshot, raw_ai_decision["decision"])
     stop_loss, gap_adjusted = ensure_min_stop_gap(
         entry_price=float(snapshot["price"]),
@@ -1524,10 +1503,10 @@ def run_cycle() -> Dict[str, Any]:
             stop_loss_price=stop_loss,
             proposed_position_size=position_size,
             max_risk_ratio=_env_float("AI_MAX_RISK_RATIO", 0.025),
-            on_block=lambda text: _notify_kakao("⚠️ AI 리스크 경고", text),
+            on_block=lambda text, _d=dry_run: _notify_kakao(f"⚠️ {_report_bracket_title(_d)} 리스크 경고", text),
         )
     else:
-        risk_check = {"allowed": True, "risk_ratio": 0.0, "reason": "가상 진입 없음"}
+        risk_check = {"allowed": True, "risk_ratio": 0.0, "reason": "진입 없음"}
 
     final_decision = dict(raw_ai_decision)
     if position_size <= 0 and raw_ai_decision["decision"] in {"BUY", "SELL"}:
@@ -1539,9 +1518,10 @@ def run_cycle() -> Dict[str, Any]:
             "confidence": 1.0,
         }
     elif open_position:
+        pos_label = "가상 포지션" if dry_run else "포지션"
         final_decision = {
             "decision": "HOLD",
-            "reason": f"기존 가상 포지션 보유 중 ({open_position.get('side', '')})",
+            "reason": f"기존 {pos_label} 보유 중 ({open_position.get('side', '')})",
             "confidence": float(raw_ai_decision.get("confidence", 0.0)),
         }
 
@@ -1565,6 +1545,13 @@ def run_cycle() -> Dict[str, Any]:
 
     save_trading_stats(stats)
     ledger = summarize_ledger(stats)
+    rb_krw, rb_usdt, rb_pct = resolve_report_balances(
+        stats,
+        dry_run=dry_run,
+        live_futures_usdt=live_wallet_usdt,
+        krw_per_usdt=krw_per_usdt,
+    )
+    stats.pop("last_openai_api_usage", None)
     report = {
         "decision": final_decision["decision"],
         "reason": final_decision["reason"],
@@ -1575,9 +1562,10 @@ def run_cycle() -> Dict[str, Any]:
         "risk_allowed": bool(risk_check["allowed"]),
         "risk_ratio": float(risk_check["risk_ratio"]),
         "dry_run": dry_run,
-        "paper_balance_krw": ledger.balance_krw,
-        "paper_balance_usdt": ledger.balance_usdt,
-        "paper_profit_pct": ledger.total_profit_pct,
+        "paper_balance_krw": rb_krw,
+        "paper_balance_usdt": rb_usdt,
+        "paper_profit_pct": rb_pct,
+        "binance_futures_wallet_usdt": live_wallet_usdt if not dry_run else None,
         "unique_failure_count": ledger.unique_failure_count,
         "last_reflection_summary": ledger.last_reflection_summary,
         "failure_memory_similarity": memory_similarity,
@@ -1606,8 +1594,6 @@ def run_cycle() -> Dict[str, Any]:
     if send_report:
         monitor_summary = get_market_monitor_summary(snapshot, model=monitor_model)
         stats["ai_monitor_calls"] = _safe_int(stats.get("ai_monitor_calls", 0)) + 1
-        api_usage = _fetch_openai_api_usage(now_kst)
-        stats["last_openai_api_usage"] = api_usage
         report["monitor_summary"] = monitor_summary.get("summary", "")
         msg = _build_kakao_message(
             report=report,
@@ -1615,9 +1601,11 @@ def run_cycle() -> Dict[str, Any]:
             learning_summary=memory_summary,
             close_info=close_info,
             open_position=open_position,
-            api_usage=api_usage,
+            dry_run=dry_run,
+            live_futures_usdt=live_wallet_usdt,
+            krw_per_usdt=krw_per_usdt,
         )
-        _notify_kakao("📊 AI Self-Learning Paper Engine", msg)
+        _notify_kakao(f"📊 {_report_bracket_title(dry_run)} AI Self-Learning Engine", msg)
         stats["last_report_at_kst"] = now_kst.isoformat()
         save_trading_stats(stats)
     return report
@@ -1640,7 +1628,8 @@ def run_forever() -> None:
             raise
         except Exception as exc:
             logger.exception("AI paper loop error: %s", exc)
-            _notify_kakao("❌ AI Paper Engine 오류", f"루프 오류 발생: {type(exc).__name__}")
+            _br = _report_bracket_title(_env_bool("AI_DRY_RUN", True))
+            _notify_kakao(f"❌ {_br} 오류", f"루프 오류 발생: {type(exc).__name__}")
         elapsed = time.time() - cycle_started
         sleep_for = max(1.0, loop_seconds - elapsed)
         time.sleep(sleep_for)

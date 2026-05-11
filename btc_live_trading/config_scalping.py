@@ -39,7 +39,13 @@ BB_STD = float(os.getenv("BB_STD", "2.0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5.0"))
 TP_PROFIT_KRW = float(os.getenv("TP_PROFIT_KRW", "10000"))
 MONTHLY_TARGET_KRW = float(os.getenv("MONTHLY_TARGET_KRW", "100000"))
-KRW_PER_USDT = float(os.getenv("KRW_PER_USDT", "1350"))
+
+try:
+    from btc_live_trading.fx_rates import fetch_usdt_krw
+except ImportError:
+    from fx_rates import fetch_usdt_krw  # type: ignore[no-redef]
+
+KRW_PER_USDT = float(fetch_usdt_krw())
 
 RISK_PER_TRADE = float(os.getenv("SCALPING_RISK_PER_TRADE", "0.01"))
 MIN_POSITION_SIZE_USDT = float(os.getenv("MIN_POSITION_SIZE_USDT", "20"))

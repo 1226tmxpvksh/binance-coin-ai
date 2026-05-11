@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 
 @dataclass
@@ -238,6 +238,30 @@ def save_trading_stats(stats: Dict[str, Any], path: Path | None = None) -> None:
     payload["cumulative_profit_krw"] = _safe_float(payload.get("total_realized_pnl_krw", payload.get("cumulative_profit_krw", 0.0)))
     with open(p, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def resolve_report_balances(
+    stats: Dict[str, Any],
+    *,
+    dry_run: bool,
+    live_futures_usdt: float | None,
+    krw_per_usdt: float,
+) -> Tuple[float, float, float]:
+    """
+    카카오 리포트 등에 쓰는 잔고(원/USDT)와 누적 수익률(%).
+    실전(dry_run=False)이고 선물 지갑 USDT 조회에 성공하면 API 잔고를 사용한다.
+    """
+    initial_krw = _safe_float(stats.get("initial_balance_krw", 0.0))
+    initial_usdt = _safe_float(stats.get("initial_balance_usdt", 0.0))
+    use_live = (not dry_run) and live_futures_usdt is not None and live_futures_usdt > 0 and krw_per_usdt > 0
+    if use_live:
+        balance_usdt = float(live_futures_usdt)
+        balance_krw = balance_usdt * krw_per_usdt
+    else:
+        balance_krw = _safe_float(stats.get("virtual_balance_krw", initial_krw))
+        balance_usdt = _safe_float(stats.get("virtual_balance_usdt", initial_usdt))
+    total_profit_pct = ((balance_krw - initial_krw) / initial_krw * 100.0) if initial_krw > 0 else 0.0
+    return balance_krw, balance_usdt, total_profit_pct
 
 
 def summarize_ledger(stats: Dict[str, Any]) -> LedgerSummary:
