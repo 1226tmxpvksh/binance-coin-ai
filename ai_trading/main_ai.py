@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -64,6 +66,19 @@ from reporting import (
 from risk_guard import assess_trade_risk, ensure_min_stop_gap
 
 try:
+    from binance_futures_tools import (
+        futures_client_from_env as _futures_client_from_env,
+        futures_open_position_rows as _futures_open_position_rows,
+        market_close_symbol as _market_close_symbol,
+        signed_position_amt_for_symbol as _signed_position_amt_for_symbol,
+    )
+except ImportError:
+    _futures_client_from_env = None  # type: ignore[assignment]
+    _futures_open_position_rows = None  # type: ignore[assignment]
+    _market_close_symbol = None  # type: ignore[assignment]
+    _signed_position_amt_for_symbol = None  # type: ignore[assignment]
+
+try:
     from btc_live_trading.fx_rates import fetch_usdt_krw as _fetch_usdt_krw
 except ImportError:
     _fetch_usdt_krw = None  # type: ignore[assignment]
@@ -104,6 +119,11 @@ KAKAO_AUTH_LINK_LOGGED = False
 STARTUP_REPORT_SENT = False
 STARTUP_HEALTH_CHECK_DONE = False
 STARTUP_HEALTH_CHECK_OK = False
+_SHUTDOWN_LOCK = threading.Lock()
+_GRACEFUL_SHUTDOWN_ONCE = threading.Event()
+_ORPHAN_POSITION_ALERT_SENT = False
+_SIGNAL_HANDLERS_INSTALLED = False
+
 LEARNING_FIELDNAMES = [
     "logged_at_kst",
     "trade_id",
@@ -1364,7 +1384,188 @@ def _send_startup_report() -> None:
     STARTUP_REPORT_SENT = True
 
 
+def _synthetic_open_position_from_exchange(
+    row: Dict[str, Any],
+    *,
+    symbol: str,
+    interval: str,
+    now_kst: datetime,
+    hold_minutes: int,
+) -> Dict[str, Any]:
+    amt = _safe_float(row.get("positionAmt"), 0.0)
+    side = "BUY" if amt > 0 else "SELL"
+    entry = _safe_float(row.get("entryPrice"), 0.0)
+    qty = abs(amt)
+    return {
+        "trade_id": f"RECOVERED-{now_kst.strftime('%Y%m%d%H%M%S')}",
+        "symbol": symbol,
+        "interval": interval,
+        "side": side,
+        "opened_at_kst": now_kst.isoformat(),
+        "expires_at_kst": (now_kst + timedelta(minutes=hold_minutes)).isoformat(),
+        "entry_price": float(entry),
+        "stop_loss": 0.0,
+        "take_profit": 0.0,
+        "position_size": float(qty),
+        "leverage": _safe_int(row.get("leverage"), 0),
+        "notional_usdt": float(entry) * float(qty),
+        "decision_reason": "거래소 잔여 포지션 동기화(비정상 종료 추정)",
+        "confidence": 1.0,
+        "similar_avg_pnl": 0.0,
+        "failure_memory_summary": "",
+        "hold_extensions": 0,
+        "entry_snapshot": {},
+        "recovered_from_exchange": True,
+    }
+
+
+def _reconcile_ledger_with_exchange(
+    stats: Dict[str, Any],
+    *,
+    dry_run: bool,
+    symbol: str,
+    interval: str,
+    now_kst: datetime,
+    hold_minutes: int,
+) -> bool:
+    """거래소 포지션과 `open_position` 불일치를 정리한다. 변경 시 True."""
+    global _ORPHAN_POSITION_ALERT_SENT
+    if dry_run or _futures_client_from_env is None or _signed_position_amt_for_symbol is None:
+        return False
+    client = _futures_client_from_env()
+    if client is None:
+        return False
+    try:
+        amt = float(_signed_position_amt_for_symbol(client, symbol))
+    except Exception:
+        return False
+    ledger = stats.get("open_position") if isinstance(stats.get("open_position"), dict) else None
+    changed = False
+    if ledger and abs(amt) < 1e-12:
+        stats["open_position"] = None
+        changed = True
+        logger.info("원장 open_position 제거: 거래소에 동일 심볼 포지션 없음")
+    elif not ledger and abs(amt) >= 1e-12 and _futures_open_position_rows is not None:
+        row = next(
+            (r for r in _futures_open_position_rows(client) if str(r.get("symbol", "")).upper() == symbol.upper()),
+            None,
+        )
+        if row is not None:
+            stats["open_position"] = _synthetic_open_position_from_exchange(
+                row, symbol=symbol, interval=interval, now_kst=now_kst, hold_minutes=hold_minutes
+            )
+            changed = True
+            if not _ORPHAN_POSITION_ALERT_SENT:
+                _ORPHAN_POSITION_ALERT_SENT = True
+                _notify_kakao(
+                    "⚠️ 미청산 포지션 발견",
+                    f"{symbol}: 거래소에 포지션이 남아 있으나 원장에는 없었습니다. "
+                    f"이번 루프부터 복구된 포지션으로 감시·청산 로직을 적용합니다.",
+                )
+    return changed
+
+
+def _graceful_shutdown_work(trigger: Any) -> None:
+    """SIGINT/SIGTERM/KeyboardInterrupt 시 호출. 호출자가 `_SHUTDOWN_LOCK`을 잡은 상태여야 한다."""
+    if _GRACEFUL_SHUTDOWN_ONCE.is_set():
+        return
+    _GRACEFUL_SHUTDOWN_ONCE.set()
+    _load_env()
+    if _hydrate_kakao_tokens is not None:
+        _hydrate_kakao_tokens()
+    dry_run = _env_bool("AI_DRY_RUN", True)
+    symbol = _env_str("AI_SYMBOL", "BTCUSDT")
+    krw_per_usdt = _krw_per_usdt()
+    initial_krw, initial_usdt = _initial_balances(krw_per_usdt)
+    stats = load_trading_stats(
+        initial_balance_krw=initial_krw,
+        initial_balance_usdt=initial_usdt,
+    )
+    ledger = stats.get("open_position") if isinstance(stats.get("open_position"), dict) else None
+    had_ledger = ledger is not None
+    ex_amt = 0.0
+    client = None
+    if not dry_run and _futures_client_from_env is not None and _signed_position_amt_for_symbol is not None:
+        client = _futures_client_from_env()
+        if client is not None:
+            try:
+                ex_amt = float(_signed_position_amt_for_symbol(client, symbol))
+            except Exception:
+                ex_amt = 0.0
+    need_exchange_close = (not dry_run) and client is not None and abs(ex_amt) >= 1e-12
+    if not need_exchange_close and not had_ledger:
+        logger.info("종료 정리(%s): 청산할 포지션 없음", trigger)
+        return
+
+    if need_exchange_close and _market_close_symbol is None:
+        logger.error("종료 정리(%s): 청산 모듈을 불러올 수 없습니다.", trigger)
+        _notify_kakao(
+            "⚠️ 긴급 청산 실패",
+            f"{symbol}: 청산 유틸리티를 불러올 수 없습니다. `scripts/emergency_exit.py`를 실행하세요. 트리거: {trigger}",
+        )
+    elif need_exchange_close:
+        ok, msg = _market_close_symbol(client, symbol)
+        if ok:
+            logger.info("종료 정리(%s): 거래소 시장가 청산 완료 %s", trigger, msg)
+            _notify_kakao(
+                "프로그램 종료로 인해 포지션을 긴급 청산했습니다.",
+                f"{symbol} 청산 완료 ({msg}). 트리거: {trigger}",
+            )
+            stats["open_position"] = None
+            save_trading_stats(stats)
+        else:
+            logger.error("종료 정리(%s): 거래소 청산 실패 %s", trigger, msg)
+            _notify_kakao(
+                "⚠️ 긴급 청산 실패",
+                f"{symbol} 시장가 청산에 실패했습니다({msg}). "
+                f"`scripts/emergency_exit.py` 실행 또는 바이낸스에서 수동 확인하세요. 트리거: {trigger}",
+            )
+    elif dry_run and had_ledger:
+        stats["open_position"] = None
+        save_trading_stats(stats)
+        logger.info("종료 정리(%s): 가상 포지션 원장 제거", trigger)
+        _notify_kakao(
+            "프로그램 종료로 인해 포지션을 긴급 청산했습니다.",
+            f"가상 매매 원장의 오픈 포지션을 종료 처리했습니다. 트리거: {trigger}",
+        )
+    elif had_ledger and abs(ex_amt) < 1e-12:
+        stats["open_position"] = None
+        save_trading_stats(stats)
+        logger.info("종료 정리(%s): 원장만 정리(거래소 무포지션)", trigger)
+
+
+def _shutdown_signal_handler(signum: int, frame: Any) -> None:
+    logger.warning("종료 신호 수신: %s", signum)
+    try:
+        with _SHUTDOWN_LOCK:
+            _graceful_shutdown_work(signum)
+    except Exception:
+        logger.exception("우아한 종료 처리 중 예외")
+    sys.exit(0)
+
+
+def install_shutdown_handlers() -> None:
+    """메인 스레드에서 한 번만 호출한다."""
+    global _SIGNAL_HANDLERS_INSTALLED
+    if _SIGNAL_HANDLERS_INSTALLED:
+        return
+    for name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _shutdown_signal_handler)
+        except ValueError as exc:
+            logger.debug("signal %s 등록 생략: %s", name, exc)
+    _SIGNAL_HANDLERS_INSTALLED = True
+
+
 def run_cycle() -> Dict[str, Any]:
+    with _SHUTDOWN_LOCK:
+        return _run_cycle_impl()
+
+
+def _run_cycle_impl() -> Dict[str, Any]:
     _load_env()
     if _hydrate_kakao_tokens is not None:
         _hydrate_kakao_tokens()
@@ -1398,6 +1599,15 @@ def run_cycle() -> Dict[str, Any]:
     )
     now_kst = datetime.now(KST)
     stats["last_cycle_at_kst"] = now_kst.isoformat()
+    if _reconcile_ledger_with_exchange(
+        stats,
+        dry_run=dry_run,
+        symbol=symbol,
+        interval=interval,
+        now_kst=now_kst,
+        hold_minutes=hold_minutes,
+    ):
+        save_trading_stats(stats)
 
     backtest_summary = load_backtest_summary(str(BACKTEST_DIR))
     snapshot = fetch_market_snapshot(symbol=symbol, interval=interval, limit=250)
@@ -1617,6 +1827,7 @@ def run_once() -> Dict[str, Any]:
 
 def run_forever() -> None:
     _load_env()
+    install_shutdown_handlers()
     loop_seconds = max(30, _env_int("AI_LOOP_SECONDS", 300))
     _send_startup_report()
     while True:
@@ -1625,7 +1836,12 @@ def run_forever() -> None:
             result = run_cycle()
             print(json.dumps(result, ensure_ascii=False))
         except KeyboardInterrupt:
-            raise
+            try:
+                with _SHUTDOWN_LOCK:
+                    _graceful_shutdown_work("KeyboardInterrupt")
+            except Exception:
+                logger.exception("KeyboardInterrupt 종료 정리 중 예외")
+            raise SystemExit(0) from None
         except Exception as exc:
             logger.exception("AI paper loop error: %s", exc)
             _br = _report_bracket_title(_env_bool("AI_DRY_RUN", True))
@@ -1637,9 +1853,18 @@ def run_forever() -> None:
 
 if __name__ == "__main__":
     _load_env()
+    install_shutdown_handlers()
     _check_project_connectivity()
     _send_startup_report()
     if _env_bool("AI_RUN_ONCE", False):
-        print(json.dumps(run_cycle(), ensure_ascii=False))
+        try:
+            print(json.dumps(run_cycle(), ensure_ascii=False))
+        except KeyboardInterrupt:
+            try:
+                with _SHUTDOWN_LOCK:
+                    _graceful_shutdown_work("KeyboardInterrupt")
+            except Exception:
+                logger.exception("KeyboardInterrupt 종료 정리 중 예외")
+            raise SystemExit(0) from None
     else:
         run_forever()

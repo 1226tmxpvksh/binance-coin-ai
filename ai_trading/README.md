@@ -160,6 +160,29 @@ KOE205가 발생하면 `KAKAO_REDIRECT_URI`와 카카오 개발자 콘솔 Redire
 
 제거됨: OpenAI Organization Costs 조회(`main_ai`의 `_fetch_openai_api_usage` 등), `.env`의 `KRW_PER_USDT`·`OPENAI_MONTHLY_BUDGET_USD`.
 
+## 리스크 관리 (강제 종료·복구·비상 청산)
+
+### 우아한 종료 (Ctrl+C / SIGTERM)
+
+- `main_ai.install_shutdown_handlers()`가 `SIGINT`·`SIGTERM`(지원되는 환경)에 `_shutdown_signal_handler`를 등록합니다. 무한 루프(`run_forever`) 시작 시와 `__main__` 진입 시 한 번씩 호출됩니다.
+- 핸들러는 `_SHUTDOWN_LOCK`을 획득한 뒤 `_graceful_shutdown_work`를 실행합니다. `run_cycle` 본문(`_run_cycle_impl`)도 동일 락으로 감싸져 있어, **한 사이클이 끝난 뒤** 종료 정리가 실행되거나, **슬립 중**이면 즉시 락을 잡고 정리합니다.
+- **실전(`AI_DRY_RUN=false`)**이고 `AI_SYMBOL`(기본 `BTCUSDT`)에 거래소 포지션이 있으면 `binance_futures_tools.market_close_symbol`로 시장가 `reduceOnly` 청산을 시도한 뒤, 성공 시 카카오로 *「프로그램 종료로 인해 포지션을 긴급 청산했습니다.」* 를 보냅니다. 실패 시 청산 실패 알림과 `scripts/emergency_exit.py` 안내를 보냅니다.
+- **가상 매매**에서만 `open_position`이 있으면 거래소 호출 없이 원장에서 제거하고 동일 문구(가상 종료 안내)로 알립니다. 포지션이 없으면 로그만 남기고 종료합니다.
+- `KeyboardInterrupt`는 `run_forever` / 단발 실행 경로에서 동일하게 `_graceful_shutdown_work`를 호출한 뒤 `SystemExit`로 빠져나갑니다. `threading.Event`로 중복 청산을 막습니다.
+
+### 재시작 시 동기화
+
+- 매 `run_cycle` 초반에 `_reconcile_ledger_with_exchange`가 실행됩니다. 거래소에만 포지션이 남아 있으면 `open_position`을 `_synthetic_open_position_from_exchange`로 복구하고, 최초 1회 카카오 *「미청산 포지션 발견」* 알림을 보냅니다. 원장만 있고 거래소에는 없으면 `open_position`을 제거합니다.
+
+### 비상 수동 청산 스크립트
+
+- `scripts/emergency_exit.py`: `.env` 로드 후 **모든 심볼**의 미결 USDT-M 포지션을 `close_all_usdm_positions`로 시장가 청산합니다. 운영 PC에서 바로 실행할 수 있습니다.
+
+```powershell
+Set-Location "c:\Users\1226t\Desktop\Coin"
+py -3 scripts\emergency_exit.py
+```
+
 ## 운영 가이드 (비용 최적화)
 
 - AI 호출 게이트: `RSI<=35` 또는 `RSI>=65`, `BB<=0.20` 또는 `BB>=0.80`, `|EMA_GAP|>=0.03%` 중 하나라도 충족할 때만 진입 AI를 호출합니다.
