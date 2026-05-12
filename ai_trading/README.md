@@ -1,6 +1,24 @@
 # AI Trading 운영 가이드
 
-`ai_trading`은 Binance 시장 데이터, `btc_day_strategy` 백테스트 자료, OpenAI 판단 로직을 결합해 BTC **가상·실전** 매매를 운영하는 엔진입니다. `AI_DRY_RUN`에 따라 리포트 문구·잔고 출처가 자동 전환됩니다. 처음 실행하는 운영자가 바로 따라 할 수 있도록 설치, 환경변수 설정, 실행 방법만 정리합니다.
+`ai_trading`은 Binance 시장 데이터, `btc_day_strategy` 백테스트 자료, OpenAI 판단 로직을 결합해 BTC 매매를 운영하는 엔진입니다. **실전 운영 시 `AI_DRY_RUN=false`** 로 두고, 주문·잔고·청산은 **`binance_futures_tools`** 의 Binance USDT-M API만 사용합니다. 가상 모드는 검증·교육용으로만 켭니다.
+
+## 프로젝트 구조 (실전 기준)
+
+| 위치 | 설명 |
+|------|------|
+| `ai_trading/main_ai.py` | 무한 루프·시그널 종료·실전/가상 분기 |
+| `ai_trading/binance_futures_tools.py` | 잔고 조회 `fetch_futures_usdt_balance_from_env`, 진입·청산·비상 청산 공용 |
+| `ai_trading/reporting.py` | `trading_stats.json`, 월 백업 파일명 |
+| `ai_trading/risk_guard.py` | 포지션 리스크 계산 |
+| `ai_trading/ai_logic/decision_engine.py` | OpenAI 호출 |
+| `ai_trading/data/` | 통계·`virtual_trades.jsonl`·`ai_learning_logs.csv`·로그 |
+| `btc_live_trading/.env` | API 키·카카오·운영 변수(공유) |
+| `btc_live_trading/fx_rates.py` | USDT/KRW (CoinGecko), `config_scalping` 등에서 사용 |
+| `btc_day_strategy/` | 백테스트 요약 로드용 |
+
+**통합 정리**: `main_ai` 안에 있던 Binance 잔고 조회(직접 `Client` 생성)를 제거하고, **`binance_futures_tools.fetch_futures_usdt_balance_from_env`** 한 경로로 맞췄습니다. `btc_live_trading/order_executor.py` 등 **다른 진입점(main_live·스캘핑)** 전용 코드는 그대로 두었습니다(삭제 시 해당 실행 경로가 깨짐).
+
+상위 폴더 개요는 저장소 루트 **`README.md`** 를 참고하세요.
 
 ## 주요 기능
 
@@ -52,8 +70,8 @@ TRADING_MODE=scalping
 SCALPING_LIVE_CONFIRMED=YES
 # AI 판단 사용 여부
 USE_AI_CONFIRM=true
-# 테스트 모드 (true면 가상 매매)
-AI_DRY_RUN=true
+# 테스트 모드 (true면 가상 매매; 실전은 false)
+AI_DRY_RUN=false
 # 손절폭 배수 (1.5~2.0 권장)
 AI_ATR_STOP_MULTIPLIER=1.2
 # 월 목표 수익금 (원 단위)
@@ -76,6 +94,8 @@ AI_PAPER_HOLD_MINUTES=15
 AI_STATUS_REPORT_MINUTES=60
 # 1회 실행 후 종료 여부 (무한 루프를 위해 false 설정)
 AI_RUN_ONCE=false
+# 학습 로그(ai_learning_logs.csv) 적재 상한(꼬리 N행만 유지, mtime 캐시와 함께 부하 완화)
+AI_LEARNING_LOG_MAX_ROWS=5000
 
 # ==========================================
 # 6. 운영 비용 및 수익 최적화 설정
@@ -174,6 +194,14 @@ KOE205가 발생하면 `KAKAO_REDIRECT_URI`와 카카오 개발자 콘솔 Redire
 
 - 매 `run_cycle` 초반에 `_reconcile_ledger_with_exchange`가 실행됩니다. 거래소에만 포지션이 남아 있으면 `open_position`을 `_synthetic_open_position_from_exchange`로 복구하고, 최초 1회 카카오 *「미청산 포지션 발견」* 알림을 보냅니다. 원장만 있고 거래소에는 없으면 `open_position`을 제거합니다.
 
+### 실전 진입·청산 주문 (`AI_DRY_RUN=false`)
+
+- **원인(과거 동작)**: 리포트의 `dry_run: false`는 환경변수만 반영했고, `_open_position`은 항상 `_paper_trade_id()`로 `PAPER-…` ID만 만들며 **거래소 주문 API를 호출하지 않았습니다.**
+- **현재**: `dry_run=false`이면 `binance_futures_tools.futures_market_open_position` → `Client.futures_create_order`(MARKET, `reduceOnly=False`)로 진입하고, `trade_id`는 응답의 **`orderId`** 문자열입니다. 가상 모드는 `order_mode: paper` + `PAPER-…` ID.
+- 편의 함수 **`market_buy_symbol` / `market_sell_symbol_open_short`**는 같은 모듈에서 롱·숏 진입용으로 노출됩니다.
+- 청산 시 `_close_position`은 실전에서 먼저 `market_close_symbol`(시장가·reduceOnly)을 호출한 뒤 원장을 갱신합니다. 거래소 청산 실패 시 카카오 *「실전 청산 실패 알림」* 후 원장·포지션은 유지됩니다.
+- 기동 시 `_send_startup_report` 및 매 사이클 `_log_order_execution_setup` 로그로 **`AI_DRY_RUN` 원문·해석값·선물 주문 스택 준비 여부**를 확인할 수 있습니다.
+
 ### 비상 수동 청산 스크립트
 
 - `scripts/emergency_exit.py`: `.env` 로드 후 **모든 심볼**의 미결 USDT-M 포지션을 `close_all_usdm_positions`로 시장가 청산합니다. 운영 PC에서 바로 실행할 수 있습니다.
@@ -199,5 +227,19 @@ py -3 scripts\emergency_exit.py
 - `ai_trading\data\virtual_trades.jsonl`: 진입/청산 이벤트(가상·실전 공통 로그 형식)
 - `ai_trading\data\ai_learning_logs.csv`: 손실 거래 사후분석과 재발 방지 메모
 - `ai_trading\data\ai_decisions.log`: AI 원판단과 최종 판단 감사 로그
+- `ai_trading\data\history\trading_stats_month_{YYYY-MM}_archived_{YYYYMMDD_HHMMSS}_kst.json`: 매월 1일 09:00(KST) 이후 첫 로드 시 이전 달 원장을 여기에 한 번 백업합니다. 이름의 월은 **막 끝난 집계 구간(아카이브 대상)** 이고, 뒤의 시각은 **저장한 순간(KST)** 입니다(실행할 때마다 생기는 파일이 아닙니다).
 
 운영 중 카카오 알림이 실패해도 위 로컬 데이터 파일은 계속 저장됩니다.
+
+- **학습 CSV 부하 완화**: 동일 사이클·파일 mtime 불변 시 재파싱 생략. 행 수는 `AI_LEARNING_LOG_MAX_ROWS`(기본 5000) 초과 시 **최근 행만** 유지합니다.
+
+## 변경·통합 이력 (실전 최적화)
+
+| 구분 | 내용 |
+|------|------|
+| Binance 잔고 API | `main_ai`의 직접 `Client` 생성 제거 → `binance_futures_tools.fetch_futures_usdt_balance_from_env` 단일화 (`futures_wallet_usdt_balance`) |
+| 학습 로그 | `_load_learning_rows` mtime 캐시 + 꼬리 행 제한 + append 후 캐시 무효화 |
+| 삭제된 `.py` 파일 | 없음 (`btc_live_trading/main_live.py`·스캘핑 등 별도 진입점 유지) |
+| 문서 | 저장소 루트 `README.md` 추가, 본 파일에 구조·실전 기준 정리 |
+
+**실전 주문 경로**: `AI_DRY_RUN=false`일 때 진입 `futures_market_open_position`, 청산·종료 `market_close_symbol` / `close_all_usdm_positions`, 잔고 `fetch_futures_usdt_balance_from_env`. 가상 원장(`virtual_balance_*`)은 통계·손익 추적용으로 갱신되며, **체결은 위 API만 사용**합니다.

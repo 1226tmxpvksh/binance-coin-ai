@@ -67,13 +67,17 @@ from risk_guard import assess_trade_risk, ensure_min_stop_gap
 
 try:
     from binance_futures_tools import (
+        fetch_futures_usdt_balance_from_env as _fetch_futures_usdt_balance_from_env,
         futures_client_from_env as _futures_client_from_env,
+        futures_market_open_position as _futures_market_open_position,
         futures_open_position_rows as _futures_open_position_rows,
         market_close_symbol as _market_close_symbol,
         signed_position_amt_for_symbol as _signed_position_amt_for_symbol,
     )
 except ImportError:
+    _fetch_futures_usdt_balance_from_env = None  # type: ignore[assignment]
     _futures_client_from_env = None  # type: ignore[assignment]
+    _futures_market_open_position = None  # type: ignore[assignment]
     _futures_open_position_rows = None  # type: ignore[assignment]
     _market_close_symbol = None  # type: ignore[assignment]
     _signed_position_amt_for_symbol = None  # type: ignore[assignment]
@@ -119,10 +123,14 @@ KAKAO_AUTH_LINK_LOGGED = False
 STARTUP_REPORT_SENT = False
 STARTUP_HEALTH_CHECK_DONE = False
 STARTUP_HEALTH_CHECK_OK = False
-_SHUTDOWN_LOCK = threading.Lock()
+# 재진입 허용: run_cycle이 락을 잡은 상태에서 Ctrl+C(SIGINT) 시 같은 스레드가 시그널 핸들러로
+# 다시 락을 요청하면 threading.Lock은 자기 자신에게 데드락이 난다(RLock 필요).
+_SHUTDOWN_LOCK = threading.RLock()
 _GRACEFUL_SHUTDOWN_ONCE = threading.Event()
 _ORPHAN_POSITION_ALERT_SENT = False
 _SIGNAL_HANDLERS_INSTALLED = False
+_LEARNING_ROWS_CACHE_MTIME: float | None = None
+_LEARNING_ROWS_CACHE_ROWS: List[Dict[str, str]] = []
 
 LEARNING_FIELDNAMES = [
     "logged_at_kst",
@@ -319,30 +327,39 @@ def _krw_per_usdt() -> float:
 
 
 def _fetch_binance_futures_usdt_balance() -> float | None:
-    api_key = _sanitize_env_value("BINANCE_API_KEY", os.getenv("BINANCE_API_KEY", os.getenv("API_KEY", "")))
-    api_secret = _sanitize_env_value("BINANCE_API_SECRET", os.getenv("BINANCE_API_SECRET", os.getenv("API_SECRET", "")))
-    if not api_key or not api_secret:
-        logger.warning("BINANCE_API_KEY/SECRET 미설정: 선물 USDT 잔고를 조회할 수 없습니다.")
-        return None
-    try:
-        from binance.client import Client
-    except ImportError:
-        logger.warning("python-binance 미설치: 선물 USDT 잔고를 조회할 수 없습니다.")
-        return None
-    try:
-        client = Client(api_key, api_secret)
-        account = client.futures_account_balance()
-        for row in account:
-            if str(row.get("asset", "")).upper() == "USDT":
-                bal = _safe_float(row.get("balance"), 0.0)
-                return bal if bal >= 0 else None
-    except Exception as exc:
-        logger.warning("futures_account_balance 조회 실패: %s", type(exc).__name__)
+    """USDT-M 선물 지갑 잔고. `binance_futures_tools.fetch_futures_usdt_balance_from_env` 단일 경로."""
+    if _fetch_futures_usdt_balance_from_env is not None:
+        return _fetch_futures_usdt_balance_from_env()
+    logger.warning("binance_futures_tools 미로드 또는 잔고 조회 불가")
     return None
 
 
 def _report_bracket_title(dry_run: bool) -> str:
     return "[가상 매매 리포트]" if dry_run else "[실전 매매 리포트]"
+
+
+def _log_order_execution_setup(dry_run: bool) -> None:
+    """`AI_DRY_RUN` 환경값과 실제 주문 함수 바인딩 여부를 함께 로깅한다."""
+    raw = os.getenv("AI_DRY_RUN", "")
+    path = "PAPER_LEDGER_ONLY" if dry_run else "BINANCE_FUTURES_MARKET"
+    api_ready = (
+        not dry_run
+        and _futures_market_open_position is not None
+        and _futures_client_from_env is not None
+        and _market_close_symbol is not None
+    )
+    logger.info(
+        "[주문실행기] AI_DRY_RUN(raw)=%r → resolved_paper_mode=%s | 경로=%s | 선물주문스택준비=%s",
+        raw,
+        dry_run,
+        path,
+        api_ready,
+    )
+    if not dry_run and not api_ready:
+        logger.error(
+            "[주문실행기] 실전으로 표시됐으나 Binance 선물 진입/청산 모듈을 쓸 수 없습니다. "
+            "의존 패키지·API 키·import 경로를 확인하세요."
+        )
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -627,6 +644,13 @@ def _position_exit_reason(
         if move_pct > 0 and _extend_winning_position(stats, open_position, snapshot, now_kst, hold_minutes, "익절선 도달 후 추세 지속"):
             return None
         return "take_profit"
+
+    scratch_min = _env_int("AI_EARLY_SCRATCH_MINUTES", 14)
+    flat_pct = _env_float("AI_SCRATCH_FLAT_MOVE_PCT", 0.12)
+    if scratch_min > 0 and flat_pct >= 0.0:
+        mins_open = _minutes_since_position_open(open_position, now_kst)
+        if mins_open >= scratch_min and abs(move_pct) < flat_pct:
+            return "scratch_flat_exit"
 
     if _position_due(open_position, now_kst):
         if move_pct > 0 and _extend_winning_position(stats, open_position, snapshot, now_kst, hold_minutes, "시간 만기 후 추세 지속"):
@@ -992,14 +1016,43 @@ def _market_signature(snapshot: Dict[str, Any], side: str = "") -> str:
     )
 
 
+def _learning_log_max_rows() -> int:
+    raw = _sanitize_env_value("AI_LEARNING_LOG_MAX_ROWS", os.getenv("AI_LEARNING_LOG_MAX_ROWS", "5000"))
+    try:
+        return max(50, int(float(raw)))
+    except ValueError:
+        return 5000
+
+
+def _invalidate_learning_rows_cache() -> None:
+    global _LEARNING_ROWS_CACHE_MTIME
+    _LEARNING_ROWS_CACHE_MTIME = None
+
+
 def _load_learning_rows() -> List[Dict[str, str]]:
+    """학습 CSV: mtime 기준 캐시 + 최대 행 수(꼬리만)로 메모리·디스크 부하 완화."""
+    global _LEARNING_ROWS_CACHE_MTIME, _LEARNING_ROWS_CACHE_ROWS
     if not LEARNING_LOG_PATH.exists():
+        _LEARNING_ROWS_CACHE_MTIME = None
+        _LEARNING_ROWS_CACHE_ROWS = []
         return []
     try:
+        mtime = LEARNING_LOG_PATH.stat().st_mtime
+    except OSError:
+        return []
+    if mtime == _LEARNING_ROWS_CACHE_MTIME and _LEARNING_ROWS_CACHE_ROWS:
+        return _LEARNING_ROWS_CACHE_ROWS
+    try:
         with open(LEARNING_LOG_PATH, "r", encoding="utf-8-sig", newline="") as f:
-            return [row for row in csv.DictReader(f) if row]
+            rows = [row for row in csv.DictReader(f) if row]
     except Exception:
         return []
+    cap = _learning_log_max_rows()
+    if len(rows) > cap:
+        rows = rows[-cap:]
+    _LEARNING_ROWS_CACHE_MTIME = mtime
+    _LEARNING_ROWS_CACHE_ROWS = rows
+    return rows
 
 
 def _combined_learning_text(row: Dict[str, str]) -> str:
@@ -1027,6 +1080,7 @@ def _append_learning_entry(entry: Dict[str, str]) -> Tuple[bool, float]:
         if not file_exists:
             writer.writeheader()
         writer.writerow(entry)
+    _invalidate_learning_rows_cache()
     return True, best_ratio
 
 
@@ -1049,7 +1103,8 @@ def _find_closest_failure_memory(snapshot: Dict[str, Any]) -> Tuple[str, str, fl
         if ratio > best_ratio:
             best_ratio = ratio
             best_row = row
-    if best_row is None or best_ratio < 0.55:
+    min_sim = _env_float("AI_FAILURE_MEMORY_MIN_SIM", 0.58)
+    if best_row is None or best_ratio < min_sim:
         return "", "", 0.0
     memory = (
         f"similarity={best_ratio:.2f}\n"
@@ -1061,7 +1116,61 @@ def _find_closest_failure_memory(snapshot: Dict[str, Any]) -> Tuple[str, str, fl
     return memory, best_row.get("reflection_summary", ""), best_ratio
 
 
-def _next_trade_id(now_kst: datetime) -> str:
+def _top_recent_loss_reflections(limit: int) -> str:
+    """pnl_usdt < 0 인 행 중 최근 N건의 반성 요약(프롬프트 상단용)."""
+    if limit <= 0:
+        return ""
+    rows = _load_learning_rows()
+    dated: List[Tuple[datetime, Dict[str, str]]] = []
+    for row in rows:
+        if _safe_float(row.get("pnl_usdt", 0.0)) >= 0.0:
+            continue
+        raw_t = str(row.get("logged_at_kst", "")).strip()
+        try:
+            dt = datetime.fromisoformat(raw_t)
+        except ValueError:
+            continue
+        dated.append((dt, row))
+    dated.sort(key=lambda x: x[0], reverse=True)
+    lines: List[str] = []
+    for dt, row in dated:
+        ref = str(row.get("reflection_summary", "")).strip()
+        if not ref:
+            continue
+        tid = str(row.get("trade_id", "")).strip()
+        label = f"{tid} " if tid else ""
+        lines.append(f"- [{dt.isoformat()}] {label}{ref}")
+        if len(lines) >= limit:
+            break
+    return "\n".join(lines)
+
+
+def _apply_failure_similarity_guard(decision: Dict[str, Any], similarity: float) -> Dict[str, Any]:
+    """과거 실패와 시그니처 유사도가 높을 때 최종 결정을 보수적으로 조정."""
+    if similarity <= 0.0:
+        return decision
+    strong = _env_float("AI_FAILURE_SIM_STRONG", 0.8)
+    moderate = _env_float("AI_FAILURE_SIM_MODERATE", 0.65)
+    strong_mult = _env_float("AI_FAILURE_SIM_CONF_MULT_STRONG", 0.15)
+    mod_mult = _env_float("AI_FAILURE_SIM_CONF_MULT_MODERATE", 0.45)
+    cap = _env_float("AI_FAILURE_SIM_CONF_CAP", 0.22)
+
+    out = dict(decision)
+    base_reason = str(out.get("reason", ""))
+    conf = _safe_float(out.get("confidence", 0.0))
+
+    if similarity >= strong:
+        out["decision"] = "HOLD"
+        out["confidence"] = min(conf * strong_mult, cap)
+        out["reason"] = f"[유사 과거실패 sim≥{strong:.2f}] {base_reason}"
+        return out
+    if similarity >= moderate:
+        out["confidence"] = conf * mod_mult
+        out["reason"] = f"[유사 과거실패 sim≥{moderate:.2f}] {base_reason}"
+    return out
+
+
+def _paper_trade_id(now_kst: datetime) -> str:
     return f"PAPER-{now_kst.strftime('%Y%m%d%H%M%S')}"
 
 
@@ -1076,6 +1185,17 @@ def _position_due(open_position: Dict[str, Any], now_kst: datetime) -> bool:
     return now_kst >= expires_at
 
 
+def _minutes_since_position_open(open_position: Dict[str, Any], now_kst: datetime) -> float:
+    raw = str(open_position.get("opened_at_kst", "")).strip()
+    if not raw:
+        return 0.0
+    try:
+        opened = datetime.fromisoformat(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, (now_kst - opened).total_seconds() / 60.0)
+
+
 def _close_position(
     *,
     stats: Dict[str, Any],
@@ -1085,7 +1205,35 @@ def _close_position(
     krw_per_usdt: float,
     model: str,
     exit_reason: str = "time_exit",
+    dry_run: bool = True,
 ) -> Dict[str, Any]:
+    sym_ex = str(open_position.get("symbol", "")).strip()
+    if (
+        not dry_run
+        and sym_ex
+        and _futures_client_from_env is not None
+        and _market_close_symbol is not None
+    ):
+        client = _futures_client_from_env()
+        if client is not None:
+            ok, msg = _market_close_symbol(client, sym_ex)
+            if not ok:
+                logger.error("실전 청산 실패 %s: %s", sym_ex, msg)
+                _notify_kakao(
+                    "🚨 실전 청산 실패 알림",
+                    f"{sym_ex} 시장가 청산 실패: {msg}. 거래소 포지션·원장을 자동으로 비우지 않았습니다.",
+                )
+                return {
+                    "close_event": None,
+                    "reflection_result": {
+                        "stored": False,
+                        "similarity": 0.0,
+                        "summary": "",
+                        "warning": "",
+                    },
+                    "exchange_close_failed": True,
+                }
+
     side = str(open_position.get("side", "HOLD")).upper()
     entry_price = _safe_float(open_position.get("entry_price", 0.0))
     exit_price = _safe_float(snapshot.get("price", 0.0))
@@ -1184,6 +1332,28 @@ def _close_position(
     return {"close_event": close_event, "reflection_result": reflection_result}
 
 
+def _live_entry_price_qty(order: Dict[str, Any], fallback_price: float, fallback_qty: float) -> Tuple[float, float]:
+    entry_px = float(fallback_price)
+    try:
+        ap = order.get("avgPrice") or order.get("price")
+        if ap is not None and str(ap).strip():
+            v = float(ap)
+            if v > 0:
+                entry_px = v
+    except (TypeError, ValueError):
+        pass
+    qty = float(fallback_qty)
+    try:
+        exq = order.get("executedQty")
+        if exq is not None and str(exq).strip():
+            v = float(exq)
+            if v > 0:
+                qty = v
+    except (TypeError, ValueError):
+        pass
+    return entry_px, qty
+
+
 def _open_position(
     *,
     stats: Dict[str, Any],
@@ -1198,21 +1368,119 @@ def _open_position(
     now_kst: datetime,
     hold_minutes: int,
     memory_summary: str,
-) -> Dict[str, Any]:
-    trade_id = _next_trade_id(now_kst)
+    dry_run: bool = True,
+) -> Dict[str, Any] | None:
+    entry_side = str(decision["decision"]).upper()
+    snap_price = float(snapshot["price"])
+
+    if dry_run:
+        trade_id = _paper_trade_id(now_kst)
+        position = {
+            "trade_id": trade_id,
+            "order_mode": "paper",
+            "symbol": symbol,
+            "interval": interval,
+            "side": entry_side,
+            "opened_at_kst": now_kst.isoformat(),
+            "expires_at_kst": (now_kst + timedelta(minutes=hold_minutes)).isoformat(),
+            "entry_price": snap_price,
+            "stop_loss": float(stop_loss),
+            "take_profit": float(_build_take_profit(snapshot, decision["decision"])),
+            "position_size": float(position_size),
+            "leverage": leverage,
+            "notional_usdt": snap_price * float(position_size),
+            "decision_reason": str(decision["reason"]),
+            "confidence": float(decision["confidence"]),
+            "similar_avg_pnl": float(similar_avg_pnl),
+            "failure_memory_summary": memory_summary,
+            "hold_extensions": 0,
+            "entry_snapshot": dict(snapshot),
+        }
+        stats["open_position"] = position
+        _append_trade_event(
+            {
+                "event": "open",
+                "logged_at_kst": now_kst.isoformat(),
+                "trade_id": trade_id,
+                "order_mode": "paper",
+                "symbol": symbol,
+                "interval": interval,
+                "side": entry_side,
+                "entry_price": snap_price,
+                "stop_loss": float(stop_loss),
+                "take_profit": float(position["take_profit"]),
+                "position_size": float(position_size),
+                "leverage": leverage,
+                "reason": str(decision["reason"]),
+                "confidence": float(decision["confidence"]),
+                "similar_avg_pnl": float(similar_avg_pnl),
+            }
+        )
+        return position
+
+    if _futures_market_open_position is None or _futures_client_from_env is None:
+        logger.error("실전 진입: binance_futures_tools 미로드")
+        _notify_kakao(
+            "🚨 실전 주문 실패 알림",
+            f"{symbol}: 선물 주문 함수를 불러올 수 없습니다(import 확인).",
+        )
+        return None
+
+    client = _futures_client_from_env()
+    if client is None:
+        logger.error("실전 진입: Binance 클라이언트 생성 실패(API 키)")
+        _notify_kakao(
+            "🚨 실전 주문 실패 알림",
+            f"{symbol}: BINANCE_API_KEY / BINANCE_API_SECRET 을 확인하세요.",
+        )
+        return None
+
+    try:
+        from binance.exceptions import BinanceAPIException
+
+        order = _futures_market_open_position(
+            client,
+            symbol,
+            entry_side=entry_side,
+            quantity=float(position_size),
+            leverage=int(leverage),
+        )
+    except BinanceAPIException as exc:
+        code = getattr(exc, "code", "")
+        msg = getattr(exc, "message", str(exc))
+        logger.exception("실전 진입 BinanceAPIException")
+        _notify_kakao(
+            "🚨 실전 주문 실패 알림",
+            f"{symbol} {entry_side} 실패 code={code} msg={msg}",
+        )
+        return None
+    except Exception as exc:
+        logger.exception("실전 진입 예외")
+        _notify_kakao(
+            "🚨 실전 주문 실패 알림",
+            f"{symbol} {entry_side} 실패: {type(exc).__name__}: {exc}",
+        )
+        return None
+
+    oid = order.get("orderId")
+    trade_id = str(oid) if oid is not None else ""
+    entry_px, qty_eff = _live_entry_price_qty(order, snap_price, position_size)
+    tp = float(_build_take_profit(snapshot, decision["decision"]))
     position = {
         "trade_id": trade_id,
+        "order_mode": "live",
+        "binance_order_id": trade_id,
         "symbol": symbol,
         "interval": interval,
-        "side": decision["decision"],
+        "side": entry_side,
         "opened_at_kst": now_kst.isoformat(),
         "expires_at_kst": (now_kst + timedelta(minutes=hold_minutes)).isoformat(),
-        "entry_price": float(snapshot["price"]),
+        "entry_price": entry_px,
         "stop_loss": float(stop_loss),
-        "take_profit": float(_build_take_profit(snapshot, decision["decision"])),
-        "position_size": float(position_size),
+        "take_profit": tp,
+        "position_size": qty_eff,
         "leverage": leverage,
-        "notional_usdt": float(snapshot["price"]) * float(position_size),
+        "notional_usdt": entry_px * qty_eff,
         "decision_reason": str(decision["reason"]),
         "confidence": float(decision["confidence"]),
         "similar_avg_pnl": float(similar_avg_pnl),
@@ -1226,18 +1494,27 @@ def _open_position(
             "event": "open",
             "logged_at_kst": now_kst.isoformat(),
             "trade_id": trade_id,
+            "order_mode": "live",
+            "binance_order_id": trade_id,
             "symbol": symbol,
             "interval": interval,
-            "side": decision["decision"],
-            "entry_price": float(snapshot["price"]),
+            "side": entry_side,
+            "entry_price": entry_px,
             "stop_loss": float(stop_loss),
-            "take_profit": float(position["take_profit"]),
-            "position_size": float(position_size),
+            "take_profit": tp,
+            "position_size": qty_eff,
             "leverage": leverage,
             "reason": str(decision["reason"]),
             "confidence": float(decision["confidence"]),
             "similar_avg_pnl": float(similar_avg_pnl),
         }
+    )
+    logger.info(
+        "실전 진입 접수 trade_id=%s symbol=%s side=%s qty=%s",
+        trade_id,
+        symbol,
+        entry_side,
+        qty_eff,
     )
     return position
 
@@ -1346,6 +1623,7 @@ def _send_startup_report() -> None:
         initial_balance_usdt=initial_usdt,
     )
     dry_run = _env_bool("AI_DRY_RUN", True)
+    _log_order_execution_setup(dry_run)
     live_usdt = None if dry_run else _fetch_binance_futures_usdt_balance()
     rb_krw, rb_usdt, rb_pct = resolve_report_balances(
         stats, dry_run=dry_run, live_futures_usdt=live_usdt, krw_per_usdt=krw_per_usdt
@@ -1541,7 +1819,9 @@ def _shutdown_signal_handler(signum: int, frame: Any) -> None:
             _graceful_shutdown_work(signum)
     except Exception:
         logger.exception("우아한 종료 처리 중 예외")
-    sys.exit(0)
+    finally:
+        # Windows 등에서 시그널 핸들러 안의 sys.exit가 무시되는 경우가 있어 즉시 종료 보장
+        os._exit(0)
 
 
 def install_shutdown_handlers() -> None:
@@ -1578,6 +1858,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
     leverage = _env_int("AI_LEVERAGE", 3)
     risk_per_trade = _env_float("AI_RISK_PER_TRADE", 0.015)
     dry_run = _env_bool("AI_DRY_RUN", True)
+    _log_order_execution_setup(dry_run)
     entry_model = _env_str("OPENAI_ENTRY_MODEL", _env_str("AI_ENTRY_MODEL", _env_str("OPENAI_MODEL", "gpt-4o")))
     monitor_model = _env_str("OPENAI_MONITOR_MODEL", _env_str("AI_MONITOR_MODEL", "gpt-4o-mini"))
     krw_per_usdt = _krw_per_usdt()
@@ -1636,19 +1917,25 @@ def _run_cycle_impl() -> Dict[str, Any]:
             krw_per_usdt=krw_per_usdt,
             model=entry_model,
             exit_reason=exit_reason,
+            dry_run=dry_run,
         )
-        open_position = None
+        if close_info.get("exchange_close_failed"):
+            open_position = stats.get("open_position") if isinstance(stats.get("open_position"), dict) else open_position
+        else:
+            open_position = None
 
     gate_open, gate_reason = _ai_entry_gate(snapshot)
     memory_block, memory_summary, memory_similarity = _find_closest_failure_memory(snapshot)
     context_text = backtest_summary.to_context_text() + f"\nSimilar-case mean pnl: {similar_avg_pnl:.4f}\n"
     if gate_open:
+        reflection_digest = _top_recent_loss_reflections(_env_int("AI_REFLECTION_DIGEST_COUNT", 5))
         model_ai_decision = get_ai_decision(
             context_text,
             snapshot,
             similar_cases,
             model=entry_model,
             failure_memory=memory_block,
+            reflection_digest=reflection_digest,
         )
         stats["ai_entry_calls"] = _safe_int(stats.get("ai_entry_calls", 0)) + 1
     else:
@@ -1662,6 +1949,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
         stats["estimated_tokens_saved"] = _safe_int(stats.get("estimated_tokens_saved", 0)) + max(0, estimated_saved)
     technical_decision = _technical_signal_decision(snapshot, backtest_summary.sample_size, similar_avg_pnl)
     raw_ai_decision = _blend_ai_and_technical_decision(model_ai_decision, technical_decision)
+    raw_ai_decision = _apply_failure_similarity_guard(raw_ai_decision, memory_similarity)
     _append_structured_ai_log(
         phase="RAW",
         timestamp=now_kst,
@@ -1750,8 +2038,16 @@ def _run_cycle_impl() -> Dict[str, Any]:
             now_kst=now_kst,
             hold_minutes=hold_minutes,
             memory_summary=memory_summary,
+            dry_run=dry_run,
         )
-        open_position = opened_position
+        if opened_position is not None:
+            open_position = opened_position
+        elif not dry_run:
+            final_decision = {
+                "decision": "HOLD",
+                "reason": "실전 거래소 진입 주문 실패(카카오 알림 참고)",
+                "confidence": 1.0,
+            }
 
     save_trading_stats(stats)
     ledger = summarize_ledger(stats)

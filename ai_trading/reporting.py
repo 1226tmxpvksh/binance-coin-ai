@@ -108,12 +108,20 @@ def default_trading_stats(
     }
 
 
-def _backup_stats(stats: Dict[str, Any], *, backup_period: str) -> None:
+def _backup_stats(
+    stats: Dict[str, Any],
+    *,
+    backup_period: str,
+    archived_at_kst: datetime | None = None,
+) -> None:
+    """월말 리셋 직전 스냅샷. 파일명은 `backup_period`(종료되는 월) + 실제 저장 시각(KST)로 구분한다."""
     history_dir = _history_dir()
     history_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = history_dir / f"trading_stats_{backup_period}.json"
+    at = archived_at_kst or datetime.now(KST)
+    ts = at.strftime("%Y%m%d_%H%M%S")
+    backup_path = history_dir / f"trading_stats_month_{backup_period}_archived_{ts}_kst.json"
     payload = dict(stats)
-    payload["backed_up_at_kst"] = datetime.now(KST).isoformat()
+    payload["backed_up_at_kst"] = at.isoformat()
     with open(backup_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -176,7 +184,7 @@ def _maybe_monthly_reset(stats: Dict[str, Any], now_kst: datetime) -> Dict[str, 
     stored_period = str(stats.get("period", current_period))
     cutoff = _monthly_reset_cutoff(now_kst)
     if now_kst >= cutoff and stored_period != current_period:
-        _backup_stats(stats, backup_period=stored_period)
+        _backup_stats(stats, backup_period=stored_period, archived_at_kst=now_kst)
         stats["period"] = current_period
         stats["monthly_realized_pnl_krw"] = 0.0
         stats["monthly_realized_pnl_usdt"] = 0.0

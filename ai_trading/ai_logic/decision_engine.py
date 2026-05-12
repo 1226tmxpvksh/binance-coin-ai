@@ -50,19 +50,27 @@ def _build_messages(
     market_snapshot: Dict[str, float],
     similar_cases: List[Dict[str, float]],
     failure_memory: str = "",
+    reflection_digest: str = "",
 ) -> List[Dict[str, str]]:
     system_prompt = (
         "You are a crypto scalp trading assistant. "
         "You must output only valid JSON with schema: "
         '{"decision":"BUY|SELL|HOLD","reason":"string","confidence":0.0}. '
-        "Operate with an aggressive paper-trading profile targeting monthly 20% growth. "
-        "When RSI, Bollinger Band position, and EMA trend clearly agree, you may enter even if "
-        "backtest similarity evidence is sparse. Use HOLD only when the signal is mixed or risk/reward is poor. "
+        "Prioritize capital preservation: if recent loss reflections or similar past failures suggest "
+        "indicator-only entries failed, prefer HOLD or very low confidence until multiple signals align. "
         "The reason field must be written in Korean for a human operator."
     )
-    memory_block = ""
+    preamble_parts: List[str] = []
+    if reflection_digest.strip():
+        preamble_parts.append(
+            "=== 절대 반복하지 말아야 할 실수 (최근 손실 반성 요약) ===\n"
+            + reflection_digest.strip()
+        )
     if failure_memory.strip():
-        memory_block = f"Past failure to avoid:\n{failure_memory.strip()}\n\n"
+        preamble_parts.append(
+            "=== 현재 차트와 유사한 과거 실패 사례(시그니처 매칭) ===\n" + failure_memory.strip()
+        )
+    preamble = ("\n\n".join(preamble_parts) + "\n\n") if preamble_parts else ""
     compact_snapshot = {
         "price": market_snapshot.get("price"),
         "rsi": market_snapshot.get("rsi"),
@@ -84,9 +92,9 @@ def _build_messages(
             }
         )
     user_prompt = (
+        f"{preamble}"
         "Backtest context(summary):\n"
         f"{backtest_context[:700]}\n\n"
-        f"{memory_block}"
         "Snapshot JSON:\n"
         f"{json.dumps(compact_snapshot, ensure_ascii=False, separators=(',', ':'))}\n"
         "Similar cases JSON:\n"
@@ -150,6 +158,7 @@ def get_ai_decision(
     similar_cases: List[Dict[str, float]],
     model: str = "gpt-4o",
     failure_memory: str = "",
+    reflection_digest: str = "",
 ) -> Dict[str, Any]:
     api_key = _load_openai_api_key()
     if not api_key:
@@ -164,7 +173,13 @@ def get_ai_decision(
 
     try:
         data = _call_openai_json(
-            _build_messages(backtest_context, market_snapshot, similar_cases, failure_memory),
+            _build_messages(
+                backtest_context,
+                market_snapshot,
+                similar_cases,
+                failure_memory,
+                reflection_digest,
+            ),
             model=model,
             timeout=25,
         )

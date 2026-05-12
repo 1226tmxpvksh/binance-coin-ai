@@ -12,6 +12,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from binance.exceptions import BinanceAPIException
+except ImportError:
+    BinanceAPIException = Exception  # type: ignore[misc, assignment]
+
 
 def _sanitize_api_value(value: str) -> str:
     raw = value or ""
@@ -31,6 +36,27 @@ def futures_client_from_env() -> Any | None:
     except ImportError:
         logger.warning("python-binance 미설치")
         return None
+
+
+def futures_wallet_usdt_balance(client: Any) -> float | None:
+    """USDT-M 선물 지갑 USDT 잔고 (`futures_account_balance`)."""
+    try:
+        account = client.futures_account_balance()
+        for row in account or []:
+            if str(row.get("asset", "")).upper() == "USDT":
+                bal = float(row.get("balance", 0) or 0)
+                return bal if bal >= 0 else None
+    except Exception as exc:
+        logger.warning("futures_account_balance 조회 실패: %s", type(exc).__name__)
+    return None
+
+
+def fetch_futures_usdt_balance_from_env() -> float | None:
+    """`.env` 키로 클라이언트 생성 후 USDT 잔고만 반환 (`main_ai` 등 단일 진입점)."""
+    client = futures_client_from_env()
+    if client is None:
+        return None
+    return futures_wallet_usdt_balance(client)
 
 
 def _lot_step_size(client: Any, symbol: str) -> float:
@@ -185,6 +211,83 @@ def market_close_signed_position(
     except Exception as exc:
         logger.exception("시장가 청산 실패 %s: %s", sym, exc)
         return False, type(exc).__name__
+
+
+def ensure_symbol_leverage(client: Any, symbol: str, leverage: int) -> None:
+    lev = int(max(1, min(125, leverage)))
+    try:
+        client.futures_change_leverage(symbol=symbol.upper(), leverage=lev)
+    except Exception as exc:
+        logger.warning("futures_change_leverage(%s, %s) 스킵: %s", symbol, lev, type(exc).__name__)
+
+
+def futures_market_open_position(
+    client: Any,
+    symbol: str,
+    *,
+    entry_side: str,
+    quantity: float,
+    leverage: int,
+) -> Dict[str, Any]:
+    """
+    USDT-M 신규 진입(시장가). entry_side는 전략 신호와 동일: BUY=롱, SELL=숏.
+    원웨이: BUY/SELL 만 전달. 헤지: positionSide LONG/SHORT 추가.
+    """
+    sym = symbol.upper()
+    es = str(entry_side).upper()
+    if es not in ("BUY", "SELL"):
+        raise ValueError(f"entry_side must be BUY or SELL, got {entry_side!r}")
+
+    qty = round_quantity_to_step(client, sym, float(quantity))
+    if qty <= 0:
+        raise ValueError("유효 수량이 없습니다(step 반올림 후 0)")
+
+    ensure_symbol_leverage(client, sym, leverage)
+
+    dual = futures_dual_side_position(client)
+    params: Dict[str, Any] = {
+        "symbol": sym,
+        "side": es,
+        "type": "MARKET",
+        "quantity": qty,
+        "reduceOnly": False,
+    }
+    if dual:
+        params["positionSide"] = "LONG" if es == "BUY" else "SHORT"
+
+    try:
+        order = client.futures_create_order(**params)
+    except BinanceAPIException:
+        raise
+    if not isinstance(order, dict):
+        raise RuntimeError("futures_create_order 비정상 응답")
+    return order
+
+
+def market_buy_symbol(
+    client: Any,
+    symbol: str,
+    quantity: float,
+    *,
+    leverage: int,
+) -> Dict[str, Any]:
+    """롱 진입용 편의 래퍼(BUY 시장가)."""
+    return futures_market_open_position(
+        client, symbol, entry_side="BUY", quantity=quantity, leverage=leverage
+    )
+
+
+def market_sell_symbol_open_short(
+    client: Any,
+    symbol: str,
+    quantity: float,
+    *,
+    leverage: int,
+) -> Dict[str, Any]:
+    """숏 진입용 편의 래퍼(SELL 시장가)."""
+    return futures_market_open_position(
+        client, symbol, entry_side="SELL", quantity=quantity, leverage=leverage
+    )
 
 
 def close_all_usdm_positions(client: Any) -> List[Tuple[str, bool, str]]:
