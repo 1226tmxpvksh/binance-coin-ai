@@ -900,6 +900,100 @@ def _decision_emoji(decision: str, risk_blocked: bool) -> str:
     return "📉"
 
 
+def _console_decision_emoji(decision: str) -> str:
+    d = (decision or "HOLD").upper()
+    if d == "BUY":
+        return "🟢"
+    if d == "SELL":
+        return "🔴"
+    return "⚪"
+
+
+def _symbol_base(symbol: str) -> str:
+    s = str(symbol or "BTCUSDT").upper()
+    for suffix in ("USDT", "BUSD", "USDC"):
+        if s.endswith(suffix):
+            return s[: -len(suffix)]
+    return s
+
+
+def _format_opened_at_kst(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        else:
+            dt = dt.astimezone(KST)
+        return dt.strftime("%H:%M")
+    except (TypeError, ValueError):
+        return text
+
+
+def _format_open_position_console(open_position: Dict[str, Any]) -> str:
+    symbol = str(open_position.get("symbol", "BTCUSDT"))
+    base = _symbol_base(symbol)
+    size = _safe_float(open_position.get("position_size", 0.0))
+    entry = _safe_float(open_position.get("entry_price", 0.0))
+    opened = _format_opened_at_kst(open_position.get("opened_at_kst", ""))
+    side = str(open_position.get("side", "")).upper()
+    side_tag = f" [{side}]" if side else ""
+    return (
+        f"{size:g} {base}{side_tag} "
+        f"(진입가: {entry:,.2f} / 진입시간: {opened})"
+    )
+
+
+def _format_cycle_dashboard(report: Dict[str, Any]) -> str:
+    market = report.get("market") if isinstance(report.get("market"), dict) else {}
+    symbol = str(market.get("symbol", "BTCUSDT"))
+    decision = str(report.get("decision", "HOLD")).upper()
+    confidence_pct = _safe_float(report.get("confidence", 0.0)) * 100.0
+    reason = _report_text(report.get("reason", ""))
+    tokens_saved = _safe_int(report.get("estimated_tokens_saved", 0))
+
+    price = _safe_float(market.get("price", 0.0))
+    rsi = _safe_float(market.get("rsi", 0.0))
+    ema_gap = _safe_float(market.get("ema_gap_pct", 0.0))
+    bb = _safe_float(market.get("bb_position", 0.5))
+
+    dry_run = bool(report.get("dry_run", True))
+    if not dry_run and report.get("binance_futures_wallet_usdt") is not None:
+        balance_usdt = _safe_float(report.get("binance_futures_wallet_usdt"))
+        balance_label = "실잔고(USDT)"
+    else:
+        balance_usdt = _safe_float(report.get("paper_balance_usdt", 0.0))
+        balance_label = "가상 잔고(USDT)" if dry_run else "잔고(USDT)"
+
+    open_position = report.get("open_position")
+    if isinstance(open_position, dict) and open_position:
+        position_line = _format_open_position_console(open_position)
+    else:
+        position_line = "없음"
+
+    decision_emoji = _console_decision_emoji(decision)
+    lines = [
+        "",
+        "=" * 50,
+        "[AI 매매 판단]",
+        f"- 최종 결정: {decision_emoji} {decision} (신뢰도: {confidence_pct:.0f}%)",
+        f"- 판단 사유: {reason}",
+        f"- AI 절감 토큰: {tokens_saved:,}",
+        "",
+        f"[시장 지표 ({symbol})]",
+        f"- 현재 가격: {price:,.2f}",
+        f"- 핵심 지표: RSI {rsi:.1f} / EMA 갭 {ema_gap:+.2f}% / 볼린저 위치 {bb:.2f}",
+        "",
+        "[현재 포지션 및 잔고]",
+        f"- {balance_label}: {balance_usdt:,.2f}",
+        f"- 보유 포지션: {position_line}",
+        "=" * 50,
+    ]
+    return "\n".join(lines)
+
+
 def _normalize_ai_log_file(log_path: Path, header: str) -> None:
     if not log_path.exists():
         return
@@ -1103,7 +1197,7 @@ def _find_closest_failure_memory(snapshot: Dict[str, Any]) -> Tuple[str, str, fl
         if ratio > best_ratio:
             best_ratio = ratio
             best_row = row
-    min_sim = _env_float("AI_FAILURE_MEMORY_MIN_SIM", 0.58)
+    min_sim = _env_float("AI_FAILURE_MEMORY_MIN_SIM", 0.75)
     if best_row is None or best_ratio < min_sim:
         return "", "", 0.0
     memory = (
@@ -1145,12 +1239,20 @@ def _top_recent_loss_reflections(limit: int) -> str:
     return "\n".join(lines)
 
 
-def _apply_failure_similarity_guard(decision: Dict[str, Any], similarity: float) -> Dict[str, Any]:
+def _apply_failure_similarity_guard(
+    decision: Dict[str, Any],
+    similarity: float,
+    snapshot: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     """과거 실패와 시그니처 유사도가 높을 때 최종 결정을 보수적으로 조정."""
     if similarity <= 0.0:
         return decision
-    strong = _env_float("AI_FAILURE_SIM_STRONG", 0.8)
-    moderate = _env_float("AI_FAILURE_SIM_MODERATE", 0.65)
+    if snapshot is not None:
+        rsi = _safe_float(snapshot.get("rsi", 50.0), 50.0)
+        if rsi <= 35.0 or rsi >= 65.0:
+            return decision
+    strong = _env_float("AI_FAILURE_SIM_STRONG", 0.92)
+    moderate = _env_float("AI_FAILURE_SIM_MODERATE", 0.85)
     strong_mult = _env_float("AI_FAILURE_SIM_CONF_MULT_STRONG", 0.15)
     mod_mult = _env_float("AI_FAILURE_SIM_CONF_MULT_MODERATE", 0.45)
     cap = _env_float("AI_FAILURE_SIM_CONF_CAP", 0.22)
@@ -1949,7 +2051,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
         stats["estimated_tokens_saved"] = _safe_int(stats.get("estimated_tokens_saved", 0)) + max(0, estimated_saved)
     technical_decision = _technical_signal_decision(snapshot, backtest_summary.sample_size, similar_avg_pnl)
     raw_ai_decision = _blend_ai_and_technical_decision(model_ai_decision, technical_decision)
-    raw_ai_decision = _apply_failure_similarity_guard(raw_ai_decision, memory_similarity)
+    raw_ai_decision = _apply_failure_similarity_guard(raw_ai_decision, memory_similarity, snapshot)
     _append_structured_ai_log(
         phase="RAW",
         timestamp=now_kst,
@@ -2130,7 +2232,7 @@ def run_forever() -> None:
         cycle_started = time.time()
         try:
             result = run_cycle()
-            print(json.dumps(result, ensure_ascii=False))
+            print(_format_cycle_dashboard(result))
         except KeyboardInterrupt:
             try:
                 with _SHUTDOWN_LOCK:
@@ -2154,7 +2256,7 @@ if __name__ == "__main__":
     _send_startup_report()
     if _env_bool("AI_RUN_ONCE", False):
         try:
-            print(json.dumps(run_cycle(), ensure_ascii=False))
+            print(_format_cycle_dashboard(run_cycle()))
         except KeyboardInterrupt:
             try:
                 with _SHUTDOWN_LOCK:
