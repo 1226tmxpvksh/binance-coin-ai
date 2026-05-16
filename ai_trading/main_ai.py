@@ -448,7 +448,7 @@ def _technical_signal_decision(snapshot: Dict[str, Any], sample_size: int, simil
         sell_score += 0.22
         sell_reasons.append(f"볼린저 위치 {bb:.2f}로 하단 이탈권")
 
-    if atr_pct >= 0.05:
+    if atr_pct >= _env_float("AI_ATR_MIN_ENTRY_PCT", 0.08):
         buy_score += 0.08
         sell_score += 0.08
     if sample_size == 0 and max(buy_score, sell_score) >= 0.56:
@@ -545,10 +545,34 @@ def _blend_ai_and_technical_decision(
     }
 
 
+def _atr_min_entry_pct() -> float:
+    """가격 대비 ATR(%) 최소값. 이보다 낮으면 횡보장으로 진입 차단."""
+    return _env_float("AI_ATR_MIN_ENTRY_PCT", 0.08)
+
+
+def _apply_atr_entry_filter(decision: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    side = str(decision.get("decision", "HOLD")).upper()
+    if side not in {"BUY", "SELL"}:
+        return decision
+    atr_pct = _safe_float(snapshot.get("atr_pct", 0.0))
+    min_pct = _atr_min_entry_pct()
+    if atr_pct >= min_pct:
+        return decision
+    out = dict(decision)
+    base_reason = _report_text(decision.get("reason"), "")
+    out["decision"] = "HOLD"
+    out["confidence"] = min(_safe_float(out.get("confidence", 0.0)), 0.35)
+    out["reason"] = (
+        f"변동성 부족(Choppy Market, ATR {atr_pct:.3f}% < {min_pct:.3f}%)"
+        + (f" — {base_reason}" if base_reason and base_reason != "기록 없음" else "")
+    )
+    return out
+
+
 def _build_stop_loss(snapshot: Dict[str, float], decision: str) -> float:
     price = float(snapshot["price"])
     atr = float(snapshot["atr14"])
-    atr_multiplier = _env_float("AI_ATR_STOP_MULTIPLIER", 1.6)
+    atr_multiplier = _env_float("AI_ATR_STOP_MULTIPLIER", 1.2)
     if decision == "BUY":
         return price - (atr * atr_multiplier)
     if decision == "SELL":
@@ -559,15 +583,20 @@ def _build_stop_loss(snapshot: Dict[str, float], decision: str) -> float:
 def _build_take_profit(snapshot: Dict[str, float], decision: str) -> float:
     price = float(snapshot["price"])
     atr = float(snapshot["atr14"])
-    multiplier = _env_float("AI_ATR_TAKE_PROFIT_MULTIPLIER", 3.2)
+    sl_mult = _env_float("AI_ATR_STOP_MULTIPLIER", 1.2)
+    tp_mult = _env_float("AI_ATR_TAKE_PROFIT_MULTIPLIER", 2.25)
+    min_rr = _env_float("AI_MIN_RR_RATIO", 1.75)
     min_profit_ratio = _env_float("AI_MIN_TAKE_PROFIT_RATIO", 0.012)
     if _trend_aligned(decision, snapshot):
-        multiplier += 0.5
-    distance = max(atr * multiplier, price * min_profit_ratio)
+        tp_mult += _env_float("AI_ATR_TREND_TP_BONUS", 0.25)
+    stop_distance = atr * sl_mult
+    tp_distance = max(atr * tp_mult, price * min_profit_ratio)
+    if stop_distance > 0 and min_rr > 0:
+        tp_distance = max(tp_distance, stop_distance * min_rr)
     if decision == "SELL":
-        return price - distance
+        return price - tp_distance
     if decision == "BUY":
-        return price + distance
+        return price + tp_distance
     return price
 
 
@@ -645,7 +674,7 @@ def _position_exit_reason(
             return None
         return "take_profit"
 
-    scratch_min = _env_int("AI_EARLY_SCRATCH_MINUTES", 14)
+    scratch_min = _env_int("AI_EARLY_SCRATCH_MINUTES", 45)
     flat_pct = _env_float("AI_SCRATCH_FLAT_MOVE_PCT", 0.12)
     if scratch_min > 0 and flat_pct >= 0.0:
         mins_open = _minutes_since_position_open(open_position, now_kst)
@@ -958,6 +987,9 @@ def _format_cycle_dashboard(report: Dict[str, Any]) -> str:
     rsi = _safe_float(market.get("rsi", 0.0))
     ema_gap = _safe_float(market.get("ema_gap_pct", 0.0))
     bb = _safe_float(market.get("bb_position", 0.5))
+    atr_pct = _safe_float(market.get("atr_pct", 0.0))
+    atr_min = _atr_min_entry_pct()
+    atr_ok = atr_pct >= atr_min
 
     dry_run = bool(report.get("dry_run", True))
     if not dry_run and report.get("binance_futures_wallet_usdt") is not None:
@@ -985,6 +1017,7 @@ def _format_cycle_dashboard(report: Dict[str, Any]) -> str:
         f"[시장 지표 ({symbol})]",
         f"- 현재 가격: {price:,.2f}",
         f"- 핵심 지표: RSI {rsi:.1f} / EMA 갭 {ema_gap:+.2f}% / 볼린저 위치 {bb:.2f}",
+        f"- 변동성(ATR): {atr_pct:.3f}% {'✓ 추세 가능' if atr_ok else f'✗ 횡보 (<{atr_min:.3f}%)'}",
         "",
         "[현재 포지션 및 잔고]",
         f"- {balance_label}: {balance_usdt:,.2f}",
@@ -1942,6 +1975,96 @@ def install_shutdown_handlers() -> None:
     _SIGNAL_HANDLERS_INSTALLED = True
 
 
+def _is_weekend_trading_blocked(now_kst: datetime) -> bool:
+    if _env_bool("AI_TRADE_ON_WEEKENDS", False):
+        return False
+    return now_kst.weekday() in (5, 6)
+
+
+def _run_weekend_monitor_cycle(
+    *,
+    stats: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    symbol: str,
+    interval: str,
+    dry_run: bool,
+    now_kst: datetime,
+    krw_per_usdt: float,
+    open_position: Dict[str, Any] | None,
+    close_info: Dict[str, Any] | None,
+    entry_model: str,
+    monitor_model: str,
+    status_report_minutes: int,
+) -> Dict[str, Any]:
+    """토·일: 신규 진입·AI 분석 없이 보유 포지션 청산 감시만 수행."""
+    live_wallet_usdt: float | None = None
+    if not dry_run:
+        live_wallet_usdt = _fetch_binance_futures_usdt_balance()
+    save_trading_stats(stats)
+    ledger = summarize_ledger(stats)
+    rb_krw, rb_usdt, rb_pct = resolve_report_balances(
+        stats,
+        dry_run=dry_run,
+        live_futures_usdt=live_wallet_usdt,
+        krw_per_usdt=krw_per_usdt,
+    )
+    weekend_reason = "주말 휴장 중 (보유 포지션 청산만 감시)"
+    if close_info:
+        weekend_reason = f"{weekend_reason} — 이번 사이클 청산 완료"
+    final_decision = {"decision": "HOLD", "reason": weekend_reason, "confidence": 1.0}
+    report = {
+        "decision": final_decision["decision"],
+        "reason": final_decision["reason"],
+        "confidence": float(final_decision["confidence"]),
+        "market": snapshot,
+        "backtest_sample_size": 0,
+        "similar_avg_pnl": 0.0,
+        "risk_allowed": True,
+        "risk_ratio": 0.0,
+        "dry_run": dry_run,
+        "paper_balance_krw": rb_krw,
+        "paper_balance_usdt": rb_usdt,
+        "paper_profit_pct": rb_pct,
+        "binance_futures_wallet_usdt": live_wallet_usdt if not dry_run else None,
+        "unique_failure_count": ledger.unique_failure_count,
+        "last_reflection_summary": ledger.last_reflection_summary,
+        "failure_memory_similarity": 0.0,
+        "open_position": open_position,
+        "close_event": close_info["close_event"] if close_info else None,
+        "raw_model_decision": final_decision,
+        "adjusted_decision": final_decision,
+        "technical_decision": final_decision,
+        "entry_gate_open": False,
+        "entry_gate_reason": weekend_reason,
+        "entry_model": entry_model,
+        "monitor_model": monitor_model,
+        "estimated_tokens_saved": _safe_int(stats.get("estimated_tokens_saved", 0)),
+        "weekend_mode": True,
+    }
+    _append_structured_ai_log(
+        phase="FINAL",
+        timestamp=now_kst,
+        snapshot=snapshot,
+        decision=report["decision"],
+        confidence=float(report["confidence"]),
+        risk_allowed=True,
+        reason=report["reason"],
+    )
+    if close_info:
+        _notify_kakao(
+            f"📊 {_report_bracket_title(dry_run)} 주말 청산",
+            f"{symbol} ({interval}) 포지션 청산: {close_info.get('close_event', {}).get('exit_reason', '')}",
+        )
+    elif open_position and _should_send_periodic_report(stats, now_kst, status_report_minutes):
+        _notify_kakao(
+            f"📊 {_report_bracket_title(dry_run)} 주말 감시",
+            f"{weekend_reason}\n보유: {open_position.get('side', '')} @ {_format_price(open_position.get('entry_price', 0.0))}",
+        )
+        stats["last_report_at_kst"] = now_kst.isoformat()
+        save_trading_stats(stats)
+    return report
+
+
 def run_cycle() -> Dict[str, Any]:
     with _SHUTDOWN_LOCK:
         return _run_cycle_impl()
@@ -1956,7 +2079,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
         raise RuntimeError("btc_live_trading.strategy.risk_manager 모듈을 로드할 수 없습니다.") from _POSITION_SIZE_IMPORT_ERROR
 
     symbol = _env_str("AI_SYMBOL", "BTCUSDT")
-    interval = _env_str("AI_TIMEFRAME", "5m")
+    interval = _env_str("AI_TIMEFRAME", "15m")
     leverage = _env_int("AI_LEVERAGE", 3)
     risk_per_trade = _env_float("AI_RISK_PER_TRADE", 0.015)
     dry_run = _env_bool("AI_DRY_RUN", True)
@@ -1964,7 +2087,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
     entry_model = _env_str("OPENAI_ENTRY_MODEL", _env_str("AI_ENTRY_MODEL", _env_str("OPENAI_MODEL", "gpt-4o")))
     monitor_model = _env_str("OPENAI_MONITOR_MODEL", _env_str("AI_MONITOR_MODEL", "gpt-4o-mini"))
     krw_per_usdt = _krw_per_usdt()
-    hold_minutes = _env_int("AI_PAPER_HOLD_MINUTES", 30)
+    hold_minutes = _env_int("AI_PAPER_HOLD_MINUTES", 60)
     status_report_minutes = _env_int("AI_STATUS_REPORT_MINUTES", 60)
     initial_krw, initial_usdt = _initial_balances(krw_per_usdt)
     stats = load_trading_stats(
@@ -1992,16 +2115,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
     ):
         save_trading_stats(stats)
 
-    backtest_summary = load_backtest_summary(str(BACKTEST_DIR))
     snapshot = fetch_market_snapshot(symbol=symbol, interval=interval, limit=250)
-    similar_cases = find_similar_backtest_cases(
-        current_rsi=float(snapshot["rsi"]),
-        current_atr_pct=float(snapshot["atr_pct"]),
-        current_ema_gap_pct=float(snapshot["ema_gap_pct"]),
-        backtest_dir=str(BACKTEST_DIR),
-        top_n=5,
-    )
-    similar_avg_pnl = sum(x["pnl"] for x in similar_cases) / len(similar_cases) if similar_cases else 0.0
 
     close_info: Dict[str, Any] | None = None
     open_position = stats.get("open_position") if isinstance(stats.get("open_position"), dict) else None
@@ -2026,6 +2140,31 @@ def _run_cycle_impl() -> Dict[str, Any]:
         else:
             open_position = None
 
+    if _is_weekend_trading_blocked(now_kst):
+        return _run_weekend_monitor_cycle(
+            stats=stats,
+            snapshot=snapshot,
+            symbol=symbol,
+            interval=interval,
+            dry_run=dry_run,
+            now_kst=now_kst,
+            krw_per_usdt=krw_per_usdt,
+            open_position=open_position if isinstance(open_position, dict) else None,
+            close_info=close_info,
+            entry_model=entry_model,
+            monitor_model=monitor_model,
+            status_report_minutes=status_report_minutes,
+        )
+
+    backtest_summary = load_backtest_summary(str(BACKTEST_DIR))
+    similar_cases = find_similar_backtest_cases(
+        current_rsi=float(snapshot["rsi"]),
+        current_atr_pct=float(snapshot["atr_pct"]),
+        current_ema_gap_pct=float(snapshot["ema_gap_pct"]),
+        backtest_dir=str(BACKTEST_DIR),
+        top_n=5,
+    )
+    similar_avg_pnl = sum(x["pnl"] for x in similar_cases) / len(similar_cases) if similar_cases else 0.0
     gate_open, gate_reason = _ai_entry_gate(snapshot)
     memory_block, memory_summary, memory_similarity = _find_closest_failure_memory(snapshot)
     context_text = backtest_summary.to_context_text() + f"\nSimilar-case mean pnl: {similar_avg_pnl:.4f}\n"
@@ -2052,6 +2191,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
     technical_decision = _technical_signal_decision(snapshot, backtest_summary.sample_size, similar_avg_pnl)
     raw_ai_decision = _blend_ai_and_technical_decision(model_ai_decision, technical_decision)
     raw_ai_decision = _apply_failure_similarity_guard(raw_ai_decision, memory_similarity, snapshot)
+    raw_ai_decision = _apply_atr_entry_filter(raw_ai_decision, snapshot)
     _append_structured_ai_log(
         phase="RAW",
         timestamp=now_kst,
@@ -2110,7 +2250,11 @@ def _run_cycle_impl() -> Dict[str, Any]:
 
     final_decision = dict(raw_ai_decision)
     if position_size <= 0 and raw_ai_decision["decision"] in {"BUY", "SELL"}:
-        final_decision = {"decision": "HOLD", "reason": "변동성 부족으로 인한 대기", "confidence": 1.0}
+        final_decision = {
+            "decision": "HOLD",
+            "reason": "손절 이격이 너무 좁아 포지션 산출 불가(변동성·최소 갭)",
+            "confidence": 1.0,
+        }
     elif not risk_check["allowed"] and raw_ai_decision["decision"] in {"BUY", "SELL"}:
         final_decision = {
             "decision": "HOLD",

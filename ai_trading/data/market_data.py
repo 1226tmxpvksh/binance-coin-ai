@@ -1,8 +1,35 @@
 from __future__ import annotations
 
-from typing import Dict, List
+import os
+import time
+from typing import Dict, List, Tuple
 
 import requests
+
+_SNAPSHOT_CACHE: Dict[Tuple[str, str, int], Tuple[float, Dict[str, float]]] = {}
+
+
+def _parse_interval_seconds(interval: str) -> int:
+    s = (interval or "15m").strip().lower()
+    if s.endswith("m"):
+        return max(60, int(s[:-1]) * 60)
+    if s.endswith("h"):
+        return max(3600, int(s[:-1]) * 3600)
+    if s.endswith("d"):
+        return max(86400, int(s[:-1]) * 86400)
+    return 900
+
+
+def _snapshot_cache_ttl_seconds(interval: str) -> int:
+    """15m 추세 매매: 루프(기본 300초)마다 Binance klines를 매번 긁지 않도록 TTL 적용."""
+    raw = os.environ.get("AI_MARKET_CACHE_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(30, int(float(raw)))
+        except ValueError:
+            pass
+    interval_secs = _parse_interval_seconds(interval)
+    return max(30, min(300, interval_secs // 3))
 
 
 def _ema(values: List[float], period: int) -> float:
@@ -47,7 +74,14 @@ def _rsi(closes: List[float], period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
-def fetch_market_snapshot(symbol: str = "BTCUSDT", interval: str = "5m", limit: int = 250) -> Dict[str, float]:
+def fetch_market_snapshot(symbol: str = "BTCUSDT", interval: str = "15m", limit: int = 250) -> Dict[str, float]:
+    cache_key = (symbol.upper(), interval, int(limit))
+    now = time.time()
+    ttl = _snapshot_cache_ttl_seconds(interval)
+    cached = _SNAPSHOT_CACHE.get(cache_key)
+    if cached is not None and now < cached[0]:
+        return dict(cached[1])
+
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     response = requests.get(url, params=params, timeout=10)
@@ -83,7 +117,7 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT", interval: str = "5m", limit: 
     if bb_upper > bb_lower:
         bb_pos = (last_price - bb_lower) / (bb_upper - bb_lower)
 
-    return {
+    snapshot = {
         "symbol": symbol,
         "interval": interval,
         "price": last_price,
@@ -97,3 +131,5 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT", interval: str = "5m", limit: 
         "bb_lower": bb_lower,
         "bb_position": bb_pos,
     }
+    _SNAPSHOT_CACHE[cache_key] = (now + ttl, snapshot)
+    return snapshot
