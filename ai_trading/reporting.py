@@ -34,6 +34,22 @@ class LedgerSummary:
     last_reflection_summary: str
 
 
+@dataclass
+class MonthlyPnlDisplay:
+    """원금 복구 중일 때 월 실현손익 착시를 막기 위한 표시용 집계."""
+    principal_recovering: bool
+    status_label: str
+    initial_balance_krw: float
+    balance_krw: float
+    shortfall_krw: float
+    monthly_realized_raw_krw: float
+    monthly_profit_display_krw: float
+    monthly_net_display_krw: float
+    monthly_operating_cost_krw: float
+    monthly_line: str
+    net_line: str
+
+
 KST = timezone(timedelta(hours=9))
 
 
@@ -330,3 +346,60 @@ def days_left_in_month_kst() -> int:
     else:
         next_month = now.replace(month=now.month + 1, day=1)
     return (next_month.date() - now.date()).days
+
+
+def build_monthly_pnl_display(
+    stats: Dict[str, Any],
+    *,
+    balance_krw: float,
+) -> MonthlyPnlDisplay:
+    """
+    총 평가금(잔고)이 초기 원금 미만이면 '원금 복구 중'으로 표기하고
+    월 실현손익·순수익을 0원(실질)으로 보여 준다.
+    """
+    initial = _safe_float(stats.get("initial_balance_krw", 500_000.0), 500_000.0)
+    raw_monthly = _safe_float(stats.get("monthly_realized_pnl_krw", 0.0))
+    est_daily = _safe_float(stats.get("estimated_daily_server_cost_krw", 0.0))
+    sub_monthly = _safe_float(stats.get("monthly_subscription_cost_krw", 0.0))
+    op_cost = est_daily * 30.0 + sub_monthly
+    recovering = initial > 0 and balance_krw < initial
+
+    if recovering:
+        shortfall = initial - balance_krw
+        ref_note = f"체결 실현손익(참고): {raw_monthly:+,.0f}원"
+        monthly_line = (
+            f"📌 원금 복구 중 — 잔고 {balance_krw:,.0f}원 / 기준 {initial:,.0f}원 "
+            f"({shortfall:,.0f}원 부족)\n"
+            f"   {ref_note} → 실질 월 실현손익: 0원"
+        )
+        net_line = f"월 순수익(Net): 0원 (잔고 복구 중 · 운영비 {op_cost:,.0f}원 별도)"
+        return MonthlyPnlDisplay(
+            principal_recovering=True,
+            status_label="원금 복구 중",
+            initial_balance_krw=initial,
+            balance_krw=balance_krw,
+            shortfall_krw=shortfall,
+            monthly_realized_raw_krw=raw_monthly,
+            monthly_profit_display_krw=0.0,
+            monthly_net_display_krw=0.0,
+            monthly_operating_cost_krw=op_cost,
+            monthly_line=monthly_line,
+            net_line=net_line,
+        )
+
+    net = raw_monthly - op_cost
+    monthly_line = f"월 실현손익: {raw_monthly:,.0f}원 / 월 운영비: {op_cost:,.0f}원"
+    net_line = f"월 순수익(Net): {net:,.0f}원"
+    return MonthlyPnlDisplay(
+        principal_recovering=False,
+        status_label="수익 구간",
+        initial_balance_krw=initial,
+        balance_krw=balance_krw,
+        shortfall_krw=0.0,
+        monthly_realized_raw_krw=raw_monthly,
+        monthly_profit_display_krw=raw_monthly,
+        monthly_net_display_krw=net,
+        monthly_operating_cost_krw=op_cost,
+        monthly_line=monthly_line,
+        net_line=net_line,
+    )

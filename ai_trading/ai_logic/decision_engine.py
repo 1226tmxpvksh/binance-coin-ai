@@ -53,11 +53,14 @@ def _build_messages(
     reflection_digest: str = "",
 ) -> List[Dict[str, str]]:
     system_prompt = (
-        "You are a crypto scalp trading assistant. "
+        "You are a crypto trend-following assistant (15m timeframe). "
         "You must output only valid JSON with schema: "
         '{"decision":"BUY|SELL|HOLD","reason":"string","confidence":0.0}. '
         "Prioritize capital preservation: if recent loss reflections or similar past failures suggest "
         "indicator-only entries failed, prefer HOLD or very low confidence until multiple signals align. "
+        "Volume confirmation: only recommend BUY or SELL when volume_surge is true "
+        "(current candle volume >= volume_7d_avg * threshold, see volume_ratio_pct). "
+        "If price moves without volume surge, treat it as noise and prefer HOLD. "
         "The reason field must be written in Korean for a human operator."
     )
     preamble_parts: List[str] = []
@@ -79,6 +82,10 @@ def _build_messages(
         "ema_gap_pct": market_snapshot.get("ema_gap_pct"),
         "bb_position": market_snapshot.get("bb_position"),
         "atr_pct": market_snapshot.get("atr_pct"),
+        "volume": market_snapshot.get("volume"),
+        "volume_7d_avg": market_snapshot.get("volume_7d_avg"),
+        "volume_ratio_pct": market_snapshot.get("volume_ratio_pct"),
+        "volume_surge": market_snapshot.get("volume_surge"),
     }
     compact_cases = []
     for case in similar_cases[:3]:
@@ -216,6 +223,8 @@ def get_market_monitor_summary(
         "ema_gap_pct": market_snapshot.get("ema_gap_pct"),
         "bb_position": market_snapshot.get("bb_position"),
         "atr_pct": market_snapshot.get("atr_pct"),
+        "volume_ratio_pct": market_snapshot.get("volume_ratio_pct"),
+        "volume_surge": market_snapshot.get("volume_surge"),
     }
     user_prompt = (
         "Market snapshot JSON:\n"

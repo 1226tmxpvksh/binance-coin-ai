@@ -57,6 +57,7 @@ from ai_logic.decision_engine import analyze_trade_failure, get_ai_decision, get
 from data.backtest_data import find_similar_backtest_cases, load_backtest_summary
 from data.market_data import fetch_market_snapshot
 from reporting import (
+    build_monthly_pnl_display,
     days_left_in_month_kst,
     load_trading_stats,
     resolve_report_balances,
@@ -569,6 +570,31 @@ def _apply_atr_entry_filter(decision: Dict[str, Any], snapshot: Dict[str, Any]) 
     return out
 
 
+def _volume_min_ratio() -> float:
+    return _env_float("AI_VOLUME_MIN_RATIO", 1.5)
+
+
+def _apply_volume_entry_filter(decision: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    if not _env_bool("AI_VOLUME_GATE_ENABLED", True):
+        return decision
+    side = str(decision.get("decision", "HOLD")).upper()
+    if side not in {"BUY", "SELL"}:
+        return decision
+    if bool(snapshot.get("volume_surge")):
+        return decision
+    ratio_pct = _safe_float(snapshot.get("volume_ratio_pct", 0.0))
+    min_ratio = _volume_min_ratio()
+    out = dict(decision)
+    base_reason = _report_text(decision.get("reason"), "")
+    out["decision"] = "HOLD"
+    out["confidence"] = min(_safe_float(out.get("confidence", 0.0)), 0.35)
+    out["reason"] = (
+        f"거래량 미동반(Volume {ratio_pct:.0f}% of 7d avg, need ≥{min_ratio * 100:.0f}%)"
+        + (f" — {base_reason}" if base_reason and base_reason != "기록 없음" else "")
+    )
+    return out
+
+
 def _build_stop_loss(snapshot: Dict[str, float], decision: str) -> float:
     price = float(snapshot["price"])
     atr = float(snapshot["atr14"])
@@ -990,8 +1016,14 @@ def _format_cycle_dashboard(report: Dict[str, Any]) -> str:
     atr_pct = _safe_float(market.get("atr_pct", 0.0))
     atr_min = _atr_min_entry_pct()
     atr_ok = atr_pct >= atr_min
+    vol_ratio_pct = _safe_float(market.get("volume_ratio_pct", 0.0))
+    vol_surge = bool(market.get("volume_surge"))
+    vol_min_pct = _volume_min_ratio() * 100.0
 
     dry_run = bool(report.get("dry_run", True))
+    balance_krw = _safe_float(report.get("paper_balance_krw", 0.0))
+    pnl_disp = report.get("pnl_display") if isinstance(report.get("pnl_display"), dict) else {}
+    recovering = bool(pnl_disp.get("principal_recovering"))
     if not dry_run and report.get("binance_futures_wallet_usdt") is not None:
         balance_usdt = _safe_float(report.get("binance_futures_wallet_usdt"))
         balance_label = "실잔고(USDT)"
@@ -1018,12 +1050,16 @@ def _format_cycle_dashboard(report: Dict[str, Any]) -> str:
         f"- 현재 가격: {price:,.2f}",
         f"- 핵심 지표: RSI {rsi:.1f} / EMA 갭 {ema_gap:+.2f}% / 볼린저 위치 {bb:.2f}",
         f"- 변동성(ATR): {atr_pct:.3f}% {'✓ 추세 가능' if atr_ok else f'✗ 횡보 (<{atr_min:.3f}%)'}",
+        f"- 거래량: {vol_ratio_pct:.0f}% of 7d avg {'✓ 급증' if vol_surge else f'✗ 미달 (<{vol_min_pct:.0f}%)'}",
         "",
         "[현재 포지션 및 잔고]",
-        f"- {balance_label}: {balance_usdt:,.2f}",
+        f"- {balance_label}: {balance_usdt:,.2f}" + (f" (≈ {balance_krw:,.0f}원)" if balance_krw > 0 else ""),
         f"- 보유 포지션: {position_line}",
-        "=" * 50,
     ]
+    if recovering:
+        shortfall = _safe_float(pnl_disp.get("shortfall_krw", 0.0))
+        lines.append(f"- 원금 상태: 📌 복구 중 ({shortfall:,.0f}원 부족 · 실질 월손익 0원 표기)")
+    lines.append("=" * 50)
     return "\n".join(lines)
 
 
@@ -1685,6 +1721,7 @@ def _build_kakao_message(
         live_futures_usdt=live_futures_usdt,
         krw_per_usdt=krw_per_usdt,
     )
+    pnl_display = build_monthly_pnl_display(stats, balance_krw=rb_krw)
     sign = "+" if rb_pct >= 0 else ""
     total_count, attempt_count = _today_decision_counters()
     market = report.get("market", {})
@@ -1704,6 +1741,8 @@ def _build_kakao_message(
         f"현재 가격: {_format_price(market.get('price', 0.0))}",
         f"매수/매도 이유: {_report_text(report['reason'])}",
         f"기술 지표: RSI {_safe_float(market.get('rsi', 0.0)):.1f} / BB {_safe_float(market.get('bb_position', 0.0)):.2f} / EMA갭 {_safe_float(market.get('ema_gap_pct', 0.0)):+.2f}%",
+        f"거래량: {_safe_float(market.get('volume_ratio_pct', 0.0)):.0f}% of 7d avg"
+        + (" (급증 ✓)" if market.get("volume_surge") else " (미동반)"),
         "",
         "🔴 [매도 알림]",
         (
@@ -1721,8 +1760,8 @@ def _build_kakao_message(
         "",
         "📊 [원장]",
         f"{bal_label}: {rb_krw:,.0f}원 ({sign}{rb_pct:.2f}%) / {rb_usdt:,.2f} USDT",
-        f"월 실현손익: {ledger.monthly_profit_krw:,.0f}원 / 월 운영비: {ledger.monthly_operating_cost_krw:,.0f}원",
-        f"월 순수익(Net): {ledger.monthly_net_profit_krw:,.0f}원",
+        pnl_display.monthly_line,
+        pnl_display.net_line,
         f"AI 게이트 절감 호출: {_safe_int(stats.get('ai_calls_saved_by_gate', 0))}회 / 예상 절감 토큰: {_safe_int(stats.get('estimated_tokens_saved', 0)):,}",
         f"월 목표 100,000원까지 남은 기간: D-{days_left_in_month_kst()}일",
     ]
@@ -2115,7 +2154,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
     ):
         save_trading_stats(stats)
 
-    snapshot = fetch_market_snapshot(symbol=symbol, interval=interval, limit=250)
+    snapshot = fetch_market_snapshot(symbol=symbol, interval=interval)
 
     close_info: Dict[str, Any] | None = None
     open_position = stats.get("open_position") if isinstance(stats.get("open_position"), dict) else None
@@ -2192,6 +2231,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
     raw_ai_decision = _blend_ai_and_technical_decision(model_ai_decision, technical_decision)
     raw_ai_decision = _apply_failure_similarity_guard(raw_ai_decision, memory_similarity, snapshot)
     raw_ai_decision = _apply_atr_entry_filter(raw_ai_decision, snapshot)
+    raw_ai_decision = _apply_volume_entry_filter(raw_ai_decision, snapshot)
     _append_structured_ai_log(
         phase="RAW",
         timestamp=now_kst,
@@ -2304,6 +2344,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
         krw_per_usdt=krw_per_usdt,
     )
     stats.pop("last_openai_api_usage", None)
+    pnl_display = build_monthly_pnl_display(stats, balance_krw=rb_krw)
     report = {
         "decision": final_decision["decision"],
         "reason": final_decision["reason"],
@@ -2331,6 +2372,12 @@ def _run_cycle_impl() -> Dict[str, Any]:
         "entry_model": entry_model,
         "monitor_model": monitor_model,
         "estimated_tokens_saved": _safe_int(stats.get("estimated_tokens_saved", 0)),
+        "pnl_display": {
+            "principal_recovering": pnl_display.principal_recovering,
+            "status_label": pnl_display.status_label,
+            "shortfall_krw": pnl_display.shortfall_krw,
+            "monthly_realized_raw_krw": pnl_display.monthly_realized_raw_krw,
+        },
     }
     _append_structured_ai_log(
         phase="FINAL",
