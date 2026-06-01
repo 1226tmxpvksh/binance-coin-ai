@@ -33,6 +33,16 @@ from kakao_utils import (  # noqa: E402
     exchange_authorization_code,
     get_redirect_uri,
 )
+from urllib.parse import quote  # noqa: E402
+
+
+def _auth_url(client_id: str, redirect_uri: str) -> str:
+    if not client_id or not redirect_uri:
+        return ""
+    return (
+        "https://kauth.kakao.com/oauth/authorize?"
+        f"client_id={client_id}&redirect_uri={quote(redirect_uri, safe='')}&response_type=code"
+    )
 
 
 def main() -> None:
@@ -48,6 +58,14 @@ def main() -> None:
     redirect_uri = get_redirect_uri()
     code = (args.code or "").strip()
     if not code:
+        url = _auth_url(client_id, redirect_uri)
+        if url:
+            print("브라우저에서 아래 URL로 로그인 후 리다이렉트 URL의 code= 값을 복사하세요.")
+            print(url)
+        print(f"Redirect URI: {redirect_uri}")
+        if not sys.stdin.isatty():
+            print("비대화형 환경: py -3 scripts/auth_kakao.py --code \"<인가코드>\" 로 실행하세요.", file=sys.stderr)
+            sys.exit(2)
         print("브라우저 리다이렉트 URL 의 code= 뒤 값을 붙여넣으세요.")
         code = input("Authorization code: ").strip()
     if not code:

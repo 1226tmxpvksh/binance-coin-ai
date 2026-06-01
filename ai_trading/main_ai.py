@@ -121,6 +121,7 @@ logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 ENV_LINE_MAP: Dict[str, int] = {}
 KAKAO_AUTH_LINK_LOGGED = False
+KAKAO_MANUAL_RECOVERY_ATTEMPTED = False
 STARTUP_REPORT_SENT = False
 STARTUP_HEALTH_CHECK_DONE = False
 STARTUP_HEALTH_CHECK_OK = False
@@ -767,7 +768,52 @@ def _log_kakao_manual_auth_link(reason: str) -> None:
     if not redirect_ok:
         logger.error("현재 redirect_uri 설정 검증에 실패했습니다. URI를 먼저 수정한 뒤 새 인가 코드를 발급하세요.")
     logger.error("=" * 80)
+    logger.error(
+        "systemd/Vultr 등 비대화형 환경에서는 journalctl에 코드를 붙여넣어도 봇 stdin으로 전달되지 않습니다."
+    )
+    logger.error("서버 SSH에서 아래 명령으로 토큰을 발급한 뒤 서비스를 재시작하세요:")
+    logger.error('  cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && py -3 scripts/auth_kakao.py --code "<인가코드>"')
+    logger.error("  sudo systemctl restart coinbot.service")
+    logger.error("또는 .env에 KAKAO_AUTH_CODE=<인가코드> 를 1회 설정 후 restart (성공 시 자동 저장됨).")
     KAKAO_AUTH_LINK_LOGGED = True
+
+
+def _stdin_is_interactive() -> bool:
+    if _env_bool("AI_FORCE_INTERACTIVE_KAKAO", False):
+        return True
+    if _env_bool("AI_NON_INTERACTIVE", False):
+        return False
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _exchange_kakao_auth_code(rest_api_key: str, redirect_uri: str, auth_code: str) -> str:
+    if (
+        _exchange_kakao_authorization_code is None
+        or _apply_kakao_token_response is None
+        or not rest_api_key
+        or not auth_code
+    ):
+        return ""
+    try:
+        token_data = _exchange_kakao_authorization_code(rest_api_key, redirect_uri, auth_code)
+        access_token = _apply_kakao_token_response(token_data)
+        if access_token:
+            logger.info("카카오 토큰 복구 완료 (.env / kakao_code.json 저장됨)")
+            return access_token
+        logger.error("카카오 토큰 응답에 access_token이 없습니다.")
+        return ""
+    except Exception as exc:
+        error_code, error_description = _extract_kakao_error(exc)
+        if error_code == "KOE205" or "KOE205" in error_description:
+            logger.error("카카오 인증 실패(KOE205): KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 다릅니다.")
+        elif error_code:
+            logger.error("카카오 인증 실패: %s (%s)", error_code, error_description or type(exc).__name__)
+        else:
+            logger.error("카카오 인증 실패: %s", type(exc).__name__)
+        return ""
 
 
 def _extract_kakao_error(exc: Exception) -> Tuple[str, str]:
@@ -785,6 +831,11 @@ def _extract_kakao_error(exc: Exception) -> Tuple[str, str]:
 
 
 def _manual_kakao_authorization_recovery(rest_api_key: str, reason: str) -> str:
+    global KAKAO_MANUAL_RECOVERY_ATTEMPTED
+    if KAKAO_MANUAL_RECOVERY_ATTEMPTED:
+        return ""
+    KAKAO_MANUAL_RECOVERY_ATTEMPTED = True
+
     if (
         _exchange_kakao_authorization_code is None
         or _apply_kakao_token_response is None
@@ -797,6 +848,17 @@ def _manual_kakao_authorization_recovery(rest_api_key: str, reason: str) -> str:
     redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else os.getenv("KAKAO_REDIRECT_URI", "")
     auth_url = _kakao_auth_url(rest_api_key)
 
+    env_code = _env_str("KAKAO_AUTH_CODE", "").strip()
+    if env_code:
+        logger.info("KAKAO_AUTH_CODE 환경변수로 카카오 토큰 교환 시도")
+        return _exchange_kakao_auth_code(rest_api_key, redirect_uri, env_code)
+
+    _log_kakao_manual_auth_link(reason)
+
+    if not _stdin_is_interactive():
+        logger.warning("비대화형 실행(systemd): input() 대기 없이 매매 루프를 계속합니다 (카카오 알림만 비활성).")
+        return ""
+
     print("\n" + "=" * 80)
     print("리프레시 토큰이 만료되었습니다. 아래 URL에서 새 인가 코드를 발급받아 입력해주세요.")
     print("=" * 80)
@@ -806,15 +868,15 @@ def _manual_kakao_authorization_recovery(rest_api_key: str, reason: str) -> str:
         print("KOE205 사전 점검: redirect_uri 형식과 로컬 설정 일치 여부 확인 완료")
     else:
         print("경고: KAKAO_REDIRECT_URI 설정을 먼저 확인하세요. 카카오 개발자 콘솔 등록값과 다르면 KOE205가 발생합니다.")
-    if auth_url:
-        print("\n인가 URL:")
-        print(auth_url)
-    else:
+    if not auth_url:
         print("\n인가 URL을 생성할 수 없습니다. KAKAO_REST_API_KEY 또는 KAKAO_REDIRECT_URI를 확인하세요.")
         print("=" * 80)
         return ""
+    print("\n인가 URL:")
+    print(auth_url)
     print("\n브라우저 인증 후 리다이렉트 URL의 code= 뒤 값을 붙여넣으세요.")
     print("입력하지 않고 Enter를 누르면 카카오 알림만 건너뛰고 매매 루프는 계속 진행됩니다.")
+    print("서버(systemd)에서는: py -3 scripts/auth_kakao.py --code \"<코드>\"")
 
     try:
         auth_code = input("인가 코드(code): ").strip()
@@ -826,24 +888,7 @@ def _manual_kakao_authorization_recovery(rest_api_key: str, reason: str) -> str:
         print("인가 코드가 입력되지 않았습니다. 카카오 알림 없이 루프를 계속합니다.")
         return ""
 
-    try:
-        token_data = _exchange_kakao_authorization_code(rest_api_key, redirect_uri, auth_code)
-        access_token = _apply_kakao_token_response(token_data)
-        if access_token:
-            print("카카오 토큰 수동 복구 완료: 새 토큰이 .env와 kakao_code.json에 저장되었습니다.")
-            logger.info("카카오 수동 인증 복구 완료")
-            return access_token
-        logger.error("카카오 토큰 응답에 access_token이 없습니다.")
-        return ""
-    except Exception as exc:
-        error_code, error_description = _extract_kakao_error(exc)
-        if error_code == "KOE205" or "KOE205" in error_description:
-            logger.error("카카오 수동 인증 실패(KOE205): KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 다릅니다.")
-        elif error_code:
-            logger.error("카카오 수동 인증 실패: %s (%s)", error_code, error_description or type(exc).__name__)
-        else:
-            logger.error("카카오 수동 인증 실패: %s", type(exc).__name__)
-        return ""
+    return _exchange_kakao_auth_code(rest_api_key, redirect_uri, auth_code)
 
 
 def _validate_kakao_access_token(access_token: str) -> bool:
@@ -911,7 +956,6 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
         if refreshed and _validate_kakao_access_token(refreshed):
             return refreshed
         if show_auth_link:
-            _log_kakao_manual_auth_link("리프레시 토큰이 만료되었거나 유효하지 않습니다.")
             recovered = _manual_kakao_authorization_recovery(rest_api_key, "리프레시 토큰이 만료되었거나 유효하지 않습니다.")
             if recovered and _validate_kakao_access_token(recovered):
                 return recovered
@@ -920,7 +964,6 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
         return ""
 
     if show_auth_link:
-        _log_kakao_manual_auth_link("사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
         recovered = _manual_kakao_authorization_recovery(rest_api_key, "사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
         if recovered and _validate_kakao_access_token(recovered):
             return recovered
