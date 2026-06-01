@@ -23,7 +23,6 @@ ROOT_DIR = BASE_DIR.parent
 LIVE_DIR = ROOT_DIR / "btc_live_trading"
 BACKTEST_DIR = ROOT_DIR / "btc_day_strategy"
 DATA_DIR = BASE_DIR / "data"
-DECISION_LOG_PATH = DATA_DIR / "ai_decisions.log"
 LEARNING_LOG_PATH = DATA_DIR / "ai_learning_logs.csv"
 TRADE_LOG_PATH = DATA_DIR / "virtual_trades.jsonl"
 
@@ -60,6 +59,7 @@ from reporting import (
     build_monthly_pnl_display,
     days_left_in_month_kst,
     load_trading_stats,
+    prune_stats_history,
     resolve_report_balances,
     save_trading_stats,
     summarize_ledger,
@@ -98,7 +98,10 @@ except Exception as exc:
 try:
     from btc_live_trading.kakao_notifier import KakaoNotifier
     from btc_live_trading.kakao_utils import (
+        LOCALHOST_REDIRECT_URI,
         apply_token_response as _apply_kakao_token_response,
+        capture_authorization_code_via_localhost as _capture_kakao_auth_localhost,
+        clear_kakao_auth_code as _clear_kakao_auth_code,
         exchange_authorization_code as _exchange_kakao_authorization_code,
         get_access_token,
         get_redirect_uri as _get_kakao_redirect_uri,
@@ -109,6 +112,8 @@ try:
 except Exception:
     KakaoNotifier = None
     _apply_kakao_token_response = None  # type: ignore
+    _capture_kakao_auth_localhost = None  # type: ignore
+    _clear_kakao_auth_code = None  # type: ignore
     _exchange_kakao_authorization_code = None  # type: ignore
     _get_kakao_redirect_uri = None  # type: ignore
     _get_kakao_refresh_token = None  # type: ignore
@@ -122,6 +127,9 @@ KST = timezone(timedelta(hours=9))
 ENV_LINE_MAP: Dict[str, int] = {}
 KAKAO_AUTH_LINK_LOGGED = False
 KAKAO_MANUAL_RECOVERY_ATTEMPTED = False
+KAKAO_AUTH_EXHAUSTED = False
+KAKAO_ENV_CODE_TRIED = False
+KAKAO_LOCAL_OAUTH_TRIED = False
 STARTUP_REPORT_SENT = False
 STARTUP_HEALTH_CHECK_DONE = False
 STARTUP_HEALTH_CHECK_OK = False
@@ -156,8 +164,7 @@ LEARNING_FIELDNAMES = [
 
 
 def _load_env() -> None:
-    explicit_env = Path(r"C:\Users\1226t\Desktop\Coin\btc_live_trading\.env")
-    target_env = explicit_env if explicit_env.exists() else (LIVE_DIR / ".env")
+    target_env = LIVE_DIR / ".env"
     if not target_env.exists():
         logger.error(".env not found at expected path: %s", target_env)
         return
@@ -255,7 +262,7 @@ def _load_env_file_safely(env_path: Path) -> None:
             if not key:
                 logger.error("Malformed .env line %d: empty key", i)
                 continue
-            os.environ.setdefault(key, value)
+            os.environ[key] = value
 
 
 def _diagnose_env_section_4(env_path: Path) -> None:
@@ -732,9 +739,14 @@ def _validate_kakao_redirect_uri_config() -> bool:
     if not env_redirect_uri:
         logger.error("KAKAO_REDIRECT_URI가 비어 있습니다. 카카오 개발자 콘솔 Redirect URI와 동일하게 설정하세요.")
         return False
-    if env_redirect_uri in {"https://example.com/oauth", "your_redirect_uri_here"}:
-        logger.error("KAKAO_REDIRECT_URI가 기본 예시값입니다. 카카오 개발자 콘솔에 등록된 실제 URI로 변경하세요.")
+    if env_redirect_uri in {"your_redirect_uri_here"}:
+        logger.error("KAKAO_REDIRECT_URI가 placeholder입니다. 카카오 개발자 콘솔 등록값으로 변경하세요.")
         return False
+    if env_redirect_uri in {"https://example.com/oauth", "http://127.0.0.1:8765/oauth"}:
+        logger.info(
+            "KAKAO_REDIRECT_URI=%s — 카카오 개발자 콘솔 Redirect URI와 동일한지 확인하세요.",
+            env_redirect_uri,
+        )
     if not env_redirect_uri.startswith(("http://", "https://")):
         logger.error("KAKAO_REDIRECT_URI 형식이 올바르지 않습니다: %s", env_redirect_uri)
         return False
@@ -762,7 +774,10 @@ def _log_kakao_manual_auth_link(reason: str) -> None:
         logger.error("1) 아래 URL을 브라우저에서 열고 카카오 로그인을 완료하세요.")
         logger.error("%s", auth_url)
         logger.error("2) 리다이렉트된 URL의 code= 뒤 값을 복사해 토큰 재발급 절차에 입력하세요.")
-        logger.error("3) KOE205가 발생하면 KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인하세요.")
+        logger.error("3) KOE205/KOE006: KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인하세요.")
+        redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else _env_str("KAKAO_REDIRECT_URI", "")
+        if redirect_uri:
+            logger.error("   등록해야 할 Redirect URI: %s", redirect_uri)
     else:
         logger.error("KAKAO_REST_API_KEY 또는 KAKAO_REDIRECT_URI가 없어 인가 URL을 만들 수 없습니다.")
     if not redirect_ok:
@@ -776,6 +791,58 @@ def _log_kakao_manual_auth_link(reason: str) -> None:
     logger.error("  sudo systemctl restart coinbot.service")
     logger.error("또는 .env에 KAKAO_AUTH_CODE=<인가코드> 를 1회 설정 후 restart (성공 시 자동 저장됨).")
     KAKAO_AUTH_LINK_LOGGED = True
+
+
+def _mark_kakao_auth_exhausted(reason: str) -> None:
+    """리프레시 만료 등 재인증 전까지 카카오 API 재시도·로그 스팸 방지."""
+    global KAKAO_AUTH_EXHAUSTED
+    if KAKAO_AUTH_EXHAUSTED:
+        return
+    KAKAO_AUTH_EXHAUSTED = True
+    _log_kakao_manual_auth_link(reason)
+
+
+def _clear_kakao_auth_exhausted() -> None:
+    global KAKAO_AUTH_EXHAUSTED, KAKAO_AUTH_LINK_LOGGED, KAKAO_MANUAL_RECOVERY_ATTEMPTED
+    global KAKAO_ENV_CODE_TRIED, KAKAO_LOCAL_OAUTH_TRIED
+    KAKAO_AUTH_EXHAUSTED = False
+    KAKAO_AUTH_LINK_LOGGED = False
+    KAKAO_MANUAL_RECOVERY_ATTEMPTED = False
+    KAKAO_ENV_CODE_TRIED = False
+    KAKAO_LOCAL_OAUTH_TRIED = False
+
+
+def _kakao_redirect_supports_localhost(redirect_uri: str) -> bool:
+    uri = (redirect_uri or "").strip().lower()
+    return "127.0.0.1" in uri or "localhost" in uri
+
+
+def _try_kakao_local_oauth_auto(rest_api_key: str) -> str:
+    """Windows 등 대화형 환경: localhost 콜백으로 브라우저 OAuth 자동 완료."""
+    global KAKAO_LOCAL_OAUTH_TRIED
+    if (
+        KAKAO_LOCAL_OAUTH_TRIED
+        or KAKAO_AUTH_EXHAUSTED
+        or _capture_kakao_auth_localhost is None
+        or not rest_api_key
+        or not _env_bool("AI_AUTO_KAKAO_OAUTH", True)
+    ):
+        return ""
+    if not _stdin_is_interactive():
+        return ""
+    redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else _env_str("KAKAO_REDIRECT_URI", "")
+    if not _kakao_redirect_supports_localhost(redirect_uri):
+        return ""
+    KAKAO_LOCAL_OAUTH_TRIED = True
+    logger.info("카카오 localhost OAuth 자동 인증 시도 (브라우저가 열립니다)...")
+    try:
+        code = _capture_kakao_auth_localhost(rest_api_key, redirect_uri=redirect_uri, open_browser=True)
+    except Exception as exc:
+        logger.error("카카오 자동 OAuth 실패: %s", exc)
+        return ""
+    if not code:
+        return ""
+    return _exchange_kakao_auth_code(rest_api_key, redirect_uri, code)
 
 
 def _stdin_is_interactive() -> bool:
@@ -801,6 +868,9 @@ def _exchange_kakao_auth_code(rest_api_key: str, redirect_uri: str, auth_code: s
         token_data = _exchange_kakao_authorization_code(rest_api_key, redirect_uri, auth_code)
         access_token = _apply_kakao_token_response(token_data)
         if access_token:
+            _clear_kakao_auth_exhausted()
+            if _clear_kakao_auth_code is not None:
+                _clear_kakao_auth_code()
             logger.info("카카오 토큰 복구 완료 (.env / kakao_code.json 저장됨)")
             return access_token
         logger.error("카카오 토큰 응답에 access_token이 없습니다.")
@@ -809,6 +879,20 @@ def _exchange_kakao_auth_code(rest_api_key: str, redirect_uri: str, auth_code: s
         error_code, error_description = _extract_kakao_error(exc)
         if error_code == "KOE205" or "KOE205" in error_description:
             logger.error("카카오 인증 실패(KOE205): KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 다릅니다.")
+        elif error_code == "invalid_grant" and "authorization code" in error_description.lower():
+            logger.error(
+                "카카오 인가 코드 만료/이미 사용됨 — 1회용 코드입니다. "
+                "py scripts/auth_kakao.py 로 새로 발급받으세요."
+            )
+            if _clear_kakao_auth_code is not None:
+                _clear_kakao_auth_code()
+        elif error_code == "KOE006" or "KOE006" in error_description:
+            redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri else _env_str("KAKAO_REDIRECT_URI", "")
+            logger.error(
+                "카카오 KOE006: Redirect URI 미등록. developers.kakao.com 콘솔 → coin 앱 → "
+                "앱 > 플랫폼 키 > REST API 키 > 리다이렉트 URI 에 아래 값을 추가하세요: %s",
+                redirect_uri or "(비어 있음)",
+            )
         elif error_code:
             logger.error("카카오 인증 실패: %s (%s)", error_code, error_description or type(exc).__name__)
         else:
@@ -850,8 +934,7 @@ def _manual_kakao_authorization_recovery(rest_api_key: str, reason: str) -> str:
 
     env_code = _env_str("KAKAO_AUTH_CODE", "").strip()
     if env_code:
-        logger.info("KAKAO_AUTH_CODE 환경변수로 카카오 토큰 교환 시도")
-        return _exchange_kakao_auth_code(rest_api_key, redirect_uri, env_code)
+        return _try_kakao_auth_code_from_env(rest_api_key)
 
     _log_kakao_manual_auth_link(reason)
 
@@ -891,8 +974,129 @@ def _manual_kakao_authorization_recovery(rest_api_key: str, reason: str) -> str:
     return _exchange_kakao_auth_code(rest_api_key, redirect_uri, auth_code)
 
 
+def _extract_kakao_code(raw: str) -> str:
+    """인가코드만 넣든, 전체 리다이렉트 URL을 넣든 code= 값만 추출."""
+    raw = (raw or "").strip().strip('"').strip("'")
+    if not raw:
+        return ""
+    if "code=" in raw:
+        from urllib.parse import urlparse, parse_qs
+
+        query = urlparse(raw).query or raw
+        parsed = parse_qs(query)
+        if parsed.get("code"):
+            return str(parsed["code"][0]).strip()
+        return raw.split("code=", 1)[1].split("&", 1)[0].strip()
+    return raw
+
+
+def _try_kakao_auth_code_from_env(rest_api_key: str) -> str:
+    global KAKAO_ENV_CODE_TRIED
+    if KAKAO_AUTH_EXHAUSTED:
+        return ""
+    code = _extract_kakao_code(_env_str("KAKAO_AUTH_CODE", ""))
+    if not code:
+        return ""
+    if KAKAO_ENV_CODE_TRIED:
+        return ""
+    KAKAO_ENV_CODE_TRIED = True
+    redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else os.getenv("KAKAO_REDIRECT_URI", "")
+    logger.info("KAKAO_AUTH_CODE 환경변수로 자동 토큰 교환 시도")
+    return _exchange_kakao_auth_code(rest_api_key, redirect_uri, code)
+
+
+def _kakao_alerts_enabled() -> bool:
+    """KAKAO_ALERTS_ENABLED=false 면 재인증 전까지 카카오 관련 호출·로그를 모두 끔."""
+    return _env_bool("KAKAO_ALERTS_ENABLED", True)
+
+
+def _interactive_kakao_browser_auth(rest_api_key: str) -> str:
+    """대화형 실행: 브라우저를 열고 사용자가 붙여넣은 code 또는 전체 URL로 토큰 발급."""
+    global KAKAO_LOCAL_OAUTH_TRIED
+    if (
+        not rest_api_key
+        or _exchange_kakao_authorization_code is None
+        or _apply_kakao_token_response is None
+    ):
+        return ""
+    if KAKAO_LOCAL_OAUTH_TRIED:
+        return ""
+    KAKAO_LOCAL_OAUTH_TRIED = True
+    redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else _env_str("KAKAO_REDIRECT_URI", "")
+    auth_url = _kakao_auth_url(rest_api_key)
+    if not auth_url:
+        return ""
+    print("\n" + "=" * 72)
+    print("[카카오 인증] 액세스 토큰 갱신이 필요합니다. 1회 로그인 후 매매가 계속됩니다.")
+    print("브라우저가 열립니다. 카카오 로그인 후 이동된 주소창의 전체 URL을 복사해 붙여넣으세요.")
+    print(auth_url)
+    print(f"(Redirect URI: {redirect_uri})")
+    print("그냥 Enter를 누르면 카카오 알림 없이 매매만 진행합니다.")
+    print("=" * 72)
+    try:
+        import webbrowser
+
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+    try:
+        raw = input("코드 또는 URL 붙여넣기: ")
+    except (EOFError, KeyboardInterrupt):
+        print("카카오 인증 입력 취소 — 알림 없이 매매를 계속합니다.")
+        return ""
+    code = _extract_kakao_code(raw)
+    if not code:
+        print("코드가 비어 있어 카카오 인증을 건너뜁니다.")
+        return ""
+    return _exchange_kakao_auth_code(rest_api_key, redirect_uri, code)
+
+
+def _bootstrap_kakao_tokens() -> None:
+    """기동 시 토큰 자동 확보: env코드 → 기존토큰검증 → 리프레시 → (대화형)브라우저 인증."""
+    if KakaoNotifier is None or _hydrate_kakao_tokens is None:
+        return
+    if not _kakao_alerts_enabled():
+        logger.info("카카오 알림 비활성화(KAKAO_ALERTS_ENABLED=false) — 토큰 갱신/알림을 건너뜁니다.")
+        return
+    if KAKAO_AUTH_EXHAUSTED:
+        return
+    _hydrate_kakao_tokens()
+    rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
+    if not rest_api_key:
+        return
+
+    if _try_kakao_auth_code_from_env(rest_api_key):
+        return
+
+    existing = get_access_token().strip() if get_access_token is not None else ""
+    if existing and _validate_kakao_access_token(existing):
+        logger.info("카카오 액세스 토큰 유효 — 재인증 불필요")
+        return
+
+    interactive = _stdin_is_interactive()
+
+    redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else _env_str("KAKAO_REDIRECT_URI", "")
+    if interactive and _kakao_redirect_supports_localhost(redirect_uri):
+        if _try_kakao_local_oauth_auto(rest_api_key):
+            return
+
+    refresh_token = _get_kakao_refresh_token().strip() if _get_kakao_refresh_token else ""
+    if refresh_token:
+        if _refresh_kakao_access_token(refresh_token, rest_api_key, mark_exhausted_on_expire=not interactive):
+            return
+
+    if interactive:
+        if _interactive_kakao_browser_auth(rest_api_key):
+            return
+
+    if not KAKAO_AUTH_EXHAUSTED:
+        _mark_kakao_auth_exhausted("리프레시 토큰이 만료되었거나 유효하지 않습니다.")
+
+
 def _validate_kakao_access_token(access_token: str) -> bool:
     if not access_token:
+        return False
+    if KAKAO_AUTH_EXHAUSTED:
         return False
     try:
         response = requests.get(
@@ -902,14 +1106,21 @@ def _validate_kakao_access_token(access_token: str) -> bool:
         )
         if response.status_code == 200:
             return True
-        logger.warning("카카오 액세스 토큰 유효성 확인 실패: HTTP %s", response.status_code)
+        if not KAKAO_AUTH_LINK_LOGGED:
+            logger.warning("카카오 액세스 토큰 유효성 확인 실패: HTTP %s", response.status_code)
         return False
     except requests.RequestException as exc:
-        logger.warning("카카오 액세스 토큰 유효성 확인 생략: %s", type(exc).__name__)
+        if not KAKAO_AUTH_LINK_LOGGED:
+            logger.warning("카카오 액세스 토큰 유효성 확인 생략: %s", type(exc).__name__)
         return bool(access_token)
 
 
-def _refresh_kakao_access_token(refresh_token: str, rest_api_key: str) -> str:
+def _refresh_kakao_access_token(
+    refresh_token: str,
+    rest_api_key: str,
+    *,
+    mark_exhausted_on_expire: bool = True,
+) -> str:
     if (
         _refresh_kakao_access_token_request is None
         or _apply_kakao_token_response is None
@@ -922,16 +1133,21 @@ def _refresh_kakao_access_token(refresh_token: str, rest_api_key: str) -> str:
         access_token = str(token_data.get("access_token") or "").strip()
         if access_token:
             _apply_kakao_token_response(token_data)
+            _clear_kakao_auth_exhausted()
             logger.info("카카오 액세스 토큰 자동 갱신 완료")
         return access_token
     except Exception as exc:
         error_code, error_description = _extract_kakao_error(exc)
-        if error_code == "expired_or_invalid_refresh_token":
-            logger.error("카카오 리프레시 토큰 만료/무효: 새 인가 코드 발급이 필요합니다.")
-        elif error_code:
-            logger.warning("카카오 리프레시 토큰 갱신 실패: %s (%s)", error_code, error_description or type(exc).__name__)
-        else:
-            logger.warning("카카오 리프레시 토큰 갱신 실패: %s", type(exc).__name__)
+        if error_code in {"expired_or_invalid_refresh_token", "invalid_grant"}:
+            if mark_exhausted_on_expire:
+                _mark_kakao_auth_exhausted("리프레시 토큰이 만료되었거나 유효하지 않습니다.")
+            else:
+                logger.info("카카오 리프레시 토큰 만료 — 브라우저 재인증을 진행합니다.")
+        elif not KAKAO_AUTH_LINK_LOGGED:
+            if error_code:
+                logger.warning("카카오 리프레시 토큰 갱신 실패: %s (%s)", error_code, error_description or type(exc).__name__)
+            else:
+                logger.warning("카카오 리프레시 토큰 갱신 실패: %s", type(exc).__name__)
         return ""
 
 
@@ -944,36 +1160,54 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
     ):
         return ""
 
+    if not _kakao_alerts_enabled():
+        return ""
+
+    if KAKAO_AUTH_EXHAUSTED:
+        return ""
+
     _hydrate_kakao_tokens()
     rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
-    access_token = get_access_token().strip()
-    if _validate_kakao_access_token(access_token):
-        return access_token
+
+    from_env = _try_kakao_auth_code_from_env(rest_api_key)
+    if from_env:
+        return from_env
 
     refresh_token = _get_kakao_refresh_token().strip()
     if refresh_token and rest_api_key:
         refreshed = _refresh_kakao_access_token(refresh_token, rest_api_key)
-        if refreshed and _validate_kakao_access_token(refreshed):
+        if refreshed:
             return refreshed
+        if KAKAO_AUTH_EXHAUSTED:
+            return ""
+
+    access_token = get_access_token().strip()
+    if access_token and _validate_kakao_access_token(access_token):
+        _clear_kakao_auth_exhausted()
+        return access_token
+
+    if refresh_token and rest_api_key:
         if show_auth_link:
             recovered = _manual_kakao_authorization_recovery(rest_api_key, "리프레시 토큰이 만료되었거나 유효하지 않습니다.")
-            if recovered and _validate_kakao_access_token(recovered):
-                return recovered
             if recovered:
                 return recovered
+        if not KAKAO_AUTH_EXHAUSTED:
+            _mark_kakao_auth_exhausted("리프레시 토큰이 만료되었거나 유효하지 않습니다.")
         return ""
 
     if show_auth_link:
         recovered = _manual_kakao_authorization_recovery(rest_api_key, "사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
-        if recovered and _validate_kakao_access_token(recovered):
-            return recovered
         if recovered:
             return recovered
+    if not KAKAO_AUTH_EXHAUSTED:
+        _mark_kakao_auth_exhausted("사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
     return ""
 
 
 def _notify_kakao(title: str, body: str) -> None:
     if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
+        return
+    if not _kakao_alerts_enabled():
         return
     access = _ensure_kakao_access_token(show_auth_link=True)
     rest = os.getenv("KAKAO_REST_API_KEY", "").strip()
@@ -1106,80 +1340,30 @@ def _format_cycle_dashboard(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _normalize_ai_log_file(log_path: Path, header: str) -> None:
-    if not log_path.exists():
-        return
-    try:
-        with open(log_path, "r", encoding="utf-8") as f:
-            lines = [ln.rstrip("\n") for ln in f if ln.strip()]
-    except Exception:
-        return
-    if not lines:
-        return
-    structured = [ln for ln in lines if "|" in ln and not ln.startswith("[")]
-    legacy = [ln for ln in lines if ln not in structured and ln != header]
-    structured_data = [ln for ln in structured if ln != header]
-    normalized = [header] + legacy + structured_data
-    if lines == normalized:
-        return
-    with open(log_path, "w", encoding="utf-8") as f:
-        for ln in normalized:
-            f.write(ln + "\n")
-
-
-def _append_structured_ai_log(
+def _record_daily_decision_stats(
+    stats: Dict[str, Any],
     *,
-    phase: str,
-    timestamp: datetime,
-    snapshot: Dict[str, float],
     decision: str,
-    confidence: float,
     risk_allowed: bool,
-    reason: str,
+    now_kst: datetime,
 ) -> None:
-    DECISION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    header = "ts_kst|phase|decision|confidence|rsi|bb_position|ema_bull|risk_allowed|entry_attempt|reason"
-    _normalize_ai_log_file(DECISION_LOG_PATH, header)
-    ema_bull = float(snapshot.get("ema20", 0.0)) > float(snapshot.get("ema60", 0.0))
-    entry_attempt = decision in {"BUY", "SELL"} and risk_allowed
-    clean_reason = str(reason).replace("\n", " ").replace("|", "/").strip()
-    row = (
-        f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')}|{phase}|{decision}|{confidence:.2f}|"
-        f"{float(snapshot.get('rsi', 0.0)):.2f}|{float(snapshot.get('bb_position', 0.0)):.3f}|"
-        f"{'Y' if ema_bull else 'N'}|{'Y' if risk_allowed else 'N'}|"
-        f"{'Y' if entry_attempt else 'N'}|{clean_reason}"
-    )
-    need_header = (not DECISION_LOG_PATH.exists()) or (DECISION_LOG_PATH.stat().st_size == 0)
-    with open(DECISION_LOG_PATH, "a", encoding="utf-8") as f:
-        if need_header:
-            f.write(header + "\n")
-        f.write(row + "\n")
+    today = now_kst.strftime("%Y-%m-%d")
+    if str(stats.get("daily_decision_date", "")) != today:
+        stats["daily_decision_date"] = today
+        stats["daily_decision_count"] = 0
+        stats["daily_entry_count"] = 0
+    stats["daily_decision_count"] = _safe_int(stats.get("daily_decision_count", 0)) + 1
+    if str(decision).upper() in {"BUY", "SELL"} and risk_allowed:
+        stats["daily_entry_count"] = _safe_int(stats.get("daily_entry_count", 0)) + 1
 
 
-def _today_decision_counters() -> Tuple[int, int]:
-    if not DECISION_LOG_PATH.exists():
-        return 0, 0
+def _today_decision_counters(stats: Dict[str, Any] | None = None) -> Tuple[int, int]:
     today = datetime.now(KST).strftime("%Y-%m-%d")
-    total = 0
-    attempts = 0
-    try:
-        with open(DECISION_LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("ts_kst|"):
-                    continue
-                parts = line.split("|", 9)
-                if len(parts) < 9:
-                    continue
-                ts, phase, _, _, _, _, _, _, entry_attempt = parts[:9]
-                if not ts.startswith(today) or phase != "FINAL":
-                    continue
-                total += 1
-                if entry_attempt == "Y":
-                    attempts += 1
-    except Exception:
+    if stats is None:
+        stats = load_trading_stats()
+    if str(stats.get("daily_decision_date", "")) != today:
         return 0, 0
-    return total, attempts
+    return _safe_int(stats.get("daily_decision_count", 0)), _safe_int(stats.get("daily_entry_count", 0))
 
 
 def _data_path(name: str) -> Path:
@@ -1262,7 +1446,14 @@ def _load_learning_rows() -> List[Dict[str, str]]:
 
 
 def _combined_learning_text(row: Dict[str, str]) -> str:
-    return f"{row.get('market_signature', '')} || {row.get('failure_reason', '')}".strip()
+    """교훈 내용 중심 비교 텍스트. 시그니처가 달라도 같은 일반론이면 중복으로 간주."""
+    return " || ".join(
+        s for s in (
+            str(row.get("failure_reason", "")).strip(),
+            str(row.get("reflection_summary", "")).strip(),
+            str(row.get("warning", "")).strip(),
+        ) if s
+    ).strip()
 
 
 def _dedupe_learning_entry(entry: Dict[str, str]) -> Tuple[bool, float]:
@@ -1290,10 +1481,49 @@ def _append_learning_entry(entry: Dict[str, str]) -> Tuple[bool, float]:
     return True, best_ratio
 
 
+def _trade_log_max_lines() -> int:
+    raw = _sanitize_env_value("AI_TRADE_LOG_MAX_LINES", os.getenv("AI_TRADE_LOG_MAX_LINES", "2000"))
+    try:
+        return max(100, int(float(raw)))
+    except ValueError:
+        return 2000
+
+
+def _prune_trade_log(max_lines: int | None = None) -> int:
+    """virtual_trades.jsonl 꼬리만 유지(오래된 라인 삭제). 반환: 삭제한 라인 수."""
+    if not TRADE_LOG_PATH.exists():
+        return 0
+    cap = max_lines if max_lines is not None else _trade_log_max_lines()
+    try:
+        with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return 0
+    if len(lines) <= cap:
+        return 0
+    keep = lines[-cap:]
+    try:
+        with open(TRADE_LOG_PATH, "w", encoding="utf-8") as f:
+            f.writelines(keep)
+    except OSError:
+        return 0
+    return len(lines) - len(keep)
+
+
 def _append_trade_event(event: Dict[str, Any]) -> None:
     TRADE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(TRADE_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    # 무한 증가 방지: 상한의 1.1배 초과 시에만 트림(매 append 전체 재작성 부담 완화)
+    cap = _trade_log_max_lines()
+    try:
+        if TRADE_LOG_PATH.stat().st_size > 0:
+            with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+                line_count = sum(1 for _ in f)
+            if line_count > int(cap * 1.1):
+                _prune_trade_log(cap)
+    except OSError:
+        pass
 
 
 def _find_closest_failure_memory(snapshot: Dict[str, Any]) -> Tuple[str, str, float]:
@@ -1339,13 +1569,21 @@ def _top_recent_loss_reflections(limit: int) -> str:
         dated.append((dt, row))
     dated.sort(key=lambda x: x[0], reverse=True)
     lines: List[str] = []
+    seen_refs: List[str] = []
     for dt, row in dated:
         ref = str(row.get("reflection_summary", "")).strip()
         if not ref:
             continue
+        if any(SequenceMatcher(None, ref, prev).ratio() >= 0.7 for prev in seen_refs):
+            continue
+        seen_refs.append(ref)
         tid = str(row.get("trade_id", "")).strip()
+        warn = str(row.get("warning", "")).strip()
         label = f"{tid} " if tid else ""
-        lines.append(f"- [{dt.isoformat()}] {label}{ref}")
+        line = f"- [{dt.isoformat()}] {label}{ref}"
+        if warn:
+            line += f" → 규칙: {warn}"
+        lines.append(line)
         if len(lines) >= limit:
             break
     return "\n".join(lines)
@@ -1766,7 +2004,7 @@ def _build_kakao_message(
     )
     pnl_display = build_monthly_pnl_display(stats, balance_krw=rb_krw)
     sign = "+" if rb_pct >= 0 else ""
-    total_count, attempt_count = _today_decision_counters()
+    total_count, attempt_count = _today_decision_counters(stats)
     market = report.get("market", {})
     close_event = close_info.get("close_event", {}) if close_info else {}
     bracket = _report_bracket_title(dry_run)
@@ -2123,15 +2361,6 @@ def _run_weekend_monitor_cycle(
         "estimated_tokens_saved": _safe_int(stats.get("estimated_tokens_saved", 0)),
         "weekend_mode": True,
     }
-    _append_structured_ai_log(
-        phase="FINAL",
-        timestamp=now_kst,
-        snapshot=snapshot,
-        decision=report["decision"],
-        confidence=float(report["confidence"]),
-        risk_allowed=True,
-        reason=report["reason"],
-    )
     if close_info:
         _notify_kakao(
             f"📊 {_report_bracket_title(dry_run)} 주말 청산",
@@ -2154,6 +2383,7 @@ def run_cycle() -> Dict[str, Any]:
 
 def _run_cycle_impl() -> Dict[str, Any]:
     _load_env()
+    _bootstrap_kakao_tokens()
     if _hydrate_kakao_tokens is not None:
         _hydrate_kakao_tokens()
     _check_project_connectivity()
@@ -2275,24 +2505,6 @@ def _run_cycle_impl() -> Dict[str, Any]:
     raw_ai_decision = _apply_failure_similarity_guard(raw_ai_decision, memory_similarity, snapshot)
     raw_ai_decision = _apply_atr_entry_filter(raw_ai_decision, snapshot)
     raw_ai_decision = _apply_volume_entry_filter(raw_ai_decision, snapshot)
-    _append_structured_ai_log(
-        phase="RAW",
-        timestamp=now_kst,
-        snapshot=snapshot,
-        decision=model_ai_decision["decision"],
-        confidence=float(model_ai_decision["confidence"]),
-        risk_allowed=True,
-        reason=model_ai_decision["reason"],
-    )
-    _append_structured_ai_log(
-        phase="ADJUSTED",
-        timestamp=now_kst,
-        snapshot=snapshot,
-        decision=raw_ai_decision["decision"],
-        confidence=float(raw_ai_decision["confidence"]),
-        risk_allowed=True,
-        reason=raw_ai_decision["reason"],
-    )
 
     live_wallet_usdt: float | None = None
     if not dry_run:
@@ -2422,14 +2634,11 @@ def _run_cycle_impl() -> Dict[str, Any]:
             "monthly_realized_raw_krw": pnl_display.monthly_realized_raw_krw,
         },
     }
-    _append_structured_ai_log(
-        phase="FINAL",
-        timestamp=now_kst,
-        snapshot=snapshot,
-        decision=report["decision"],
-        confidence=float(report["confidence"]),
+    _record_daily_decision_stats(
+        stats,
+        decision=str(report["decision"]),
         risk_allowed=bool(report["risk_allowed"]),
-        reason=report["reason"],
+        now_kst=now_kst,
     )
 
     send_report = bool(opened_position or close_info or _should_send_periodic_report(stats, now_kst, status_report_minutes))
@@ -2460,6 +2669,9 @@ def run_once() -> Dict[str, Any]:
 def run_forever() -> None:
     _load_env()
     install_shutdown_handlers()
+    prune_stats_history()
+    _prune_trade_log()
+    _bootstrap_kakao_tokens()
     loop_seconds = max(30, _env_int("AI_LOOP_SECONDS", 300))
     _send_startup_report()
     while True:
@@ -2486,6 +2698,9 @@ def run_forever() -> None:
 if __name__ == "__main__":
     _load_env()
     install_shutdown_handlers()
+    prune_stats_history()
+    _prune_trade_log()
+    _bootstrap_kakao_tokens()
     _check_project_connectivity()
     _send_startup_report()
     if _env_bool("AI_RUN_ONCE", False):

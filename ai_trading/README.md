@@ -13,10 +13,10 @@
 | `ai_trading/ai_logic/decision_engine.py` | OpenAI 호출 |
 | `ai_trading/data/` | 통계·`virtual_trades.jsonl`·`ai_learning_logs.csv`·로그 |
 | `btc_live_trading/.env` | API 키·카카오·운영 변수(공유) |
-| `btc_live_trading/fx_rates.py` | USDT/KRW (CoinGecko), `config_scalping` 등에서 사용 |
-| `btc_day_strategy/` | 백테스트 요약 로드용 |
+| `btc_live_trading/fx_rates.py` | USDT/KRW (CoinGecko) |
+| `btc_day_strategy/` | 백테스트·전략 라이브러리 (시작 시 연결 점검) |
 
-**통합 정리**: `main_ai` 안에 있던 Binance 잔고 조회(직접 `Client` 생성)를 제거하고, **`binance_futures_tools.fetch_futures_usdt_balance_from_env`** 한 경로로 맞췄습니다. `btc_live_trading/order_executor.py` 등 **다른 진입점(main_live·스캘핑)** 전용 코드는 그대로 두었습니다(삭제 시 해당 실행 경로가 깨짐).
+**통합 정리**: `main_ai` 안에 있던 Binance 잔고 조회(직접 `Client` 생성)를 제거하고, **`binance_futures_tools.fetch_futures_usdt_balance_from_env`** 한 경로로 맞췄습니다. 레거시 단타·`main_live` 실전 엔진(`order_executor.py`, `live_trading_engine.py`, `scalping_engine.py` 등)은 더 이상 쓰이지 않아 **제거**했습니다.
 
 상위 폴더 개요는 저장소 루트 **`README.md`** 를 참고하세요.
 
@@ -251,8 +251,7 @@ py -3 scripts\emergency_exit.py
 - `ai_trading\data\trading_stats.json`: 원장(가상 잔고·실현 손익 집계 등), 월간 집계, 오픈 포지션 상태. 실전 리포트 표시 잔고는 Binance API가 우선입니다.
 - `ai_trading\data\virtual_trades.jsonl`: 진입/청산 이벤트(가상·실전 공통 로그 형식)
 - `ai_trading\data\ai_learning_logs.csv`: 손실 거래 사후분석과 재발 방지 메모
-- `ai_trading\data\ai_decisions.log`: AI 원판단과 최종 판단 감사 로그
-- `ai_trading\data\history\trading_stats_month_{YYYY-MM}_archived_{YYYYMMDD_HHMMSS}_kst.json`: 매월 1일 09:00(KST) 이후 첫 로드 시 이전 달 원장을 여기에 한 번 백업합니다. 이름의 월은 **막 끝난 집계 구간(아카이브 대상)** 이고, 뒤의 시각은 **저장한 순간(KST)** 입니다(실행할 때마다 생기는 파일이 아닙니다).
+- `ai_trading\data\history\trading_stats_month_{YYYY-MM}_archived.json`: 매월 1일 09:00(KST) 이후 첫 로드 시 이전 달 원장 백업(월당 파일 1개, 덮어쓰기). `AI_STATS_HISTORY_MAX_FILES`(기본 6) 초과 시 오래된 파일 자동 삭제.
 
 운영 중 카카오 알림이 실패해도 위 로컬 데이터 파일은 계속 저장됩니다.
 
@@ -264,7 +263,8 @@ py -3 scripts\emergency_exit.py
 |------|------|
 | Binance 잔고 API | `main_ai`의 직접 `Client` 생성 제거 → `binance_futures_tools.fetch_futures_usdt_balance_from_env` 단일화 (`futures_wallet_usdt_balance`) |
 | 학습 로그 | `_load_learning_rows` mtime 캐시 + 꼬리 행 제한 + append 후 캐시 무효화 |
-| 삭제된 `.py` 파일 | 없음 (`btc_live_trading/main_live.py`·스캘핑 등 별도 진입점 유지) |
+| 거래 로그 회전 | `virtual_trades.jsonl`은 `AI_TRADE_LOG_MAX_LINES`(기본 2000) 초과 시 오래된 라인 자동 삭제 |
+| 레거시 제거 | `btc_live_trading`의 `main_live`·스캘핑·`order_executor` 등 미사용 실전 엔진 일체 삭제, `ai_decisions.log`·`live_trading.log` 제거 |
 | 문서 | 저장소 루트 `README.md` 추가, 본 파일에 구조·실전 기준 정리 |
 
 **실전 주문 경로**: `AI_DRY_RUN=false`일 때 진입 `futures_market_open_position`, 청산·종료 `market_close_symbol` / `close_all_usdm_positions`, 잔고 `fetch_futures_usdt_balance_from_env`. 가상 원장(`virtual_balance_*`)은 통계·손익 추적용으로 갱신되며, **체결은 위 API만 사용**합니다.

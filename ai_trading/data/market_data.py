@@ -101,6 +101,9 @@ def _compute_volume_metrics(volumes: List[float]) -> Dict[str, float | bool]:
         "volume_ratio_pct": ratio * 100.0,
         "volume_surge": ratio >= min_ratio,
     }
+
+
+def _rsi(closes: List[float], period: int = 14) -> float:
     if len(closes) < period + 1:
         return 50.0
     gains = []

@@ -7,11 +7,11 @@
 | 경로 | 역할 |
 |------|------|
 | **`ai_trading/`** | 메인 루프, 리포트, 선물 주문·청산(`binance_futures_tools.py`), 학습 로그, `README.md` 상세 가이드 |
-| **`btc_live_trading/`** | 공용 `.env`, 카카오·환율(`fx_rates.py`), 스캘핑/`main_live.py` 등 **별도 진입점**(선택) |
-| **`btc_day_strategy/`** | 백테스트·전략 라이브러리 (`main_ai` 백테스트 요약 로드) |
-| **`scripts/`** | `emergency_exit.py` 등 비상 스크립트 |
+| **`btc_live_trading/`** | 공용 `.env`, 카카오 토큰(`kakao_utils.py`/`kakao_notifier.py`), 환율(`fx_rates.py`), 공용 전략 모듈(`strategy/`) |
+| **`btc_day_strategy/`** | 백테스트·전략 라이브러리 (`main_ai` 시작 시 연결 점검) |
+| **`scripts/`** | `auth_kakao.py`(카카오 토큰 발급), `reset_live_ledger.py`(원장 리셋), `emergency_exit.py`(비상 청산) |
 
-레거시 단타 엔진(`scalping_engine.py`, `main_live.py`)은 과거 용도로 남아 있으며, **실전 단일 매매**는 `AI_DRY_RUN=false`로 `py ai_trading\main_ai.py`만 쓰면 됩니다.
+**실전 매매**는 `AI_DRY_RUN=false`로 `py ai_trading\main_ai.py` 하나만 실행하면 됩니다. (레거시 단타·`main_live` 엔진은 제거됨)
 
 자세한 환경변수·데이터 파일·리스크 관리는 **`ai_trading/README.md`** 를 참고하세요.
 

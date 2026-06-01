@@ -256,17 +256,27 @@ def analyze_trade_failure(
     price_move_pct = float(trade_context.get("price_move_pct", 0.0))
     side = str(trade_context.get("side", "HOLD")).upper()
     system_prompt = (
-        "You are a trading post-mortem analyst. "
+        "You are a quantitative trading post-mortem analyst. "
         "Return strict JSON only with keys: market_context, failure_reason, reflection_summary, warning. "
-        "All values must be written in Korean."
+        "All values MUST be written in Korean.\n"
+        "STRICT RULES (the output is stored as machine-learning training data, so it must be SPECIFIC and DISTINCT):\n"
+        "1) Cite concrete numbers from the snapshots in EVERY field: RSI value, EMA gap %, BB position, ATR %, "
+        "the actual price move %, and the trade side.\n"
+        "2) NEVER use generic filler such as '단일 지표에 의존', '종합적으로 고려', '다양한 지표를 고려' unless you "
+        "attach a concrete numeric threshold that made this specific trade fail.\n"
+        "3) 'warning' MUST be one actionable IF-THEN rule with numbers, e.g. "
+        "'RSI<=35 과매도라도 EMA갭이 -0.4% 이하 하락추세면 매수 금지'.\n"
+        "4) Diagnose the SPECIFIC mistake of THIS trade (entry timing, wrong side vs trend, low volatility/ATR, "
+        "chasing an extended move), not a generic lecture.\n"
+        "5) Keep each field under 200 Korean characters, one or two sentences."
     )
     user_prompt = (
-        "Analyze why this virtual scalp trade failed or underperformed.\n\n"
+        "Analyze why this scalp/trend trade failed or underperformed. Be specific and quantitative.\n\n"
         f"Trade context:\n{json.dumps(trade_context, ensure_ascii=False)}\n\n"
         f"Entry snapshot:\n{json.dumps(entry_snapshot, ensure_ascii=False)}\n\n"
         f"Exit snapshot:\n{json.dumps(exit_snapshot, ensure_ascii=False)}\n\n"
-        "Focus on market structure, volatility, trend mismatch, and overfitting to a single indicator. "
-        "Write concise Korean sentences for a KakaoTalk report."
+        "Compare entry vs exit values (RSI, EMA gap, BB, ATR, price) to pinpoint what actually went wrong. "
+        "Produce a distinct, number-grounded lesson that would help avoid this exact setup next time."
     )
     try:
         data = _call_openai_json(
@@ -284,13 +294,24 @@ def analyze_trade_failure(
     except Exception as e:
         logger.warning("Failure reflection fallback used: %s", type(e).__name__)
         direction_text = "상승" if price_move_pct > 0 else "하락" if price_move_pct < 0 else "횡보"
+        e_rsi = float(entry_snapshot.get("rsi", 0.0))
+        e_bb = float(entry_snapshot.get("bb_position", 0.0))
+        e_ema_gap = float(entry_snapshot.get("ema_gap_pct", 0.0))
+        e_atr = float(entry_snapshot.get("atr_pct", 0.0))
+        x_rsi = float(exit_snapshot.get("rsi", e_rsi))
         return {
             "market_context": (
-                f"{side} 판단 후 15분 동안 가격이 {price_move_pct:.2f}% {direction_text}했고 "
-                f"RSI={float(entry_snapshot.get('rsi', 0.0)):.1f}, "
-                f"BB={float(entry_snapshot.get('bb_position', 0.0)):.2f}"
+                f"{side} 진입 후 15분간 가격 {price_move_pct:+.2f}% {direction_text}, "
+                f"RSI {e_rsi:.0f}→{x_rsi:.0f}, EMA갭 {e_ema_gap:+.2f}%, BB {e_bb:.2f}, ATR {e_atr:.2f}%"
             ),
-            "failure_reason": fallback_reason,
-            "reflection_summary": fallback_summary,
-            "warning": "단일 지표보다 추세 방향과 변동성 확장 여부를 함께 확인할 것",
+            "failure_reason": (
+                f"{side} 방향이 EMA갭 {e_ema_gap:+.2f}% 추세와 어긋났고 ATR {e_atr:.2f}%로 변동성이 낮아 "
+                f"기대한 {direction_text} 모멘텀이 나오지 않음"
+            ),
+            "reflection_summary": (
+                f"ATR {e_atr:.2f}% 저변동·EMA갭 {e_ema_gap:+.2f}% 구간에서 {side} 진입은 손실 위험이 큼"
+            ),
+            "warning": (
+                f"RSI {e_rsi:.0f} 수준이라도 EMA갭이 {e_ema_gap:+.2f}%로 추세와 반대면 {side} 진입 금지"
+            ),
         }

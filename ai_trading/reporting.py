@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -130,16 +131,38 @@ def _backup_stats(
     backup_period: str,
     archived_at_kst: datetime | None = None,
 ) -> None:
-    """월말 리셋 직전 스냅샷. 파일명은 `backup_period`(종료되는 월) + 실제 저장 시각(KST)로 구분한다."""
+    """월말 리셋 직전 스냅샷. 동일 월(backup_period)은 파일 1개만 유지(덮어쓰기)."""
     history_dir = _history_dir()
     history_dir.mkdir(parents=True, exist_ok=True)
     at = archived_at_kst or datetime.now(KST)
-    ts = at.strftime("%Y%m%d_%H%M%S")
-    backup_path = history_dir / f"trading_stats_month_{backup_period}_archived_{ts}_kst.json"
+    backup_path = history_dir / f"trading_stats_month_{backup_period}_archived.json"
     payload = dict(stats)
     payload["backed_up_at_kst"] = at.isoformat()
     with open(backup_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+    prune_stats_history()
+
+
+def prune_stats_history(max_files: int | None = None) -> int:
+    """history/*.json 상한 초과분 삭제. 반환: 삭제한 파일 수."""
+    if max_files is None:
+        raw = os.environ.get("AI_STATS_HISTORY_MAX_FILES", "6").strip()
+        try:
+            max_files = max(1, int(float(raw)))
+        except ValueError:
+            max_files = 6
+    history_dir = _history_dir()
+    if not history_dir.exists():
+        return 0
+    files = sorted(history_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    removed = 0
+    for old in files[max_files:]:
+        try:
+            old.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _normalize_stats(
@@ -195,7 +218,7 @@ def _normalize_stats(
     return stats
 
 
-def _maybe_monthly_reset(stats: Dict[str, Any], now_kst: datetime) -> Dict[str, Any]:
+def _maybe_monthly_reset(stats: Dict[str, Any], now_kst: datetime) -> Tuple[Dict[str, Any], bool]:
     current_period = _current_period(now_kst)
     stored_period = str(stats.get("period", current_period))
     cutoff = _monthly_reset_cutoff(now_kst)
@@ -212,9 +235,10 @@ def _maybe_monthly_reset(stats: Dict[str, Any], now_kst: datetime) -> Dict[str, 
         stats["ai_calls_saved_by_gate"] = 0
         stats["estimated_tokens_saved"] = 0
         stats["last_reset_at_kst"] = now_kst.isoformat()
-    elif "period" not in stats:
+        return stats, True
+    if "period" not in stats:
         stats["period"] = current_period
-    return stats
+    return stats, False
 
 
 def load_trading_stats(
@@ -246,7 +270,10 @@ def load_trading_stats(
             initial_balance_usdt=initial_balance_usdt,
             now_kst=now_kst,
         )
-        return _maybe_monthly_reset(normalized, now_kst)
+        stats, did_reset = _maybe_monthly_reset(normalized, now_kst)
+        if did_reset:
+            save_trading_stats(stats, p)
+        return stats
     except Exception:
         return default_trading_stats(
             initial_balance_krw=initial_balance_krw,

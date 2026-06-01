@@ -85,9 +85,8 @@ def _open_exchange_positions() -> list[str]:
 
 def _backup_stats(stats: dict, *, archived_at: datetime) -> Path:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    ts = archived_at.strftime("%Y%m%d_%H%M%S")
     period = str(stats.get("period", archived_at.strftime("%Y-%m")))
-    path = HISTORY_DIR / f"trading_stats_pre_live_reset_{period}_{ts}_kst.json"
+    path = HISTORY_DIR / f"trading_stats_pre_live_reset_{period}.json"
     payload = dict(stats)
     payload["backed_up_at_kst"] = archived_at.isoformat()
     payload["backup_reason"] = "reset_live_ledger"

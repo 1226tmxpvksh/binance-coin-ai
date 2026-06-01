@@ -65,11 +65,8 @@ btc_day_strategy/              # 백테스트 전용 (이 폴더)
 ├── README.md                  # 이 문서
 └── README_COMPARISON.md       # 비교 상세 가이드
 
-../btc_live_trading/           # 실전 매매 전용 폴더
-├── config_live.py             # 실전 설정
-├── main_live.py               # 실전 실행
-├── live_trading_engine.py     # 실시간 엔진
-└── ...                        # 실전 전용 모듈들
+../ai_trading/                 # 실전 AI 매매 엔진 (main_ai.py)
+../btc_live_trading/           # 공용 .env·카카오·환율·전략 모듈
 ```
 
 ## 🚀 빠른 시작
@@ -222,13 +219,12 @@ MIN_POSITION_SIZE_USDT = 20  # 바이낸스 최소
 ## 📚 관련 문서
 
 - `README_COMPARISON.md` - 전략 비교 상세 가이드
-- `../MIGRATION_GUIDE.md` - 백테스트 → 실전 전환 가이드
-- `../btc_live_trading/README.md` - 실전 매매 가이드
+- `../ai_trading/README.md` - 실전 AI 매매 가이드
 
 ## ❓ 자주 묻는 질문
 
 ### Q1: 실전 매매는 어디서 하나요?
-→ `btc_live_trading` 폴더에서 `python main_live.py` 실행
+→ 저장소 루트에서 `py ai_trading\main_ai.py` 실행 (`ai_trading/README.md` 참고)
 
 ### Q2: 실전 설정으로 백테스트하려면?
 → `python compare_strategies.py` 실행
