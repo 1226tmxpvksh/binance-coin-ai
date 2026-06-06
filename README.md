@@ -19,6 +19,45 @@
 
 `main_ai.py` 실행 시 매 루프마다 콘솔에 **구조화된 대시보드**가 출력됩니다(AI 판단, 시장 지표, 잔고, 보유 포지션). 예시와 상세 설명은 [`ai_trading/README.md`](ai_trading/README.md)의 **운영 및 모니터링** 섹션을 참고하세요.
 
+## 카카오톡 토큰 관리 및 트러블슈팅
+
+카카오 액세스 토큰은 발급 후 약 **6시간**이면 만료되므로, 봇은 `refresh_token`으로 자동 갱신합니다. 갱신 로직과 저장소는 모두 `btc_live_trading/` 안에 있습니다.
+
+### 자동 갱신 동작 방식
+
+- **토큰 저장 위치**: `btc_live_trading/kakao_code.json`(access/refresh) + `btc_live_trading/.env`. 두 곳이 항상 동기화됩니다.
+- **절대경로 처리**: `kakao_utils.py`가 실행 위치(CWD)와 무관하게 모듈 기준 절대경로(`os.path.abspath`)로 파일을 읽고 씁니다. systemd `WorkingDirectory`가 달라도 다른 파일을 건드리지 않습니다.
+- **원자적 저장**: 토큰 파일은 임시 파일에 먼저 쓴 뒤 `os.replace`로 교체합니다. 저장 중 프로세스가 죽거나 재시작돼도 `kakao_code.json`이 깨지지 않습니다. (이전에는 쓰기 도중 중단 시 파일이 손상돼 다음 갱신이 영구 실패했음)
+- **refresh_token 회전 저장**: 카카오가 갱신 응답에 새 `refresh_token`을 함께 주면(만료 임박 시) 반드시 `.env`와 `kakao_code.json` 양쪽에 덮어써 저장합니다. 누락 시 다음 갱신이 무조건 실패하므로 회전 발급 여부를 로그로 남깁니다.
+- **봇 방어막**: 카카오 **발송 실패**(토큰은 유효하나 일시적 네트워크/타임아웃 등)는 `logger.error`로만 남기고 매매 루프는 멈추지 않습니다.
+- **인증 실패 시 매매 차단**: 반대로 유효한 카카오 **액세스 토큰 자체를 확보하지 못하면**(인증 실패/만료) 해당 사이클의 **매매 로직을 실행하지 않습니다**. 알림 없이 깜깜이 매매가 되는 것을 막기 위한 안전장치입니다. 재인증 후 서비스를 재시작하면 자동으로 매매가 재개됩니다. (`_kakao_auth_ready()`) 알림을 의도적으로 끄려면 `KAKAO_ALERTS_ENABLED=false`로 두면 이 차단도 우회되어 매매만 진행됩니다.
+
+### 토큰 갱신 로그 확인 (Vultr / systemd)
+
+```bash
+# 실시간 카카오 토큰/알림 관련 로그만 필터링
+journalctl -u coinbot.service -f | grep -iE "kakao|토큰|refresh|갱신"
+```
+
+정상 동작 시 6시간 주기로 아래와 같은 로그가 보입니다.
+
+- `카카오 액세스 토큰 자동 갱신 완료`
+- `kakao_code.json 갱신 완료: /.../kakao_code.json`
+- (회전 발급 시) `카카오 refresh_token이 회전 발급되어 새 값을 저장합니다.`
+
+### 알림이 끊겼을 때 (수동 재발급)
+
+`refresh_token`까지 만료되면(약 2개월 미사용) 새 인가 코드가 필요합니다.
+
+1. 수동 갱신 스크립트: **`scripts/auth_kakao.py`**
+   ```bash
+   py scripts\auth_kakao.py          # 브라우저 URL 안내 → code 입력
+   py scripts\auth_kakao.py --auto   # 로컬 콜백(127.0.0.1:8765)으로 자동 수신
+   ```
+2. **경로 주의점**: 스크립트는 `btc_live_trading/kakao_code.json` / `.env`에 저장합니다. 서버에서 발급했다면 그 파일을 그대로 두고, 로컬에서 발급했다면 **`kakao_code.json`을 서버의 `btc_live_trading/`로 업로드**(WinSCP)한 뒤 `systemctl restart coinbot.service`로 재시작하세요. 경로가 어긋나면 토큰을 못 찾습니다.
+3. `KAKAO_REDIRECT_URI`는 카카오 개발자 콘솔 등록값과 **1글자도 다르면 안 됩니다**(불일치 시 KOE205/KOE006).
+4. 잠시 알림만 끄려면 `.env`에 `KAKAO_ALERTS_ENABLED=false`를 두면 매매는 그대로, 카카오 호출만 생략됩니다.
+
 ## 전략 요약 및 아키텍처 (15m 추세 매매)
 
 | 단계 | 구현 | 설명 |

@@ -1205,21 +1205,45 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
 
 
 def _notify_kakao(title: str, body: str) -> None:
-    if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
-        return
+    # 봇 방어막: 카카오 알림 관련 어떤 예외도 매매 루프로 전파되지 않도록 전체를 격리한다.
+    try:
+        if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
+            return
+        if not _kakao_alerts_enabled():
+            return
+        access = _ensure_kakao_access_token(show_auth_link=True)
+        rest = os.getenv("KAKAO_REST_API_KEY", "").strip()
+        if not access or not rest:
+            return
+        notifier = KakaoNotifier(
+            access_token=access,
+            enabled=True,
+            rest_api_key=rest,
+            prompt_on_refresh_failure=False,
+        )
+        notifier.send_message(title, body)
+    except Exception as exc:
+        # 알림 실패는 로그만 남기고 매매는 그대로 진행한다.
+        logger.error("카카오 알림 전송 중 예외 발생(매매에는 영향 없음): %s", type(exc).__name__)
+
+
+def _kakao_auth_ready() -> bool:
+    """매매를 진행해도 되는 카카오 인증 상태인지 확인한다.
+
+    - KAKAO_ALERTS_ENABLED=false 이면 운영자가 알림을 의도적으로 끈 것이므로 통과시킨다.
+    - 그 외에는 유효한 카카오 액세스 토큰을 확보하지 못하면 False(매매 차단)를 반환한다.
+    """
     if not _kakao_alerts_enabled():
-        return
-    access = _ensure_kakao_access_token(show_auth_link=True)
-    rest = os.getenv("KAKAO_REST_API_KEY", "").strip()
-    if not access or not rest:
-        return
-    notifier = KakaoNotifier(
-        access_token=access,
-        enabled=True,
-        rest_api_key=rest,
-        prompt_on_refresh_failure=False,
-    )
-    notifier.send_message(title, body)
+        return True
+    if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
+        logger.error("카카오 모듈 로드 실패 — 인증 확인 불가로 매매를 차단합니다.")
+        return False
+    try:
+        access = _ensure_kakao_access_token(show_auth_link=True)
+    except Exception as exc:
+        logger.error("카카오 인증 확인 중 예외: %s", type(exc).__name__)
+        return False
+    return bool(access)
 
 
 def _decision_emoji(decision: str, risk_blocked: bool) -> str:
@@ -2677,8 +2701,14 @@ def run_forever() -> None:
     while True:
         cycle_started = time.time()
         try:
-            result = run_cycle()
-            print(_format_cycle_dashboard(result))
+            if not _kakao_auth_ready():
+                logger.error(
+                    "카카오 인증 실패 — 매매 로직을 실행하지 않습니다. "
+                    "서버에서 재인증(scripts/auth_kakao.py) 후 서비스를 재시작하세요."
+                )
+            else:
+                result = run_cycle()
+                print(_format_cycle_dashboard(result))
         except KeyboardInterrupt:
             try:
                 with _SHUTDOWN_LOCK:
@@ -2705,6 +2735,12 @@ if __name__ == "__main__":
     _send_startup_report()
     if _env_bool("AI_RUN_ONCE", False):
         try:
+            if not _kakao_auth_ready():
+                logger.error(
+                    "카카오 인증 실패 — 매매 로직을 실행하지 않습니다. "
+                    "서버에서 재인증(scripts/auth_kakao.py) 후 다시 실행하세요."
+                )
+                raise SystemExit(1)
             print(_format_cycle_dashboard(run_cycle()))
         except KeyboardInterrupt:
             try:

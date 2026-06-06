@@ -15,7 +15,15 @@ from . import strategy_exit
 from . import risk_manager
 from . import backtest_engine
 from . import performance
-from . import visualization
+
+# visualization은 matplotlib에 의존하며 백테스트 차트 전용이다.
+# 라이브 매매 서버에는 matplotlib이 없을 수 있으므로 선택적으로 로드한다.
+try:
+    from . import visualization  # noqa: F401
+    _HAS_VISUALIZATION = True
+except ImportError:
+    visualization = None  # type: ignore[assignment]
+    _HAS_VISUALIZATION = False
 
 __all__ = [
     'config',

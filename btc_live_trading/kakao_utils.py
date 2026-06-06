@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -17,8 +18,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_MODULE_DIR = Path(__file__).resolve().parent
-KAKAO_CODE_JSON = _MODULE_DIR / "kakao_code.json"
+# 작업 디렉터리(CWD)와 무관하게 항상 같은 파일을 읽고 쓰도록 절대경로로 고정한다.
+_MODULE_DIR = Path(os.path.abspath(os.path.dirname(__file__)))
+KAKAO_CODE_JSON = Path(os.path.abspath(_MODULE_DIR / "kakao_code.json"))
 DEFAULT_REDIRECT_URI = "https://example.com/oauth"
 LOCALHOST_REDIRECT_URI = "http://127.0.0.1:8765/oauth"
 
@@ -28,7 +30,27 @@ def get_kakao_json_path() -> Path:
 
 
 def _env_file_path() -> Path:
-    return _MODULE_DIR / ".env"
+    return Path(os.path.abspath(_MODULE_DIR / ".env"))
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """임시 파일에 먼저 쓰고 os.replace로 교체 → 쓰기 중단 시에도 원본이 손상되지 않음."""
+    target = Path(os.path.abspath(path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp_kakao_", suffix=".swap")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, target)  # 같은 파일시스템 내 원자적 교체
+    except Exception:
+        try:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def get_redirect_uri() -> str:
@@ -74,22 +96,37 @@ def get_refresh_token() -> str:
     return jr
 
 
-def _write_kakao_code_json(access_token: str, refresh_token: str) -> None:
+def _write_kakao_code_json(access_token: str, refresh_token: str) -> bool:
+    """kakao_code.json 갱신. 기존 파일 값과 병합해 어떤 토큰도 유실되지 않도록 한다.
+
+    반환값: 저장 성공 여부. 쓰기 실패는 다음 갱신을 영구 차단하므로 명확히 로깅한다.
+    """
+    existing_access, existing_refresh = _read_json_tokens()
+    eff_access = (access_token or existing_access or "").strip()
+    eff_refresh = (refresh_token or existing_refresh or "").strip()
+
     payload: Dict[str, str] = {}
-    if access_token:
-        payload["access_token"] = access_token
-    if refresh_token:
-        payload["refresh_token"] = refresh_token
+    if eff_access:
+        payload["access_token"] = eff_access
+    if eff_refresh:
+        payload["refresh_token"] = eff_refresh
     if not payload:
-        return
+        return False
+
     try:
-        KAKAO_CODE_JSON.write_text(
+        _atomic_write_text(
+            KAKAO_CODE_JSON,
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
-        logger.info("Updated %s", KAKAO_CODE_JSON)
+        logger.info("kakao_code.json 갱신 완료: %s", KAKAO_CODE_JSON)
+        return True
     except Exception as exc:
-        logger.error("Failed to write %s: %s", KAKAO_CODE_JSON, exc)
+        logger.error(
+            "kakao_code.json 저장 실패(%s): %s — 다음 토큰 갱신 시 문제가 될 수 있으니 권한/디스크를 확인하세요.",
+            KAKAO_CODE_JSON,
+            exc,
+        )
+        return False
 
 
 def _merge_env_file(updates: Dict[str, str]) -> None:
@@ -128,29 +165,37 @@ def _merge_env_file(updates: Dict[str, str]) -> None:
             out.append(f"{key}={val}\n")
 
     try:
-        env_path.write_text("".join(out), encoding="utf-8")
-        logger.info("Updated Kakao token keys in .env")
+        _atomic_write_text(env_path, "".join(out))
+        logger.info(".env 토큰 키 갱신 완료: %s", env_path)
     except Exception as exc:
-        logger.error("Failed to write .env: %s", exc)
+        logger.error(".env 저장 실패(%s): %s", env_path, exc)
 
 
-def persist_kakao_tokens(access_token: str, refresh_token: Optional[str] = None) -> None:
+def persist_kakao_tokens(access_token: str, refresh_token: Optional[str] = None) -> bool:
+    """access/refresh 토큰을 os.environ, kakao_code.json, .env 세 곳에 동기화 저장.
+
+    refresh_token이 None이면 기존 env/json의 refresh를 유지하고,
+    값이 주어지면(카카오가 회전 발급한 새 refresh) 반드시 덮어써 저장한다.
+    반환값: kakao_code.json 저장 성공 여부.
     """
-    access_token은 필수로 반영. refresh_token이 None이면 기존 env/json의 refresh를 유지.
-    """
+    ja, jr_file = _read_json_tokens()
+
     if access_token:
         os.environ["KAKAO_ACCESS_TOKEN"] = access_token
 
-    ja, jr_file = _read_json_tokens()
     if refresh_token is not None:
-        os.environ["KAKAO_REFRESH_TOKEN"] = refresh_token
-        eff_refresh = refresh_token
+        new_refresh = refresh_token.strip()
+        prev_refresh = (os.getenv("KAKAO_REFRESH_TOKEN", "").strip() or jr_file)
+        if new_refresh and new_refresh != prev_refresh:
+            logger.info("카카오 refresh_token이 회전 발급되어 새 값을 저장합니다.")
+        os.environ["KAKAO_REFRESH_TOKEN"] = new_refresh
+        eff_refresh = new_refresh
     else:
         eff_refresh = os.getenv("KAKAO_REFRESH_TOKEN", "").strip() or jr_file
 
     eff_access = access_token or os.getenv("KAKAO_ACCESS_TOKEN", "").strip() or ja
 
-    _write_kakao_code_json(eff_access, eff_refresh)
+    json_ok = _write_kakao_code_json(eff_access, eff_refresh)
 
     file_updates: Dict[str, str] = {}
     if eff_access:
@@ -159,6 +204,8 @@ def persist_kakao_tokens(access_token: str, refresh_token: Optional[str] = None)
         file_updates["KAKAO_REFRESH_TOKEN"] = eff_refresh
     if file_updates:
         _merge_env_file(file_updates)
+
+    return json_ok
 
 
 def clear_env_key(key: str) -> None:
@@ -180,7 +227,9 @@ def apply_token_response(token_data: Dict[str, Any]) -> str:
         refresh_opt = str(new_refresh).strip()
     else:
         refresh_opt = None
-    persist_kakao_tokens(access, refresh_opt)
+    saved = persist_kakao_tokens(access, refresh_opt)
+    if refresh_opt:
+        logger.info("카카오 토큰 갱신 응답에 새 refresh_token 포함 → 저장 %s", "성공" if saved else "실패")
     return access
 
 
