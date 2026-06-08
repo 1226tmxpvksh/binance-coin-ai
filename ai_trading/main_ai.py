@@ -1173,6 +1173,15 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
     if from_env:
         return from_env
 
+    # 검증 우선: 기존 액세스 토큰이 아직 유효하면 그대로 사용한다.
+    # (매 알림마다 refresh를 호출하면 마스터 열쇠 회전이 과도하게 일어나 위험하다.
+    #  따라서 회전은 액세스 토큰이 실제로 만료된 6시간 주기에만 발생하도록 한다.)
+    access_token = get_access_token().strip()
+    if access_token and _validate_kakao_access_token(access_token):
+        _clear_kakao_auth_exhausted()
+        return access_token
+
+    # 액세스 토큰이 만료/무효일 때만 refresh_token으로 갱신(여기서만 회전 발생).
     refresh_token = _get_kakao_refresh_token().strip()
     if refresh_token and rest_api_key:
         refreshed = _refresh_kakao_access_token(refresh_token, rest_api_key)
@@ -1180,11 +1189,6 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
             return refreshed
         if KAKAO_AUTH_EXHAUSTED:
             return ""
-
-    access_token = get_access_token().strip()
-    if access_token and _validate_kakao_access_token(access_token):
-        _clear_kakao_auth_exhausted()
-        return access_token
 
     if refresh_token and rest_api_key:
         if show_auth_link:

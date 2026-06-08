@@ -53,6 +53,16 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
+def _mask_token(token: str) -> str:
+    """로그용 토큰 마스킹: 앞 6자 + …(길이) + 뒤 4자."""
+    t = (token or "").strip()
+    if not t:
+        return "(없음)"
+    if len(t) <= 12:
+        return f"{t[:2]}…{t[-2:]}(len={len(t)})"
+    return f"{t[:6]}…{t[-4:]}(len={len(t)})"
+
+
 def get_redirect_uri() -> str:
     return (os.getenv("KAKAO_REDIRECT_URI") or DEFAULT_REDIRECT_URI).strip()
 
@@ -174,24 +184,40 @@ def _merge_env_file(updates: Dict[str, str]) -> None:
 def persist_kakao_tokens(access_token: str, refresh_token: Optional[str] = None) -> bool:
     """access/refresh 토큰을 os.environ, kakao_code.json, .env 세 곳에 동기화 저장.
 
-    refresh_token이 None이면 기존 env/json의 refresh를 유지하고,
-    값이 주어지면(카카오가 회전 발급한 새 refresh) 반드시 덮어써 저장한다.
-    반환값: kakao_code.json 저장 성공 여부.
+    refresh_token(마스터 열쇠) 처리 규칙:
+      * None 또는 빈 문자열  → 회전 없음. 기존 env/json의 refresh_token을 절대 유실하지 않고 유지.
+      * 비어있지 않은 값      → 회전 발급. 무조건 새 값으로 기존 값을 대체 저장.
+
+    저장 후 kakao_code.json을 다시 읽어 refresh_token이 의도대로 기록되었는지 검증한다.
+    반환값: refresh_token 저장·검증 성공 여부(다음 갱신을 보장하는 핵심 지표).
     """
     ja, jr_file = _read_json_tokens()
+    prev_refresh = (os.getenv("KAKAO_REFRESH_TOKEN", "").strip() or jr_file).strip()
 
     if access_token:
         os.environ["KAKAO_ACCESS_TOKEN"] = access_token
 
-    if refresh_token is not None:
-        new_refresh = refresh_token.strip()
-        prev_refresh = (os.getenv("KAKAO_REFRESH_TOKEN", "").strip() or jr_file)
-        if new_refresh and new_refresh != prev_refresh:
-            logger.info("카카오 refresh_token이 회전 발급되어 새 값을 저장합니다.")
-        os.environ["KAKAO_REFRESH_TOKEN"] = new_refresh
+    # --- 마스터 열쇠(refresh_token) 회전 분기 ---
+    new_refresh = (refresh_token or "").strip() if refresh_token is not None else ""
+    if new_refresh:
+        if new_refresh != prev_refresh:
+            logger.info(
+                "🔑 카카오 마스터 열쇠 회전 감지: %s → %s (새 refresh_token 저장)",
+                _mask_token(prev_refresh),
+                _mask_token(new_refresh),
+            )
+        else:
+            logger.info("카카오 refresh_token 재발급(기존과 동일 값) 확인: %s", _mask_token(new_refresh))
         eff_refresh = new_refresh
     else:
-        eff_refresh = os.getenv("KAKAO_REFRESH_TOKEN", "").strip() or jr_file
+        # 회전 없음 → 기존 유효 refresh_token을 반드시 유지
+        eff_refresh = prev_refresh
+        if eff_refresh:
+            logger.debug("카카오 응답에 refresh_token 없음 → 기존 마스터 열쇠 유지: %s", _mask_token(eff_refresh))
+
+    if eff_refresh:
+        os.environ["KAKAO_REFRESH_TOKEN"] = eff_refresh
+    # eff_refresh가 비어 있으면 기존 env 값을 굳이 지우지 않는다(유실 방지).
 
     eff_access = access_token or os.getenv("KAKAO_ACCESS_TOKEN", "").strip() or ja
 
@@ -205,7 +231,21 @@ def persist_kakao_tokens(access_token: str, refresh_token: Optional[str] = None)
     if file_updates:
         _merge_env_file(file_updates)
 
-    return json_ok
+    # --- 저장 검증: 파일에 실제로 의도한 refresh_token이 기록됐는지 재확인 ---
+    refresh_ok = True
+    if eff_refresh:
+        _, saved_refresh = _read_json_tokens()
+        refresh_ok = (saved_refresh == eff_refresh)
+        if refresh_ok:
+            logger.info("✅ refresh_token 저장 검증 통과: %s (kakao_code.json)", _mask_token(eff_refresh))
+        else:
+            logger.error(
+                "❌ refresh_token 저장 검증 실패! 파일=%s, 의도=%s — 다음 갱신이 실패할 수 있습니다.",
+                _mask_token(saved_refresh),
+                _mask_token(eff_refresh),
+            )
+
+    return json_ok and refresh_ok
 
 
 def clear_env_key(key: str) -> None:
@@ -219,17 +259,24 @@ def clear_kakao_auth_code() -> None:
 
 
 def apply_token_response(token_data: Dict[str, Any]) -> str:
-    """OAuth/refresh 응답 JSON에서 토큰을 꺼내 저장하고 access_token 문자열을 반환."""
+    """OAuth/refresh 응답 JSON에서 토큰을 꺼내 저장하고 access_token 문자열을 반환.
+
+    카카오 갱신 응답의 refresh_token 필드 유무를 명확히 분기한다.
+      * 필드가 있고 값이 비어있지 않으면 → 회전으로 간주, 새 값으로 대체 저장.
+      * 필드가 없거나 빈 값이면        → 회전 없음, 기존 refresh_token 유지.
+    """
     access = str(token_data.get("access_token") or "").strip()
-    new_refresh = token_data.get("refresh_token")
-    refresh_opt: Optional[str]
-    if new_refresh is not None:
-        refresh_opt = str(new_refresh).strip()
+    raw_refresh = token_data.get("refresh_token")
+    has_new_refresh = raw_refresh is not None and str(raw_refresh).strip() != ""
+
+    if has_new_refresh:
+        rotated = str(raw_refresh).strip()
+        logger.info("카카오 갱신 응답에 refresh_token 포함 → 마스터 열쇠 회전 처리 시작")
+        ok = persist_kakao_tokens(access, rotated)
+        logger.info("카카오 마스터 열쇠 회전 저장 결과: %s", "성공" if ok else "실패")
     else:
-        refresh_opt = None
-    saved = persist_kakao_tokens(access, refresh_opt)
-    if refresh_opt:
-        logger.info("카카오 토큰 갱신 응답에 새 refresh_token 포함 → 저장 %s", "성공" if saved else "실패")
+        logger.debug("카카오 갱신 응답에 refresh_token 없음 → 기존 마스터 열쇠 유지 처리")
+        persist_kakao_tokens(access, None)
     return access
 
 
