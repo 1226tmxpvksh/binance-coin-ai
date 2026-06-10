@@ -784,11 +784,15 @@ def _log_kakao_manual_auth_link(reason: str) -> None:
         logger.error("현재 redirect_uri 설정 검증에 실패했습니다. URI를 먼저 수정한 뒤 새 인가 코드를 발급하세요.")
     logger.error("=" * 80)
     logger.error(
-        "systemd/Vultr 등 비대화형 환경에서는 journalctl에 코드를 붙여넣어도 봇 stdin으로 전달되지 않습니다."
+        "systemd/Vultr 등 비대화형 환경에서는 journalctl에 코드를 붙여넣을 수 없습니다."
     )
-    logger.error("서버 SSH에서 아래 명령으로 토큰을 발급한 뒤 서비스를 재시작하세요:")
-    logger.error('  cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && py -3 scripts/auth_kakao.py --code "<인가코드>"')
-    logger.error("  sudo systemctl restart coinbot.service")
+    logger.error("대신 아래 한 줄로 URL + 인증 입력 + 로그 팔로우가 한 번에 됩니다:")
+    logger.error("  bash ~/Coin/scripts/coinbot_watch.sh")
+    logger.error("또는 수동 절차:")
+    logger.error("  sudo systemctl stop coinbot.service")
+    logger.error("  cd ~/Coin && source ~/venv/bin/activate && python ai_trading/main_ai.py")
+    logger.error("  (터미널에 뜨는 URL로 인증 → 코드 입력 → 완료 후 Ctrl+C)")
+    logger.error("  sudo systemctl start coinbot.service")
     logger.error("또는 .env에 KAKAO_AUTH_CODE=<인가코드> 를 1회 설정 후 restart (성공 시 자동 저장됨).")
     KAKAO_AUTH_LINK_LOGGED = True
 
@@ -882,7 +886,7 @@ def _exchange_kakao_auth_code(rest_api_key: str, redirect_uri: str, auth_code: s
         elif error_code == "invalid_grant" and "authorization code" in error_description.lower():
             logger.error(
                 "카카오 인가 코드 만료/이미 사용됨 — 1회용 코드입니다. "
-                "py scripts/auth_kakao.py 로 새로 발급받으세요."
+                "인증 URL에서 새 코드를 발급받아 다시 입력하세요."
             )
             if _clear_kakao_auth_code is not None:
                 _clear_kakao_auth_code()
@@ -958,8 +962,8 @@ def _manual_kakao_authorization_recovery(rest_api_key: str, reason: str) -> str:
     print("\n인가 URL:")
     print(auth_url)
     print("\n브라우저 인증 후 리다이렉트 URL의 code= 뒤 값을 붙여넣으세요.")
-    print("입력하지 않고 Enter를 누르면 카카오 알림만 건너뛰고 매매 루프는 계속 진행됩니다.")
-    print("서버(systemd)에서는: py -3 scripts/auth_kakao.py --code \"<코드>\"")
+    print("입력하지 않고 Enter를 누르면 인증을 건너뜁니다 (Safety First 게이트가 매매를 차단합니다).")
+    print("서버(systemd)에서는 서비스를 멈추고 'python ai_trading/main_ai.py'를 직접 실행해 대화형 인증을 진행하세요.")
 
     try:
         auth_code = input("인가 코드(code): ").strip()
@@ -1010,28 +1014,35 @@ def _kakao_alerts_enabled() -> bool:
     return _env_bool("KAKAO_ALERTS_ENABLED", True)
 
 
-def _interactive_kakao_browser_auth(rest_api_key: str) -> str:
-    """대화형 실행: 브라우저를 열고 사용자가 붙여넣은 code 또는 전체 URL로 토큰 발급."""
-    global KAKAO_LOCAL_OAUTH_TRIED
+def _interactive_kakao_auth_until_done(rest_api_key: str) -> str:
+    """대화형 가동 로직(No Auth, No Start + But Interactive).
+
+    봇을 일시 중지(Pause)하고 터미널에 카카오 로그인 URL을 출력한 뒤,
+    운영자가 인가 코드를 입력해 인증이 성공할 때까지 input()으로 기다린다.
+    성공 시 깨끗한 새 마스터 열쇠가 원자적 저장 + 저장 후 검증(✅)을 거쳐
+    kakao_code.json/.env에 안착된 뒤 access_token을 반환한다.
+    'skip' 입력 시에만 인증 없이 빠져나간다(이후 Safety First 게이트가 매매를 차단).
+    """
     if (
         not rest_api_key
         or _exchange_kakao_authorization_code is None
         or _apply_kakao_token_response is None
     ):
         return ""
-    if KAKAO_LOCAL_OAUTH_TRIED:
-        return ""
-    KAKAO_LOCAL_OAUTH_TRIED = True
     redirect_uri = _get_kakao_redirect_uri() if _get_kakao_redirect_uri is not None else _env_str("KAKAO_REDIRECT_URI", "")
     auth_url = _kakao_auth_url(rest_api_key)
     if not auth_url:
+        logger.error("KAKAO_REST_API_KEY/KAKAO_REDIRECT_URI가 없어 인가 URL을 만들 수 없습니다.")
         return ""
+
     print("\n" + "=" * 72)
-    print("[카카오 인증] 액세스 토큰 갱신이 필요합니다. 1회 로그인 후 매매가 계속됩니다.")
-    print("브라우저가 열립니다. 카카오 로그인 후 이동된 주소창의 전체 URL을 복사해 붙여넣으세요.")
-    print(auth_url)
-    print(f"(Redirect URI: {redirect_uri})")
-    print("그냥 Enter를 누르면 카카오 알림 없이 매매만 진행합니다.")
+    print("[카카오 대화형 인증] 마스터 열쇠가 없거나 만료되어 봇을 일시 중지했습니다.")
+    print("인증이 끝나야 매매 엔진이 가동됩니다. (Safety First)")
+    print("-" * 72)
+    print("1) 아래 URL을 브라우저에서 열고 카카오 로그인을 완료하세요:")
+    print(f"   {auth_url}")
+    print("2) 이동된 주소창의 전체 URL(또는 code= 뒤 값)을 아래에 붙여넣으세요.")
+    print("   인증 없이 건너뛰려면 'skip' 입력 (매매는 차단된 상태로 유지됩니다)")
     print("=" * 72)
     try:
         import webbrowser
@@ -1039,20 +1050,34 @@ def _interactive_kakao_browser_auth(rest_api_key: str) -> str:
         webbrowser.open(auth_url)
     except Exception:
         pass
-    try:
-        raw = input("코드 또는 URL 붙여넣기: ")
-    except (EOFError, KeyboardInterrupt):
-        print("카카오 인증 입력 취소 — 알림 없이 매매를 계속합니다.")
-        return ""
-    code = _extract_kakao_code(raw)
-    if not code:
-        print("코드가 비어 있어 카카오 인증을 건너뜁니다.")
-        return ""
-    return _exchange_kakao_auth_code(rest_api_key, redirect_uri, code)
+
+    while True:
+        try:
+            raw = input("코드 또는 URL 붙여넣기 (skip=건너뛰기): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n카카오 인증 입력이 중단되었습니다. 매매는 차단된 상태로 유지됩니다.")
+            return ""
+        if raw.lower() == "skip":
+            print("인증을 건너뜁니다. 매매는 Safety First 게이트에 의해 차단됩니다.")
+            return ""
+        code = _extract_kakao_code(raw)
+        if not code:
+            print("입력에서 인가 코드를 찾지 못했습니다. 전체 URL 또는 code= 뒤 값을 다시 붙여넣으세요.")
+            continue
+        access = _exchange_kakao_auth_code(rest_api_key, redirect_uri, code)
+        if access:
+            print("[OK] 카카오 인증 완료 - 새 마스터 열쇠가 저장.검증되었습니다. 매매 엔진을 가동합니다.")
+            return access
+        print("토큰 발급에 실패했습니다. (인가 코드는 1회용입니다) 새 코드를 발급받아 다시 입력하세요.")
+        print(f"   {auth_url}")
 
 
 def _bootstrap_kakao_tokens() -> None:
-    """기동 시 토큰 자동 확보: env코드 → 기존토큰검증 → 리프레시 → (대화형)브라우저 인증."""
+    """기동 시 마스터 열쇠 확보: env코드 → 기존토큰검증 → 리프레시 → 대화형 인증(input 대기).
+
+    대화형 환경에서는 인증이 성공할 때까지 봇을 일시 중지하고 터미널에서
+    인가 코드를 직접 받는다. 인증·저장·검증이 끝나야 매매 루프로 진입한다.
+    """
     if KakaoNotifier is None or _hydrate_kakao_tokens is None:
         return
     if not _kakao_alerts_enabled():
@@ -1060,14 +1085,17 @@ def _bootstrap_kakao_tokens() -> None:
         return
     if KAKAO_AUTH_EXHAUSTED:
         return
+    # 1) 마스터 열쇠 저장소(kakao_code.json) 읽기
     _hydrate_kakao_tokens()
     rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
     if not rest_api_key:
         return
 
+    # 2) .env의 1회용 인가 코드가 있으면 우선 사용
     if _try_kakao_auth_code_from_env(rest_api_key):
         return
 
+    # 3) 기존 액세스 토큰이 유효하면 그대로 가동
     existing = get_access_token().strip() if get_access_token is not None else ""
     if existing and _validate_kakao_access_token(existing):
         logger.info("카카오 액세스 토큰 유효 — 재인증 불필요")
@@ -1080,15 +1108,24 @@ def _bootstrap_kakao_tokens() -> None:
         if _try_kakao_local_oauth_auto(rest_api_key):
             return
 
+    # 4) 리프레시 토큰으로 자동 갱신(회전 시 원자적 저장+검증은 kakao_utils가 보장)
     refresh_token = _get_kakao_refresh_token().strip() if _get_kakao_refresh_token else ""
     if refresh_token:
         if _refresh_kakao_access_token(refresh_token, rest_api_key, mark_exhausted_on_expire=not interactive):
             return
 
+    # 5) 여기까지 왔다면 마스터 열쇠가 없거나 invalid_grant 상태.
     if interactive:
-        if _interactive_kakao_browser_auth(rest_api_key):
+        # 대화형: 봇을 일시 중지하고 터미널에서 인가 코드를 직접 받아 인증을 끝낸다.
+        logger.error("카카오 마스터 열쇠 만료/없음 — 봇을 일시 중지하고 대화형 인증을 시작합니다.")
+        if _interactive_kakao_auth_until_done(rest_api_key):
             return
+        # 운영자가 명시적으로 skip한 경우에만 여기 도달
+        if not KAKAO_AUTH_EXHAUSTED:
+            _mark_kakao_auth_exhausted("운영자가 대화형 인증을 건너뛰었습니다.")
+        return
 
+    # 비대화형(systemd): input() 불가 — 조치 방법을 ERROR로 남기고 게이트가 매매를 차단한다.
     if not KAKAO_AUTH_EXHAUSTED:
         _mark_kakao_auth_exhausted("리프레시 토큰이 만료되었거나 유효하지 않습니다.")
 
@@ -1232,10 +1269,12 @@ def _notify_kakao(title: str, body: str) -> None:
 
 
 def _kakao_auth_ready() -> bool:
-    """매매를 진행해도 되는 카카오 인증 상태인지 확인한다.
+    """Safety First 게이트: 매매를 진행해도 되는 카카오 인증 상태인지 확인한다.
 
+    카카오 알림은 시스템 생존 신호(Heartbeat)이므로 매매 엔진의 '전제 조건'이다.
     - KAKAO_ALERTS_ENABLED=false 이면 운영자가 알림을 의도적으로 끈 것이므로 통과시킨다.
     - 그 외에는 유효한 카카오 액세스 토큰을 확보하지 못하면 False(매매 차단)를 반환한다.
+    - 점검 중 예외가 나도 호출자에게 전파하지 않고 False(안전 측)로 처리한다.
     """
     if not _kakao_alerts_enabled():
         return True
@@ -1245,7 +1284,7 @@ def _kakao_auth_ready() -> bool:
     try:
         access = _ensure_kakao_access_token(show_auth_link=True)
     except Exception as exc:
-        logger.error("카카오 인증 확인 중 예외: %s", type(exc).__name__)
+        logger.error("카카오 인증 확인 중 예외 — 매매를 차단합니다: %s", type(exc).__name__)
         return False
     return bool(access)
 
@@ -2699,16 +2738,24 @@ def run_forever() -> None:
     install_shutdown_handlers()
     prune_stats_history()
     _prune_trade_log()
-    _bootstrap_kakao_tokens()
+    try:
+        _bootstrap_kakao_tokens()
+    except Exception as exc:
+        logger.error("카카오 토큰 부트스트랩 실패(매매는 계속 진행): %s", type(exc).__name__)
     loop_seconds = max(30, _env_int("AI_LOOP_SECONDS", 300))
-    _send_startup_report()
+    try:
+        _send_startup_report()
+    except Exception as exc:
+        logger.error("운영 시작 보고 실패(매매는 계속 진행): %s", type(exc).__name__)
     while True:
         cycle_started = time.time()
         try:
+            # Safety First: 카카오 인증(생존 신호)이 확보되지 않으면 이번 사이클의
+            # 매매 로직(차트 분석·주문)을 통째로 건너뛴다.
             if not _kakao_auth_ready():
                 logger.error(
                     "카카오 인증 실패 — 매매 로직을 실행하지 않습니다. "
-                    "서버에서 재인증(scripts/auth_kakao.py) 후 서비스를 재시작하세요."
+                    "SSH에서 bash ~/Coin/scripts/coinbot_watch.sh 를 실행하면 URL+입력 후 로그를 볼 수 있습니다."
                 )
             else:
                 result = run_cycle()
@@ -2734,15 +2781,21 @@ if __name__ == "__main__":
     install_shutdown_handlers()
     prune_stats_history()
     _prune_trade_log()
-    _bootstrap_kakao_tokens()
+    try:
+        _bootstrap_kakao_tokens()
+    except Exception as _exc:
+        logger.error("카카오 토큰 부트스트랩 실패(매매는 계속 진행): %s", type(_exc).__name__)
     _check_project_connectivity()
-    _send_startup_report()
+    try:
+        _send_startup_report()
+    except Exception as _exc:
+        logger.error("운영 시작 보고 실패(매매는 계속 진행): %s", type(_exc).__name__)
     if _env_bool("AI_RUN_ONCE", False):
         try:
             if not _kakao_auth_ready():
                 logger.error(
                     "카카오 인증 실패 — 매매 로직을 실행하지 않습니다. "
-                    "서버에서 재인증(scripts/auth_kakao.py) 후 다시 실행하세요."
+                    "봇을 터미널에서 직접 실행하면 대화형 인증이 진행됩니다."
                 )
                 raise SystemExit(1)
             print(_format_cycle_dashboard(run_cycle()))

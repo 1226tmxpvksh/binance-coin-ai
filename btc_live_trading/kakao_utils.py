@@ -82,28 +82,38 @@ def _read_json_tokens() -> tuple[str, str]:
 
 
 def hydrate_tokens_from_json() -> None:
-    """kakao_code.json 값을 os.environ에 병합(비어 있을 때만)."""
+    """kakao_code.json 값을 os.environ에 동기화한다.
+
+    json은 원자적 저장+저장 후 검증을 거치는 '정본'이므로, .env와 값이
+    어긋나면 json을 우선한다(회전 후 .env만 낡은 경우 2~3일 좀비 버그 방지).
+    """
     ja, jr = _read_json_tokens()
-    if not os.getenv("KAKAO_ACCESS_TOKEN", "").strip() and ja:
+    if ja:
         os.environ["KAKAO_ACCESS_TOKEN"] = ja
-    if not os.getenv("KAKAO_REFRESH_TOKEN", "").strip() and jr:
+    if jr:
         os.environ["KAKAO_REFRESH_TOKEN"] = jr
 
 
 def get_access_token() -> str:
-    a = os.getenv("KAKAO_ACCESS_TOKEN", "").strip()
-    if a:
-        return a
     ja, _ = _read_json_tokens()
-    return ja
+    a_env = os.getenv("KAKAO_ACCESS_TOKEN", "").strip()
+    if ja:
+        if a_env and a_env != ja:
+            logger.warning("KAKAO_ACCESS_TOKEN(.env)과 kakao_code.json 불일치 — json 값을 사용합니다.")
+        return ja
+    return a_env
 
 
 def get_refresh_token() -> str:
-    r = os.getenv("KAKAO_REFRESH_TOKEN", "").strip()
-    if r and r != "your_refresh_token_here":
-        return r
     _, jr = _read_json_tokens()
-    return jr
+    r_env = os.getenv("KAKAO_REFRESH_TOKEN", "").strip()
+    if jr and jr != "your_refresh_token_here":
+        if r_env and r_env != jr:
+            logger.warning("KAKAO_REFRESH_TOKEN(.env)과 kakao_code.json 불일치 — json 값을 사용합니다.")
+        return jr
+    if r_env and r_env != "your_refresh_token_here":
+        return r_env
+    return jr or ""
 
 
 def _write_kakao_code_json(access_token: str, refresh_token: str) -> bool:
@@ -276,7 +286,12 @@ def apply_token_response(token_data: Dict[str, Any]) -> str:
         logger.info("카카오 마스터 열쇠 회전 저장 결과: %s", "성공" if ok else "실패")
     else:
         logger.debug("카카오 갱신 응답에 refresh_token 없음 → 기존 마스터 열쇠 유지 처리")
-        persist_kakao_tokens(access, None)
+        ok = persist_kakao_tokens(access, None)
+    if not ok:
+        logger.error(
+            "카카오 토큰 저장/검증 실패 — 다음 갱신 시 invalid_grant가 날 수 있습니다. "
+            "kakao_code.json/.env 권한·디스크를 확인하세요."
+        )
     return access
 
 

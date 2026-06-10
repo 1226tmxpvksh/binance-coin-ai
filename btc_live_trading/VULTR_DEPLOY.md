@@ -2,6 +2,8 @@
 
 실전 매매는 **`ai_trading/main_ai.py`** 하나로 돌아갑니다. 저장소 루트(`Coin/`) 전체를 서버에 올리고 아래 절차를 따르세요.
 
+> **이미 배포된 서버에서 봇을 켜거나 카카오 재인증할 때** → **[START.md](../START.md)** (일상 시작 절차)
+
 ## 1. 옮길 것 / 제외할 것
 
 ### ✅ 포함
@@ -79,20 +81,23 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable coinbot
 sudo systemctl start coinbot
-sudo journalctl -u coinbot -f
+bash ~/Coin/scripts/coinbot_watch.sh   # 인증 필요 시 URL+입력 후 로그 팔로우
 ```
 
 ---
 
 ## 4. 카카오 토큰 (비대화형 서버)
 
-서버는 브라우저가 없어 자동 OAuth가 불가능합니다. **PC에서** 토큰을 발급해 동기화하세요:
+`journalctl -f`만 실행하면 **인증 입력 칸이 나오지 않습니다.** SSH에서 아래를 사용하세요:
 
-1. PC: `py scripts/auth_kakao.py` → 로그인 후 코드 붙여넣기
-2. PC의 `btc_live_trading/.env`와 `btc_live_trading/kakao_code.json`을 서버로 복사
-3. `sudo systemctl restart coinbot`
+```bash
+bash ~/Coin/scripts/coinbot_watch.sh
+```
 
-또는 서버 SSH에서: `py -3 scripts/auth_kakao.py --code "<인가코드>"`
+- 토큰 만료/없음 → 터미널에 카카오 URL + 코드 입력 → 자동 저장 → `systemctl restart` → 로그 팔로우
+- 토큰 정상 → 바로 `journalctl -f`
+
+대안: `.env`에 `KAKAO_AUTH_CODE=<코드>` 1회 설정 후 `systemctl restart coinbot`
 카카오 알림이 필요 없으면 `.env`에 `KAKAO_ALERTS_ENABLED=false`.
 
 ---

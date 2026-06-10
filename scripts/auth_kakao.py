@@ -119,10 +119,7 @@ def main() -> None:
             print("[1단계] 아래 URL을 브라우저에서 여세요(자동으로 열립니다):")
             print(url)
             print("-" * 70)
-            print(f"등록되어 있어야 할 Redirect URI: {redirect_uri}")
-            print("  ※ 브라우저에 KOE006이 뜨면 이 URI가 카카오 콘솔에 등록되지 않은 것입니다.")
-            print("    developers.kakao.com → 내 앱 → 앱 설정 > 플랫폼 키 > REST API 키")
-            print("    > 리다이렉트 URI 에 위 값을 똑같이 추가 후 다시 실행하세요.")
+            print("[2단계] 로그인 후 이동된 주소창의 전체 URL(또는 code= 뒤 값)을 붙여넣으세요.")
             print("=" * 70)
             if sys.stdin.isatty() and not args.no_browser:
                 try:
@@ -132,7 +129,6 @@ def main() -> None:
         if not sys.stdin.isatty():
             print('비대화형 환경: py -3 scripts/auth_kakao.py --code "<인가코드>" 로 실행하세요.', file=sys.stderr)
             sys.exit(2)
-        print("[2단계] 로그인 후 이동된 주소창의 전체 URL(또는 code= 뒤 값)을 붙여넣으세요.")
         code = _extract_code(input("코드 또는 URL 붙여넣기: "))
     if not code:
         print("인가 코드가 비어 있습니다.", file=sys.stderr)

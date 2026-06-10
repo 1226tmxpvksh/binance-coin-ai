@@ -9,9 +9,11 @@
 | **`ai_trading/`** | 메인 루프, 리포트, 선물 주문·청산(`binance_futures_tools.py`), 학습 로그, `README.md` 상세 가이드 |
 | **`btc_live_trading/`** | 공용 `.env`, 카카오 토큰(`kakao_utils.py`/`kakao_notifier.py`), 환율(`fx_rates.py`), 공용 전략 모듈(`strategy/`) |
 | **`btc_day_strategy/`** | 백테스트·전략 라이브러리 (`main_ai` 시작 시 연결 점검) |
-| **`scripts/`** | `auth_kakao.py`(카카오 토큰 발급), `reset_live_ledger.py`(원장 리셋), `emergency_exit.py`(비상 청산) |
+| **`scripts/`** | `coinbot_watch.sh`(서버: 인증+로그 한 번에), `auth_kakao.py`, `reset_live_ledger.py`, `emergency_exit.py` |
 
 **실전 매매**는 `AI_DRY_RUN=false`로 `py ai_trading\main_ai.py` 하나만 실행하면 됩니다. (레거시 단타·`main_live` 엔진은 제거됨)
+
+**서버(Vultr)에서 봇 켜기·카카오 인증:** **[START.md](START.md)** ← 시작 절차 전체 정리
 
 자세한 환경변수·데이터 파일·리스크 관리는 **`ai_trading/README.md`** 를 참고하세요.
 
@@ -33,13 +35,23 @@
   - **필드가 없거나 빈 문자열이면** → 회전 없음으로 간주하고 **기존 유효 `refresh_token`을 절대 유실하지 않고 유지**. (이전 버그: 빈 문자열을 "회전됨"으로 오인해 기존 마스터 열쇠를 지우던 구멍을 막음)
 - **저장 검증(write-after-read)**: 저장 직후 `kakao_code.json`을 다시 읽어 의도한 `refresh_token`이 실제로 기록됐는지 검증하고 성공/실패를 로그로 남깁니다. 검증 실패 시 즉시 `ERROR`로 경고합니다.
 - **회전 빈도 최소화**: 매 알림마다 토큰을 갱신하면 회전이 과도하게 일어나 위험하므로, **유효한 액세스 토큰이 있으면 그대로 사용**하고 실제로 만료된 6시간 주기에만 갱신/회전이 일어나도록 했습니다(`_ensure_kakao_access_token` 검증 우선).
-- **봇 방어막**: 카카오 **발송 실패**(토큰은 유효하나 일시적 네트워크/타임아웃 등)는 `logger.error`로만 남기고 매매 루프는 멈추지 않습니다.
-- **인증 실패 시 매매 차단**: 반대로 유효한 카카오 **액세스 토큰 자체를 확보하지 못하면**(인증 실패/만료) 해당 사이클의 **매매 로직을 실행하지 않습니다**. 알림 없이 깜깜이 매매가 되는 것을 막기 위한 안전장치입니다. 재인증 후 서비스를 재시작하면 자동으로 매매가 재개됩니다. (`_kakao_auth_ready()`) 알림을 의도적으로 끄려면 `KAKAO_ALERTS_ENABLED=false`로 두면 이 차단도 우회되어 매매만 진행됩니다.
+- **Safety First — 카카오 알림 실패 시 매매 즉시 차단**: 카카오톡 알림은 단순 정보전달이 아니라 **시스템이 건강하게 살아있다는 생존 신호(Heartbeat)** 입니다. 따라서 카카오 알림은 매매 엔진의 **전제 조건**이며, 매 사이클 `run_cycle()`(차트 분석·주문) 직전에 인증 게이트(`_kakao_auth_ready()`)가 토큰 유효성을 점검합니다.
+  - 토큰이 없거나 만료(`invalid_grant`)·갱신 실패·모듈 로드 실패·점검 중 예외 상태이면 → `[ERROR] 카카오 인증 실패 — 매매 로직을 실행하지 않습니다` 로그를 남기고 **그 사이클의 매매 로직을 통째로 건너뜁니다.**
+  - 봇 프로세스 자체는 죽지 않고 매 주기마다 인증을 재점검하므로, 대화형 재인증(아래 참고) 후에는 매매가 자동 재개됩니다.
+  - 예외적으로 운영자가 의도적으로 알림을 끈 경우(`KAKAO_ALERTS_ENABLED=false`)에만 게이트를 우회하여 알림 없이 매매를 진행합니다.
+- **터미널 대화형 인증 내장 (No Auth, No Start + But Interactive)**: `main_ai.py` 가동 시 마스터 열쇠가 없거나 `invalid_grant` 상태이면, 봇이 ERROR만 뱉고 끝나는 게 아니라 **일시 중지(Pause) 후 터미널에 카카오 로그인 URL을 출력하고 `input()`으로 인가 코드 입력을 직접 기다립니다**(`_interactive_kakao_auth_until_done`). 코드 입력 → 토큰 발급 → 원자적 저장 + 저장 후 검증(✅)까지 성공해야 운영 시작 카톡을 쏘고 매매 루프로 진입합니다. 잘못된/만료된 코드를 넣어도 죽지 않고 재입력을 받습니다.
 
 ### 토큰 갱신 로그 확인 (Vultr / systemd)
 
+**`journalctl -u coinbot.service -f`만 실행하면 인증 입력 칸이 나오지 않습니다** (journalctl은 읽기 전용 로그 뷰어). 대신 아래 스크립트를 사용하세요 — 인증이 필요하면 **URL + 입력 칸**을 먼저 띄운 뒤 자동으로 로그를 팔로우합니다.
+
 ```bash
-# 실시간 카카오 토큰/알림 관련 로그만 필터링
+bash ~/Coin/scripts/coinbot_watch.sh
+```
+
+로그만 필터링하려면:
+
+```bash
 journalctl -u coinbot.service -f | grep -iE "kakao|토큰|refresh|갱신"
 ```
 
@@ -55,18 +67,29 @@ journalctl -u coinbot.service -f | grep -iE "kakao|토큰|refresh|갱신"
 - `❌ refresh_token 저장 검증 실패!` ← 파일 기록이 어긋남(권한/디스크 점검)
 - `카카오 리프레시 토큰 만료/무효: 새 인가 코드 발급이 필요합니다.`
 
-### 알림이 끊겼을 때 (수동 재발급)
+### 알림이 끊겼을 때 (대화형 재인증)
 
-`refresh_token`까지 만료되면(약 2개월 미사용) 새 인가 코드가 필요합니다.
+`refresh_token`까지 만료되면 새 인가 코드가 필요합니다.
 
-1. 수동 갱신 스크립트: **`scripts/auth_kakao.py`**
-   ```bash
-   py scripts\auth_kakao.py          # 브라우저 URL 안내 → code 입력
-   py scripts\auth_kakao.py --auto   # 로컬 콜백(127.0.0.1:8765)으로 자동 수신
-   ```
-2. **경로 주의점**: 스크립트는 `btc_live_trading/kakao_code.json` / `.env`에 저장합니다. 서버에서 발급했다면 그 파일을 그대로 두고, 로컬에서 발급했다면 **`kakao_code.json`을 서버의 `btc_live_trading/`로 업로드**(WinSCP)한 뒤 `systemctl restart coinbot.service`로 재시작하세요. 경로가 어긋나면 토큰을 못 찾습니다.
-3. `KAKAO_REDIRECT_URI`는 카카오 개발자 콘솔 등록값과 **1글자도 다르면 안 됩니다**(불일치 시 KOE205/KOE006).
-4. 잠시 알림만 끄려면 `.env`에 `KAKAO_ALERTS_ENABLED=false`를 두면 매매는 그대로, 카카오 호출만 생략됩니다.
+**서버 SSH (권장 — journalctl 대신 이 명령):**
+
+```bash
+bash ~/Coin/scripts/coinbot_watch.sh
+```
+
+1. 카카오 토큰이 없거나 만료면 → 터미널에 **로그인 URL + 코드 입력 칸**이 바로 나옵니다.
+2. PC 브라우저에서 URL 열고 로그인 → 이동된 주소창 전체 URL(또는 `code=` 뒤 값) 붙여넣기.
+3. `[OK] 카카오 토큰 저장 완료` 확인 → 서비스 자동 재시작 → **이어서 `journalctl -f` 로그**가 표시됩니다.
+
+**로컬 PC:** `py ai_trading\main_ai.py` 실행 시 터미널 대화형 인증이 동일하게 진행됩니다.
+
+**대안:** `.env`에 `KAKAO_AUTH_CODE=<인가코드>` 1회 설정 후 `systemctl restart coinbot.service` (성공 시 자동 저장·삭제).
+
+**경로 주의:** 토큰은 `btc_live_trading/kakao_code.json` / `.env`에 저장됩니다. 로컬과 서버를 **동시에** 같은 토큰으로 쓰면 마스터 열쇠 회전 충돌이 납니다. 로컬 봇은 `KAKAO_ALERTS_ENABLED=false` 권장.
+
+`KAKAO_REDIRECT_URI`는 카카오 개발자 콘솔 등록값과 **1글자도 다르면 안 됩니다**(KOE205/KOE006).
+
+알림만 끄려면 `.env`에 `KAKAO_ALERTS_ENABLED=false` (게이트 우회, 매매만 진행).
 
 ## 전략 요약 및 아키텍처 (15m 추세 매매)
 
