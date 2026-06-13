@@ -1,0 +1,26 @@
+mode: PAPER
+
+exchange:
+  name: binance
+  symbol: BTCUSDT
+  timeframe: 4h
+  leverage: 1
+
+risk:
+  risk_per_trade: 0.01
+  daily_loss_limit: 0.03
+  max_consecutive_losses: 5
+
+strategy:
+  ema_period: 200
+  atr_period: 14
+  atr_multiplier: 1.0
+  atr_stop: 2.0
+  pivot_length: 5
+
+kakao:
+  enabled: true
+
+telegram:
+  enabled: false
+

@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../cursor_coin_test"
+		},
+		{
+			"path": "../cursor_coin/btc_live_trading"
+		}
+	],
+	"settings": {}
+}

@@ -1,0 +1,59 @@
+2026-06-13 23:14:05 [INFO] __main__: ============================================================
+2026-06-13 23:14:05 [INFO] __main__: BTC ATR EMA200 LIVE TRADING START
+2026-06-13 23:14:05 [INFO] __main__: DRY_RUN=True SYMBOL=BTCUSDT INTERVAL=4h
+2026-06-13 23:14:05 [INFO] __main__: ============================================================
+2026-06-13 23:14:05 [WARNING] __main__: 카카오 토큰이 없어 알림을 비활성화합니다.
+2026-06-13 23:14:06 [INFO] exchange.binance_futures: Binance Futures 시간 동기화 완료: offset=-35681ms
+2026-06-13 23:14:06 [INFO] exchange.binance_futures: [DRY RUN] 레버리지 설정 생략: 1x
+2026-06-13 23:14:06 [INFO] execution.engine: 진입 없음: EMA200 또는 ATR breakout 조건 미충족
+2026-06-13 23:14:06 [INFO] scheduler: 다음 점검 시각: 2026-06-14 00:01:00
+2026-06-13 23:16:26 [INFO] __main__: ============================================================
+2026-06-13 23:16:26 [INFO] __main__: BTC ATR EMA200 LIVE TRADING START
+2026-06-13 23:16:26 [INFO] __main__: DRY_RUN=True SYMBOL=BTCUSDT INTERVAL=4h
+2026-06-13 23:16:26 [INFO] __main__: ============================================================
+2026-06-13 23:16:26 [WARNING] __main__: 카카오 토큰이 없어 알림을 비활성화합니다.
+2026-06-13 23:16:26 [INFO] exchange.binance_futures: Binance Futures 시간 동기화 완료: offset=-35675ms
+2026-06-13 23:16:26 [INFO] exchange.binance_futures: [DRY RUN] 레버리지 설정 생략: 1x
+2026-06-13 23:16:26 [INFO] execution.engine: 진입 없음: EMA200 또는 ATR breakout 조건 미충족
+2026-06-13 23:16:26 [INFO] scheduler: 다음 점검 시각: 2026-06-14 00:01:00
+2026-06-13 23:18:29 [INFO] __main__: ============================================================
+2026-06-13 23:18:29 [INFO] __main__: BTC ATR EMA200 LIVE TRADING START
+2026-06-13 23:18:29 [INFO] __main__: DRY_RUN=True SYMBOL=BTCUSDT INTERVAL=4h
+2026-06-13 23:18:29 [INFO] __main__: ============================================================
+2026-06-13 23:18:29 [WARNING] __main__: 카카오 토큰이 없어 알림을 비활성화합니다.
+2026-06-13 23:18:29 [INFO] exchange.binance_futures: Binance Futures 시간 동기화 완료: offset=-35670ms
+2026-06-13 23:18:29 [INFO] exchange.binance_futures: [DRY RUN] 레버리지 설정 생략: 1x
+2026-06-13 23:18:29 [INFO] execution.engine: 진입 없음: EMA200 또는 ATR breakout 조건 미충족
+2026-06-13 23:18:29 [INFO] scheduler: 다음 점검 시각: 2026-06-14 00:01:00
+2026-06-13 23:21:06 [INFO] __main__: ============================================================
+2026-06-13 23:21:06 [INFO] __main__: BTC ATR EMA200 LIVE TRADING START
+2026-06-13 23:21:06 [INFO] __main__: DRY_RUN=True SYMBOL=BTCUSDT INTERVAL=4h
+2026-06-13 23:21:06 [INFO] __main__: ============================================================
+2026-06-13 23:21:07 [INFO] exchange.binance_futures: Binance Futures 시간 동기화 완료: offset=-35663ms
+2026-06-13 23:21:07 [INFO] exchange.binance_futures: [DRY RUN] 레버리지 설정 생략: 1x
+2026-06-13 23:21:07 [ERROR] notification.kakao_notifier: 카카오 토큰 갱신 실패: 400 {"error":"invalid_grant","error_description":"expired_or_invalid_refresh_token","error_code":"KOE322"}
+2026-06-13 23:21:07 [ERROR] notification.kakao_notifier: 카카오 알림 실패: status=401 body={"msg":"no access token.","code":-401}
+2026-06-13 23:21:07 [INFO] execution.engine: 진입 없음: EMA200 또는 ATR breakout 조건 미충족
+2026-06-13 23:21:08 [ERROR] notification.kakao_notifier: 카카오 토큰 갱신 실패: 400 {"error":"invalid_grant","error_description":"expired_or_invalid_refresh_token","error_code":"KOE322"}
+2026-06-13 23:21:08 [ERROR] notification.kakao_notifier: 카카오 알림 실패: status=401 body={"msg":"no access token.","code":-401}
+2026-06-13 23:21:08 [INFO] scheduler: 다음 점검 시각: 2026-06-14 00:01:00
+2026-06-13 23:23:03 [INFO] __main__: ============================================================
+2026-06-13 23:23:03 [INFO] __main__: BTC ATR EMA200 LIVE TRADING START
+2026-06-13 23:23:03 [INFO] __main__: DRY_RUN=True SYMBOL=BTCUSDT INTERVAL=4h
+2026-06-13 23:23:03 [INFO] __main__: ============================================================
+2026-06-13 23:23:03 [INFO] exchange.binance_futures: Binance Futures 시간 동기화 완료: offset=-35659ms
+2026-06-13 23:23:03 [INFO] exchange.binance_futures: [DRY RUN] 레버리지 설정 생략: 1x
+2026-06-13 23:23:04 [ERROR] notification.kakao_notifier: 카카오 토큰 갱신 실패: 400 {"error":"invalid_grant","error_description":"expired_or_invalid_refresh_token","error_code":"KOE322"}
+2026-06-13 23:23:04 [ERROR] notification.kakao_notifier: 카카오 알림 실패: status=401 body={"msg":"no access token.","code":-401}
+2026-06-13 23:23:04 [INFO] execution.engine: 진입 없음: EMA200 또는 ATR breakout 조건 미충족
+2026-06-13 23:23:04 [ERROR] notification.kakao_notifier: 카카오 토큰 갱신 실패: 400 {"error":"invalid_grant","error_description":"expired_or_invalid_refresh_token","error_code":"KOE322"}
+2026-06-13 23:23:04 [ERROR] notification.kakao_notifier: 카카오 알림 실패: status=401 body={"msg":"no access token.","code":-401}
+2026-06-13 23:23:04 [INFO] scheduler: 다음 점검 시각: 2026-06-14 00:01:00
+2026-06-13 23:32:38 [INFO] __main__: ============================================================
+2026-06-13 23:32:38 [INFO] __main__: BTC ATR EMA200 LIVE TRADING START
+2026-06-13 23:32:38 [INFO] __main__: DRY_RUN=True SYMBOL=BTCUSDT INTERVAL=4h
+2026-06-13 23:32:38 [INFO] __main__: ============================================================
+2026-06-13 23:32:38 [INFO] exchange.binance_futures: Binance Futures 시간 동기화 완료: offset=-35633ms
+2026-06-13 23:32:38 [INFO] exchange.binance_futures: [DRY RUN] 레버리지 설정 생략: 1x
+2026-06-13 23:32:39 [INFO] execution.engine: 진입 없음: EMA200 또는 ATR breakout 조건 미충족
+2026-06-13 23:32:40 [INFO] scheduler: 다음 점검 시각: 2026-06-14 00:01:00

@@ -1,0 +1,20 @@
+{
+  "position": {
+    "has_position": false,
+    "entry_time": null,
+    "entry_price": 0.0,
+    "quantity": 0.0,
+    "stop_price": 0.0,
+    "stop_order_id": null,
+    "last_signal_time": null,
+    "last_pivot_low": null,
+    "last_pivot_low_time": null
+  },
+  "safety": {
+    "daily_trades": 0,
+    "daily_realized_loss": 0.0,
+    "consecutive_losses": 0,
+    "cooldown_until": null,
+    "day": "2026-06-13"
+  }
+}

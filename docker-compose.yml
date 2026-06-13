@@ -1,0 +1,14 @@
+services:
+  btc-atr-ema200-live:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: btc-atr-ema200-live
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./state:/app/state
+      - ./database:/app/database
+
