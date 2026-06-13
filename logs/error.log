@@ -1,8 +1,0 @@
-2026-06-13 23:21:07 [ERROR] notification.kakao_notifier: 카카오 토큰 갱신 실패: 400 {"error":"invalid_grant","error_description":"expired_or_invalid_refresh_token","error_code":"KOE322"}
-2026-06-13 23:21:07 [ERROR] notification.kakao_notifier: 카카오 알림 실패: status=401 body={"msg":"no access token.","code":-401}
-2026-06-13 23:21:08 [ERROR] notification.kakao_notifier: 카카오 토큰 갱신 실패: 400 {"error":"invalid_grant","error_description":"expired_or_invalid_refresh_token","error_code":"KOE322"}
-2026-06-13 23:21:08 [ERROR] notification.kakao_notifier: 카카오 알림 실패: status=401 body={"msg":"no access token.","code":-401}
-2026-06-13 23:23:04 [ERROR] notification.kakao_notifier: 카카오 토큰 갱신 실패: 400 {"error":"invalid_grant","error_description":"expired_or_invalid_refresh_token","error_code":"KOE322"}
-2026-06-13 23:23:04 [ERROR] notification.kakao_notifier: 카카오 알림 실패: status=401 body={"msg":"no access token.","code":-401}
-2026-06-13 23:23:04 [ERROR] notification.kakao_notifier: 카카오 토큰 갱신 실패: 400 {"error":"invalid_grant","error_description":"expired_or_invalid_refresh_token","error_code":"KOE322"}
-2026-06-13 23:23:04 [ERROR] notification.kakao_notifier: 카카오 알림 실패: status=401 body={"msg":"no access token.","code":-401}
