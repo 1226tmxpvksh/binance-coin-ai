@@ -107,6 +107,7 @@ try:
         get_redirect_uri as _get_kakao_redirect_uri,
         get_refresh_token as _get_kakao_refresh_token,
         hydrate_tokens_from_json as _hydrate_kakao_tokens,
+        open_kakao_auth_url as _open_kakao_auth_url,
         refresh_access_token_request as _refresh_kakao_access_token_request,
     )
 except Exception:
@@ -118,18 +119,22 @@ except Exception:
     _get_kakao_redirect_uri = None  # type: ignore
     _get_kakao_refresh_token = None  # type: ignore
     _hydrate_kakao_tokens = None  # type: ignore
+    _open_kakao_auth_url = None  # type: ignore
     _refresh_kakao_access_token_request = None  # type: ignore
     get_access_token = None  # type: ignore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
+SINGLE_INSTANCE_LOCK_PATH = ROOT_DIR / ".coinbot.lock"
+_SINGLE_INSTANCE_LOCK_HANDLE: Any | None = None
 ENV_LINE_MAP: Dict[str, int] = {}
 KAKAO_AUTH_LINK_LOGGED = False
 KAKAO_MANUAL_RECOVERY_ATTEMPTED = False
 KAKAO_AUTH_EXHAUSTED = False
 KAKAO_ENV_CODE_TRIED = False
 KAKAO_LOCAL_OAUTH_TRIED = False
+_WINDOWS_KAKAO_WARNED = False
 STARTUP_REPORT_SENT = False
 STARTUP_HEALTH_CHECK_DONE = False
 STARTUP_HEALTH_CHECK_OK = False
@@ -161,6 +166,45 @@ LEARNING_FIELDNAMES = [
     "reflection_summary",
     "warning",
 ]
+
+
+def _acquire_single_instance_lock() -> None:
+    """프로세스 단일 실행 보장(Single Instance Lock).
+
+    Linux(Vultr): fcntl.flock 비차단 독점 락.
+    Windows(로컬): msvcrt.locking 비차단 바이트 락.
+    락 획득 실패 시 카카오·매매 로직 진입 전 즉시 종료한다.
+    """
+    global _SINGLE_INSTANCE_LOCK_HANDLE
+
+    lock_path = SINGLE_INSTANCE_LOCK_PATH
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+", encoding="utf-8")
+    except OSError as exc:
+        logger.error("Single Instance Lock 파일을 열 수 없습니다(%s): %s", lock_path, exc)
+        sys.exit(1)
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        handle.close()
+        logger.error("이미 다른 봇 인스턴스가 실행 중입니다. 다중 실행을 차단하고 종료합니다.")
+        sys.exit(1)
+
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    _SINGLE_INSTANCE_LOCK_HANDLE = handle
 
 
 def _load_env() -> None:
@@ -1010,7 +1054,19 @@ def _try_kakao_auth_code_from_env(rest_api_key: str) -> str:
 
 
 def _kakao_alerts_enabled() -> bool:
-    """KAKAO_ALERTS_ENABLED=false 면 재인증 전까지 카카오 관련 호출·로그를 모두 끔."""
+    """KAKAO_ALERTS_ENABLED=false 면 재인증 전까지 카카오 관련 호출·로그를 모두 끔.
+
+    Windows 로컬(os.name=='nt')에서는 .env 설정과 무관하게 항상 False — 서버 토큰 보호.
+    """
+    global _WINDOWS_KAKAO_WARNED
+    if os.name == "nt":
+        if not _WINDOWS_KAKAO_WARNED:
+            logger.warning(
+                "Windows 로컬 PC — 카카오 전 기능 비활성(서버 토큰 Family Revocation 방지). "
+                "인증·알림은 Vultr에서 bash ~/Coin/scripts/coinbot_watch.sh 로만 하세요."
+            )
+            _WINDOWS_KAKAO_WARNED = True
+        return False
     return _env_bool("KAKAO_ALERTS_ENABLED", True)
 
 
@@ -1044,12 +1100,15 @@ def _interactive_kakao_auth_until_done(rest_api_key: str) -> str:
     print("2) 이동된 주소창의 전체 URL(또는 code= 뒤 값)을 아래에 붙여넣으세요.")
     print("   인증 없이 건너뛰려면 'skip' 입력 (매매는 차단된 상태로 유지됩니다)")
     print("=" * 72)
-    try:
-        import webbrowser
+    if _open_kakao_auth_url is not None:
+        _open_kakao_auth_url(auth_url)
+    else:
+        try:
+            import webbrowser
 
-        webbrowser.open(auth_url)
-    except Exception:
-        pass
+            webbrowser.open(auth_url)
+        except Exception:
+            pass
 
     while True:
         try:
@@ -1545,7 +1604,39 @@ def _append_learning_entry(entry: Dict[str, str]) -> Tuple[bool, float]:
             writer.writeheader()
         writer.writerow(entry)
     _invalidate_learning_rows_cache()
+    cap = _learning_log_max_rows()
+    try:
+        with open(LEARNING_LOG_PATH, "r", encoding="utf-8-sig", newline="") as f:
+            row_count = sum(1 for _ in csv.DictReader(f))
+        if row_count > int(cap * 1.1):
+            _prune_learning_log(cap)
+    except OSError:
+        pass
     return True, best_ratio
+
+
+def _prune_learning_log(max_rows: int | None = None) -> int:
+    """ai_learning_logs.csv 꼬리만 유지(오래된 행 삭제). 반환: 삭제한 행 수."""
+    if not LEARNING_LOG_PATH.exists():
+        return 0
+    cap = max_rows if max_rows is not None else _learning_log_max_rows()
+    try:
+        with open(LEARNING_LOG_PATH, "r", encoding="utf-8-sig", newline="") as f:
+            rows = [row for row in csv.DictReader(f) if row]
+    except OSError:
+        return 0
+    if len(rows) <= cap:
+        return 0
+    keep = rows[-cap:]
+    try:
+        with open(LEARNING_LOG_PATH, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=LEARNING_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(keep)
+    except OSError:
+        return 0
+    _invalidate_learning_rows_cache()
+    return len(rows) - len(keep)
 
 
 def _trade_log_max_lines() -> int:
@@ -2738,6 +2829,7 @@ def run_forever() -> None:
     install_shutdown_handlers()
     prune_stats_history()
     _prune_trade_log()
+    _prune_learning_log()
     try:
         _bootstrap_kakao_tokens()
     except Exception as exc:
@@ -2777,10 +2869,12 @@ def run_forever() -> None:
 
 
 if __name__ == "__main__":
+    _acquire_single_instance_lock()
     _load_env()
     install_shutdown_handlers()
     prune_stats_history()
     _prune_trade_log()
+    _prune_learning_log()
     try:
         _bootstrap_kakao_tokens()
     except Exception as _exc:

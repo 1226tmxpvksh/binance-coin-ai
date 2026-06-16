@@ -6,6 +6,7 @@
 import logging
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from binance.client import Client
 
 import config as config_original
@@ -23,7 +24,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('strategy_comparison.log', encoding='utf-8')
+        RotatingFileHandler(
+            'strategy_comparison.log', maxBytes=512 * 1024, backupCount=2, encoding='utf-8'
+        )
     ]
 )
 

@@ -27,11 +27,14 @@ from kakao_utils import (  # noqa: E402
     get_access_token,
     get_refresh_token,
     hydrate_tokens_from_json,
+    is_windows_local_host,
     refresh_access_token_request,
 )
 
 
 def _alerts_enabled() -> bool:
+    if is_windows_local_host():
+        return False
     return os.getenv("KAKAO_ALERTS_ENABLED", "true").strip().lower() not in {
         "0",
         "false",

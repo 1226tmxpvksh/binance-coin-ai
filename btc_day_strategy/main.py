@@ -6,6 +6,7 @@
 import logging
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 import config
 from data_loader import fetch_historical_data, validate_data
@@ -21,7 +22,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('backtest.log', encoding='utf-8')
+        RotatingFileHandler(
+            'backtest.log', maxBytes=512 * 1024, backupCount=2, encoding='utf-8'
+        )
     ]
 )
 

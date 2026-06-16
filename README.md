@@ -25,6 +25,16 @@
 
 카카오 액세스 토큰은 발급 후 약 **6시간**이면 만료되므로, 봇은 `refresh_token`으로 자동 갱신합니다. 갱신 로직과 저장소는 모두 `btc_live_trading/` 안에 있습니다.
 
+### 다중 실행·로컬 PC 차단 (Family Revocation 방지)
+
+| 위험 | 대응 |
+|------|------|
+| **서버에 `main_ai.py`가 여러 개** 동시 실행 | `_acquire_single_instance_lock()` — 프로젝트 루트 `.coinbot.lock`에 `fcntl`(Linux) / `msvcrt`(Windows) 독점 락. 두 번째 인스턴스는 카카오 API 호출 전 `sys.exit(1)` |
+| **로컬 Windows + Vultr 서버**가 같은 토큰 공유 | `os.name=='nt'`이면 `_kakao_alerts_enabled()`가 **무조건 False** — 인증·갱신·알림·토큰 저장 전면 차단 (`kakao_api_allowed()`) |
+| **Windows `webbrowser.open`** | 바탕화면 `.url` 바로가기 생성 방지 — `open_kakao_auth_url()`은 Windows에서 URL만 출력 |
+
+서버에서 좀비 프로세스 확인: `pgrep -af main_ai.py` → `systemctl stop coinbot.service` 후 재시작.
+
 ### 자동 갱신 동작 방식
 
 - **토큰 저장 위치**: `btc_live_trading/kakao_code.json`(access/refresh) + `btc_live_trading/.env`. 두 곳이 항상 동기화됩니다.
@@ -81,11 +91,11 @@ bash ~/Coin/scripts/coinbot_watch.sh
 2. PC 브라우저에서 URL 열고 로그인 → 이동된 주소창 전체 URL(또는 `code=` 뒤 값) 붙여넣기.
 3. `[OK] 카카오 토큰 저장 완료` 확인 → 서비스 자동 재시작 → **이어서 `journalctl -f` 로그**가 표시됩니다.
 
-**로컬 PC:** `py ai_trading\main_ai.py` 실행 시 터미널 대화형 인증이 동일하게 진행됩니다.
+**로컬 PC (Windows):** 카카오는 **코드가 자동으로 전부 끕니다.** 로컬에서 `main_ai.py`를 켜도 서버 토큰은 건드리지 않습니다. 카카오 인증은 **Vultr SSH**에서만 `bash ~/Coin/scripts/coinbot_watch.sh`.
 
 **대안:** `.env`에 `KAKAO_AUTH_CODE=<인가코드>` 1회 설정 후 `systemctl restart coinbot.service` (성공 시 자동 저장·삭제).
 
-**경로 주의:** 토큰은 `btc_live_trading/kakao_code.json` / `.env`에 저장됩니다. 로컬과 서버를 **동시에** 같은 토큰으로 쓰면 마스터 열쇠 회전 충돌이 납니다. 로컬 봇은 `KAKAO_ALERTS_ENABLED=false` 권장.
+**경로 주의:** 토큰은 `btc_live_trading/kakao_code.json` / `.env`에 저장됩니다. 인증·갱신은 **서버에서만** 하세요.
 
 `KAKAO_REDIRECT_URI`는 카카오 개발자 콘솔 등록값과 **1글자도 다르면 안 됩니다**(KOE205/KOE006).
 

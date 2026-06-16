@@ -10,6 +10,7 @@ README2.md 기준 전략 백테스트 실행 스크립트
 import logging
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import Dict, Any
 
 from binance.client import Client
@@ -28,7 +29,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('readme2_backtest.log', encoding='utf-8')
+        RotatingFileHandler(
+            'readme2_backtest.log', maxBytes=512 * 1024, backupCount=2, encoding='utf-8'
+        )
     ]
 )
 

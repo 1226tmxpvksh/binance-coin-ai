@@ -153,6 +153,19 @@ py -3 ai_trading\main_ai.py
 연결 확인: btc_day_strategy 전략 로드 완료
 ```
 
+### 단일 실행 (Single Instance Lock)
+
+- `__main__` 진입 직후 `_acquire_single_instance_lock()` — 프로젝트 루트 `Coin/.coinbot.lock` 독점.
+- Linux: `fcntl.flock(LOCK_EX|LOCK_NB)` / Windows: `msvcrt.locking(LK_NBLCK)`.
+- 이미 다른 인스턴스가 락을 쥐면 ERROR 로그 후 `sys.exit(1)` (**카카오 부트스트랩 전**).
+- 서버에서 `pgrep -af main_ai.py`로 1프로세스만 떠 있는지 확인.
+
+### Windows 로컬 PC
+
+- `os.name=='nt'`이면 카카오 인증·갱신·알림·토큰 저장 **전부 자동 차단** (`.env`의 `KAKAO_ALERTS_ENABLED=true`여도 무시).
+- 로컬에서 코드 테스트해도 Vultr 서버 토큰(Family Revocation)은 보호됨.
+- 카카오 인증은 서버 SSH → `bash ~/Coin/scripts/coinbot_watch.sh`만 사용.
+
 ## 운영 및 모니터링
 
 매 루프가 끝날 때마다 콘솔 로그는 **구조화된 대시보드 형태**로 출력됩니다. 원시 JSON(`json.dumps`) 대신, AI 판단·시장 지표·잔고·보유 포지션을 구역별로 나눈 텍스트 블록입니다.
@@ -255,15 +268,17 @@ py -3 scripts\emergency_exit.py
 
 운영 중 카카오 알림이 실패해도 위 로컬 데이터 파일은 계속 저장됩니다.
 
-- **학습 CSV 부하 완화**: 동일 사이클·파일 mtime 불변 시 재파싱 생략. 행 수는 `AI_LEARNING_LOG_MAX_ROWS`(기본 5000) 초과 시 **최근 행만** 유지합니다.
+- **학습 CSV 부하 완화**: 동일 사이클·파일 mtime 불변 시 재파싱 생략. 행 수는 `AI_LEARNING_LOG_MAX_ROWS`(기본 5000) 초과 시 **최근 행만** 유지 (`_prune_learning_log`, 기동 시 + append 시 110% 초과 트림).
 
 ## 변경·통합 이력 (실전 최적화)
 
 | 구분 | 내용 |
 |------|------|
 | Binance 잔고 API | `main_ai`의 직접 `Client` 생성 제거 → `binance_futures_tools.fetch_futures_usdt_balance_from_env` 단일화 (`futures_wallet_usdt_balance`) |
-| 학습 로그 | `_load_learning_rows` mtime 캐시 + 꼬리 행 제한 + append 후 캐시 무효화 |
+| 학습 로그 | `_load_learning_rows` mtime 캐시 + `_prune_learning_log` 디스크 트림 + append 후 캐시 무효화 |
 | 거래 로그 회전 | `virtual_trades.jsonl`은 `AI_TRADE_LOG_MAX_LINES`(기본 2000) 초과 시 오래된 라인 자동 삭제 |
+| 단일 실행 | `.coinbot.lock` + `fcntl`/`msvcrt` — 다중 `main_ai` Race Condition·토큰 몰살 방지 |
+| Windows 카카오 | `kakao_api_allowed()` / `_kakao_alerts_enabled()` — 로컬 PC에서 서버 토큰 보호 |
 | 레거시 제거 | `btc_live_trading`의 `main_live`·스캘핑·`order_executor` 등 미사용 실전 엔진 일체 삭제, `ai_decisions.log`·`live_trading.log` 제거 |
 | 문서 | 저장소 루트 `README.md` 추가, 본 파일에 구조·실전 기준 정리 |
 

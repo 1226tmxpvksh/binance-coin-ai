@@ -1,7 +1,8 @@
-# 환경변수 및 민감한 정보
+# 환경변수 및 민감한 정보 (절대 커밋 금지)
 .env
 *.env
 !.env.example
+btc_live_trading/kakao_code.json
 
 # Python
 __pycache__/
@@ -47,12 +48,24 @@ logs/
 # 백업 파일
 *.bak
 *.backup
-*~
 
-# 거래 데이터
+# AI 매매 런타임 데이터 (PC·서버마다 다름 — Git 제외)
+ai_trading/data/trading_stats.json
+ai_trading/data/virtual_trades.jsonl
+ai_trading/data/history/
+ai_trading/data/*.csv
+ai_trading/data/ai_learning_logs.csv
+
+# 백테스트 산출물 (재생성 가능)
+btc_day_strategy/output/
+btc_day_strategy/*.log
+
+# 레거시 거래 데이터
 trades.json
 positions.json
-*.csv
+
+# 봇 단일 실행 락 (실행 시 자동 생성)
+.coinbot.lock
 
 # 임시 파일
 tmp/

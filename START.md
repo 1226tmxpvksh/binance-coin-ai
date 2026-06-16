@@ -17,9 +17,12 @@ WinSCP에서 **수정한 파일만** `/home/bot2/Coin/` 아래 같은 경로로 
 SSH (root):
 
 ```bash
+pgrep -af main_ai.py          # 좀비 프로세스 있으면 stop 후 재시작
 systemctl restart coinbot.service
 journalctl -u coinbot.service -f
 ```
+
+`.coinbot.lock` 덕분에 `main_ai.py`가 2개 이상 떠 있으면 두 번째는 즉시 종료됩니다. 그래도 `pgrep`으로 1개만 남았는지 확인하세요.
 
 `카카오톡 메시지 전송 성공` / 매매 로그가 보이면 끝.  
 로그만 끊을 때: `Ctrl+C` (봇은 계속 실행)
@@ -81,6 +84,7 @@ sed -i 's/\r$//' /home/bot2/Coin/scripts/coinbot_watch.sh
 | `No module named 'dotenv'` | `source ~/venv/bin/activate` 후 다시 실행 |
 | `bot2 is not in the sudoers` | 재시작은 **root**에서 `systemctl restart` |
 | `$'\r': command not found` | §3 `sed` 실행 |
+| `main_ai.py`가 여러 개 실행됨 | `pgrep -af main_ai.py` → `systemctl stop coinbot.service` → 재시작 (Single Instance Lock 적용 후에도 좀비는 수동 정리) |
 
 ---
 

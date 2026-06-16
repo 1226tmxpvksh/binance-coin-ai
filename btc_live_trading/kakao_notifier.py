@@ -17,6 +17,7 @@ from kakao_utils import (
     get_redirect_uri,
     get_refresh_token,
     hydrate_tokens_from_json,
+    kakao_api_allowed,
     refresh_access_token_request,
 )
 
@@ -107,6 +108,10 @@ class KakaoNotifier:
         """
         if not self.enabled:
             logger.debug("카카오톡 알림이 비활성화되어 있습니다")
+            return False
+
+        if not kakao_api_allowed():
+            logger.debug("Windows 로컬 — 카카오 메시지 전송 차단")
             return False
         
         if not self.access_token:

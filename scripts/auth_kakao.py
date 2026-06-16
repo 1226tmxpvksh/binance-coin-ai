@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import webbrowser
 from pathlib import Path
 from urllib.parse import quote
 
@@ -39,6 +38,8 @@ from kakao_utils import (  # noqa: E402
     clear_kakao_auth_code,
     exchange_authorization_code,
     get_redirect_uri,
+    kakao_api_allowed,
+    open_kakao_auth_url,
 )
 
 
@@ -71,6 +72,14 @@ def _extract_code(raw: str) -> str:
 
 
 def main() -> None:
+    if not kakao_api_allowed():
+        print(
+            "오류: Windows 로컬 PC에서는 카카오 인증을 실행할 수 없습니다.\n"
+            "서버 토큰 보호를 위해 Vultr에서 bash ~/Coin/scripts/coinbot_watch.sh 를 사용하세요.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     parser = argparse.ArgumentParser(description="Kakao OAuth: authorization code → tokens")
     parser.add_argument("--code", default="", help="인가 코드 (생략 시 입력 프롬프트)")
     parser.add_argument(
@@ -116,16 +125,13 @@ def main() -> None:
         url = _auth_url(client_id, redirect_uri)
         if url:
             print("=" * 70)
-            print("[1단계] 아래 URL을 브라우저에서 여세요(자동으로 열립니다):")
+            print("[1단계] 아래 URL을 브라우저에서 여세요:")
             print(url)
             print("-" * 70)
             print("[2단계] 로그인 후 이동된 주소창의 전체 URL(또는 code= 뒤 값)을 붙여넣으세요.")
             print("=" * 70)
             if sys.stdin.isatty() and not args.no_browser:
-                try:
-                    webbrowser.open(url)
-                except Exception:
-                    pass
+                open_kakao_auth_url(url)
         if not sys.stdin.isatty():
             print('비대화형 환경: py -3 scripts/auth_kakao.py --code "<인가코드>" 로 실행하세요.', file=sys.stderr)
             sys.exit(2)
