@@ -74,8 +74,9 @@ def _extract_code(raw: str) -> str:
 def main() -> None:
     if not kakao_api_allowed():
         print(
-            "오류: Windows 로컬 PC에서는 카카오 인증을 실행할 수 없습니다.\n"
-            "서버 토큰 보호를 위해 Vultr에서 bash ~/Coin/scripts/coinbot_watch.sh 를 사용하세요.",
+            "오류: 환경 화이트리스트 불일치 — 카카오 인증은 hostname=example1, "
+            "project=/home/bot2/Coin 에서만 실행할 수 있습니다.\n"
+            "Vultr에서 bash ~/Coin/scripts/coinbot_watch.sh 를 사용하세요.",
             file=sys.stderr,
         )
         sys.exit(2)

@@ -107,8 +107,11 @@ try:
         get_redirect_uri as _get_kakao_redirect_uri,
         get_refresh_token as _get_kakao_refresh_token,
         hydrate_tokens_from_json as _hydrate_kakao_tokens,
+        kakao_api_allowed as _kakao_api_allowed,
         open_kakao_auth_url as _open_kakao_auth_url,
+        refresh_kakao_access_token_sync as _refresh_kakao_access_token_sync,
         refresh_access_token_request as _refresh_kakao_access_token_request,
+        validate_access_token as _validate_kakao_access_token_util,
     )
 except Exception:
     KakaoNotifier = None
@@ -119,8 +122,11 @@ except Exception:
     _get_kakao_redirect_uri = None  # type: ignore
     _get_kakao_refresh_token = None  # type: ignore
     _hydrate_kakao_tokens = None  # type: ignore
+    _kakao_api_allowed = None  # type: ignore
     _open_kakao_auth_url = None  # type: ignore
+    _refresh_kakao_access_token_sync = None  # type: ignore
     _refresh_kakao_access_token_request = None  # type: ignore
+    _validate_kakao_access_token_util = None  # type: ignore
     get_access_token = None  # type: ignore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -134,14 +140,17 @@ KAKAO_MANUAL_RECOVERY_ATTEMPTED = False
 KAKAO_AUTH_EXHAUSTED = False
 KAKAO_ENV_CODE_TRIED = False
 KAKAO_LOCAL_OAUTH_TRIED = False
-_WINDOWS_KAKAO_WARNED = False
+_KAKAO_ENV_WARNED = False
 STARTUP_REPORT_SENT = False
 STARTUP_HEALTH_CHECK_DONE = False
 STARTUP_HEALTH_CHECK_OK = False
 # 재진입 허용: run_cycle이 락을 잡은 상태에서 Ctrl+C(SIGINT) 시 같은 스레드가 시그널 핸들러로
 # 다시 락을 요청하면 threading.Lock은 자기 자신에게 데드락이 난다(RLock 필요).
 _SHUTDOWN_LOCK = threading.RLock()
+_CYCLE_LOCK = threading.Lock()
 _GRACEFUL_SHUTDOWN_ONCE = threading.Event()
+_TRADING_LOOP_INITIALIZED = False
+_ORDER_EXECUTION_SETUP_LOGGED = False
 _ORPHAN_POSITION_ALERT_SENT = False
 _SIGNAL_HANDLERS_INSTALLED = False
 _LEARNING_ROWS_CACHE_MTIME: float | None = None
@@ -393,6 +402,9 @@ def _report_bracket_title(dry_run: bool) -> str:
 
 def _log_order_execution_setup(dry_run: bool) -> None:
     """`AI_DRY_RUN` 환경값과 실제 주문 함수 바인딩 여부를 함께 로깅한다."""
+    global _ORDER_EXECUTION_SETUP_LOGGED
+    if _ORDER_EXECUTION_SETUP_LOGGED:
+        return
     raw = os.getenv("AI_DRY_RUN", "")
     path = "PAPER_LEDGER_ONLY" if dry_run else "BINANCE_FUTURES_MARKET"
     api_ready = (
@@ -413,6 +425,7 @@ def _log_order_execution_setup(dry_run: bool) -> None:
             "[주문실행기] 실전으로 표시됐으나 Binance 선물 진입/청산 모듈을 쓸 수 없습니다. "
             "의존 패키지·API 키·import 경로를 확인하세요."
         )
+    _ORDER_EXECUTION_SETUP_LOGGED = True
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1056,16 +1069,26 @@ def _try_kakao_auth_code_from_env(rest_api_key: str) -> str:
 def _kakao_alerts_enabled() -> bool:
     """KAKAO_ALERTS_ENABLED=false 면 재인증 전까지 카카오 관련 호출·로그를 모두 끔.
 
-    Windows 로컬(os.name=='nt')에서는 .env 설정과 무관하게 항상 False — 서버 토큰 보호.
+    환경 화이트리스트(hostname=example1, project=/home/bot2/Coin) 불일치 시
+    .env 설정과 무관하게 항상 False — 유령 봇·WSL·백업 폴더 차단.
     """
-    global _WINDOWS_KAKAO_WARNED
-    if os.name == "nt":
-        if not _WINDOWS_KAKAO_WARNED:
+    global _KAKAO_ENV_WARNED
+    if _kakao_api_allowed is not None and not _kakao_api_allowed():
+        if not _KAKAO_ENV_WARNED:
             logger.warning(
-                "Windows 로컬 PC — 카카오 전 기능 비활성(서버 토큰 Family Revocation 방지). "
+                "카카오 환경 화이트리스트 불일치 — 카카오 전 기능 비활성. "
+                "hostname=example1, project=/home/bot2/Coin 에서만 허용. "
+                "인증: bash ~/Coin/scripts/coinbot_watch.sh"
+            )
+            _KAKAO_ENV_WARNED = True
+        return False
+    if _kakao_api_allowed is None and os.name == "nt":
+        if not _KAKAO_ENV_WARNED:
+            logger.warning(
+                "Windows 로컬 PC — 카카오 전 기능 비활성. "
                 "인증·알림은 Vultr에서 bash ~/Coin/scripts/coinbot_watch.sh 로만 하세요."
             )
-            _WINDOWS_KAKAO_WARNED = True
+            _KAKAO_ENV_WARNED = True
         return False
     return _env_bool("KAKAO_ALERTS_ENABLED", True)
 
@@ -1217,20 +1240,12 @@ def _refresh_kakao_access_token(
     *,
     mark_exhausted_on_expire: bool = True,
 ) -> str:
-    if (
-        _refresh_kakao_access_token_request is None
-        or _apply_kakao_token_response is None
-        or not refresh_token
-        or not rest_api_key
-    ):
+    if not refresh_token or not rest_api_key or _refresh_kakao_access_token_sync is None:
         return ""
     try:
-        token_data = _refresh_kakao_access_token_request(rest_api_key, refresh_token)
-        access_token = str(token_data.get("access_token") or "").strip()
+        access_token = _refresh_kakao_access_token_sync(rest_api_key, refresh_token).strip()
         if access_token:
-            _apply_kakao_token_response(token_data)
             _clear_kakao_auth_exhausted()
-            logger.info("카카오 액세스 토큰 자동 갱신 완료")
         return access_token
     except Exception as exc:
         error_code, error_description = _extract_kakao_error(exc)
@@ -2535,16 +2550,25 @@ def _run_weekend_monitor_cycle(
 
 
 def run_cycle() -> Dict[str, Any]:
-    with _SHUTDOWN_LOCK:
-        return _run_cycle_impl()
+    if not _CYCLE_LOCK.acquire(blocking=False):
+        logger.warning("이전 매매 사이클이 아직 실행 중 — 중복 [AI 매매 판단] 실행을 건너뜁니다.")
+        return {
+            "decision": "HOLD",
+            "reason": "이전 사이클 실행 중 — 중복 스케줄 건너뜀",
+            "confidence": 1.0,
+            "cycle_skipped": True,
+        }
+    try:
+        with _SHUTDOWN_LOCK:
+            return _run_cycle_impl()
+    finally:
+        _CYCLE_LOCK.release()
 
 
 def _run_cycle_impl() -> Dict[str, Any]:
     _load_env()
-    _bootstrap_kakao_tokens()
     if _hydrate_kakao_tokens is not None:
         _hydrate_kakao_tokens()
-    _check_project_connectivity()
     if calculate_position_size is None:
         raise RuntimeError("btc_live_trading.strategy.risk_manager 모듈을 로드할 수 없습니다.") from _POSITION_SIZE_IMPORT_ERROR
 
@@ -2824,21 +2848,36 @@ def run_once() -> Dict[str, Any]:
     return run_cycle()
 
 
-def run_forever() -> None:
+def _initialize_trading_loop_once(*, send_startup_report: bool = True) -> None:
+    """프로세스당 1회만: env·핸들러·카카오 부트스트랩·연결 점검·시작 보고.
+
+    run_forever / __main__ 양쪽에서 호출해도 Job·초기화가 중복 등록되지 않는다.
+    """
+    global _TRADING_LOOP_INITIALIZED
+    if _TRADING_LOOP_INITIALIZED:
+        return
+
     _load_env()
     install_shutdown_handlers()
     prune_stats_history()
     _prune_trade_log()
     _prune_learning_log()
+    _check_project_connectivity()
     try:
         _bootstrap_kakao_tokens()
     except Exception as exc:
         logger.error("카카오 토큰 부트스트랩 실패(매매는 계속 진행): %s", type(exc).__name__)
+    if send_startup_report:
+        try:
+            _send_startup_report()
+        except Exception as exc:
+            logger.error("운영 시작 보고 실패(매매는 계속 진행): %s", type(exc).__name__)
+    _TRADING_LOOP_INITIALIZED = True
+
+
+def run_forever() -> None:
+    _initialize_trading_loop_once()
     loop_seconds = max(30, _env_int("AI_LOOP_SECONDS", 300))
-    try:
-        _send_startup_report()
-    except Exception as exc:
-        logger.error("운영 시작 보고 실패(매매는 계속 진행): %s", type(exc).__name__)
     while True:
         cycle_started = time.time()
         try:
@@ -2851,7 +2890,8 @@ def run_forever() -> None:
                 )
             else:
                 result = run_cycle()
-                print(_format_cycle_dashboard(result))
+                if not result.get("cycle_skipped"):
+                    print(_format_cycle_dashboard(result))
         except KeyboardInterrupt:
             try:
                 with _SHUTDOWN_LOCK:
@@ -2870,20 +2910,7 @@ def run_forever() -> None:
 
 if __name__ == "__main__":
     _acquire_single_instance_lock()
-    _load_env()
-    install_shutdown_handlers()
-    prune_stats_history()
-    _prune_trade_log()
-    _prune_learning_log()
-    try:
-        _bootstrap_kakao_tokens()
-    except Exception as _exc:
-        logger.error("카카오 토큰 부트스트랩 실패(매매는 계속 진행): %s", type(_exc).__name__)
-    _check_project_connectivity()
-    try:
-        _send_startup_report()
-    except Exception as _exc:
-        logger.error("운영 시작 보고 실패(매매는 계속 진행): %s", type(_exc).__name__)
+    _initialize_trading_loop_once()
     if _env_bool("AI_RUN_ONCE", False):
         try:
             if not _kakao_auth_ready():

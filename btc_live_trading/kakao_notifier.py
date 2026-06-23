@@ -18,7 +18,7 @@ from kakao_utils import (
     get_refresh_token,
     hydrate_tokens_from_json,
     kakao_api_allowed,
-    refresh_access_token_request,
+    refresh_kakao_access_token_sync,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ class KakaoNotifier:
             return False
 
         if not kakao_api_allowed():
-            logger.debug("Windows 로컬 — 카카오 메시지 전송 차단")
+            logger.debug("환경 화이트리스트 불일치 — 카카오 메시지 전송 차단")
             return False
         
         if not self.access_token:
@@ -277,12 +277,9 @@ class KakaoNotifier:
             logger.error("KAKAO_REST_API_KEY가 없어 토큰을 갱신할 수 없습니다.")
             return None
         try:
-            token_data = refresh_access_token_request(self.rest_api_key, refresh_token)
-            access_token = token_data.get("access_token")
-            if token_data.get("refresh_token"):
-                logger.info("새 리프레시 토큰도 발급되었습니다 (자동 저장됨)")
+            access_token = refresh_kakao_access_token_sync(self.rest_api_key, refresh_token)
             if access_token:
-                apply_token_response(token_data)
+                self.access_token = access_token
             return access_token
         except Exception as e:
             error_code, error_description = _response_error_payload(e)

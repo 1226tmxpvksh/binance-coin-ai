@@ -10,7 +10,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -18,28 +20,74 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_WINDOWS_KAKAO_BLOCK_LOGGED = False
+_KAKAO_REFRESH_LOCK = threading.Lock()
+
+# 작업 디렉터리(CWD)와 무관하게 항상 같은 파일을 읽고 쓰도록 절대경로로 고정한다.
+_MODULE_DIR = Path(os.path.abspath(os.path.dirname(__file__)))
+KAKAO_CODE_JSON = Path(os.path.abspath(_MODULE_DIR / "kakao_code.json"))
+DEFAULT_REDIRECT_URI = "https://example.com/oauth"
+LOCALHOST_REDIRECT_URI = "http://127.0.0.1:8765/oauth"
+
+# 정품 Vultr 운영 환경만 카카오 API 허용 (유령 봇·WSL·백업 폴더 차단)
+ALLOWED_KAKAO_HOSTNAME = (os.getenv("KAKAO_ALLOWED_HOSTNAME") or "example1").strip()
+ALLOWED_KAKAO_PROJECT_ROOT = (
+    (os.getenv("KAKAO_ALLOWED_PROJECT_ROOT") or "/home/bot2/Coin").strip().rstrip("/")
+)
+
+
+def _normalize_project_path(path: str) -> str:
+    return os.path.realpath(path).replace("\\", "/").rstrip("/")
+
+_KAKAO_ENV_BLOCK_LOGGED = False
+
+
+def get_project_root() -> Path:
+    """btc_live_trading 상위 = Coin 프로젝트 루트 (CWD 무관)."""
+    return Path(os.path.realpath(str(_MODULE_DIR.parent)))
 
 
 def is_windows_local_host() -> bool:
-    """로컬 Windows PC 여부 (Vultr Linux 서버와 구분)."""
+    """로컬 Windows PC 여부 (webbrowser.open 바탕화면 .url 방지용)."""
     return os.name == "nt"
 
 
-def kakao_api_allowed() -> bool:
-    """카카오 API 호출·토큰 저장 허용 여부. Windows 로컬에서는 항상 False."""
-    return not is_windows_local_host()
-
-
-def _log_windows_kakao_block_once(action: str) -> None:
-    global _WINDOWS_KAKAO_BLOCK_LOGGED
-    if not _WINDOWS_KAKAO_BLOCK_LOGGED:
-        logger.warning(
-            "Windows 로컬 환경 — 카카오 %s 차단(서버 토큰 Family Revocation 방지). "
-            "인증·알림은 Vultr 서버에서만 실행하세요.",
-            action,
+def kakao_env_block_reason() -> str:
+    """화이트리스트 불일치 사유(로그용). 일치하면 빈 문자열."""
+    hostname = socket.gethostname().strip()
+    project_root = _normalize_project_path(str(get_project_root()))
+    allowed_root = ALLOWED_KAKAO_PROJECT_ROOT.replace("\\", "/")
+    reasons: list[str] = []
+    if hostname != ALLOWED_KAKAO_HOSTNAME:
+        reasons.append(f"hostname={hostname!r} (허용: {ALLOWED_KAKAO_HOSTNAME!r})")
+    if project_root != allowed_root:
+        reasons.append(
+            f"project_root={project_root!r} (허용: {allowed_root!r})"
         )
-        _WINDOWS_KAKAO_BLOCK_LOGGED = True
+    return "; ".join(reasons)
+
+
+def is_kakao_whitelisted_environment() -> bool:
+    """hostname==example1 이고 프로젝트 루트==/home/bot2/Coin 일 때만 True."""
+    return not kakao_env_block_reason()
+
+
+def kakao_api_allowed() -> bool:
+    """카카오 API 호출·토큰 저장 허용 여부. 정품 서버·정품 경로에서만 True."""
+    return is_kakao_whitelisted_environment()
+
+
+def _log_kakao_env_block_once(action: str) -> None:
+    global _KAKAO_ENV_BLOCK_LOGGED
+    if not _KAKAO_ENV_BLOCK_LOGGED:
+        reason = kakao_env_block_reason() or "환경 불일치"
+        logger.warning(
+            "카카오 %s 차단(환경 화이트리스트) — %s. "
+            "hostname=%s, project=/home/bot2/Coin 에서만 허용.",
+            action,
+            reason,
+            ALLOWED_KAKAO_HOSTNAME,
+        )
+        _KAKAO_ENV_BLOCK_LOGGED = True
 
 
 def open_kakao_auth_url(url: str, *, open_browser: bool = True) -> None:
@@ -58,13 +106,6 @@ def open_kakao_auth_url(url: str, *, open_browser: bool = True) -> None:
         webbrowser.open(url)
     except Exception as exc:
         logger.warning("브라우저 자동 열기 실패: %s", exc)
-
-
-# 작업 디렉터리(CWD)와 무관하게 항상 같은 파일을 읽고 쓰도록 절대경로로 고정한다.
-_MODULE_DIR = Path(os.path.abspath(os.path.dirname(__file__)))
-KAKAO_CODE_JSON = Path(os.path.abspath(_MODULE_DIR / "kakao_code.json"))
-DEFAULT_REDIRECT_URI = "https://example.com/oauth"
-LOCALHOST_REDIRECT_URI = "http://127.0.0.1:8765/oauth"
 
 
 def get_kakao_json_path() -> Path:
@@ -244,7 +285,7 @@ def persist_kakao_tokens(access_token: str, refresh_token: Optional[str] = None)
     반환값: refresh_token 저장·검증 성공 여부(다음 갱신을 보장하는 핵심 지표).
     """
     if not kakao_api_allowed():
-        _log_windows_kakao_block_once("토큰 저장")
+        _log_kakao_env_block_once("토큰 저장")
         return False
     ja, jr_file = _read_json_tokens()
     prev_refresh = (os.getenv("KAKAO_REFRESH_TOKEN", "").strip() or jr_file).strip()
@@ -346,10 +387,11 @@ def exchange_authorization_code(
     code: str,
 ) -> Dict[str, Any]:
     if not kakao_api_allowed():
-        _log_windows_kakao_block_once("인가 코드 교환")
+        _log_kakao_env_block_once("인가 코드 교환")
         raise RuntimeError(
-            "Windows 로컬에서는 카카오 OAuth를 실행할 수 없습니다. "
-            "Vultr 서버에서 bash ~/Coin/scripts/coinbot_watch.sh 를 사용하세요."
+            "환경 화이트리스트 불일치 — 카카오 OAuth는 hostname=example1, "
+            "project=/home/bot2/Coin 에서만 실행할 수 있습니다. "
+            "Vultr에서 bash ~/Coin/scripts/coinbot_watch.sh 를 사용하세요."
         )
     token_url = "https://kauth.kakao.com/oauth/token"
     data = {
@@ -387,10 +429,11 @@ def capture_authorization_code_via_localhost(
     from urllib.parse import parse_qs, quote, urlparse
 
     if not kakao_api_allowed():
-        _log_windows_kakao_block_once("로컬 콜백 인증")
+        _log_kakao_env_block_once("로컬 콜백 인증")
         raise RuntimeError(
-            "Windows 로컬에서는 카카오 로컬 콜백 인증을 사용할 수 없습니다. "
-            "Vultr 서버에서 bash ~/Coin/scripts/coinbot_watch.sh 를 사용하세요."
+            "환경 화이트리스트 불일치 — 카카오 로컬 콜백 인증은 hostname=example1, "
+            "project=/home/bot2/Coin 에서만 사용할 수 있습니다. "
+            "Vultr에서 bash ~/Coin/scripts/coinbot_watch.sh 를 사용하세요."
         )
 
     uri = (redirect_uri or LOCALHOST_REDIRECT_URI).strip()
@@ -452,12 +495,61 @@ def capture_authorization_code_via_localhost(
     return auth_code["value"]
 
 
+def validate_access_token(access_token: str) -> bool:
+    """카카오 access_token 유효성(HTTP 200) 확인."""
+    token = (access_token or "").strip()
+    if not token or not kakao_api_allowed():
+        return False
+    try:
+        response = requests.get(
+            "https://kapi.kakao.com/v1/user/access_token_info",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=8,
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return bool(token)
+
+
+def refresh_kakao_access_token_sync(client_id: str, refresh_token: str = "") -> str:
+    """Thread-safe 카카오 access_token 갱신(Double-checked locking).
+
+    여러 스레드/코루틴이 동시에 만료를 감지해도 Refresh HTTP 호출은 1회만 수행하고,
+    대기 스레드는 락 해제 후 이미 저장된 access_token을 재사용한다.
+    """
+    if not kakao_api_allowed():
+        _log_kakao_env_block_once("토큰 갱신")
+        return ""
+
+    hydrate_tokens_from_json()
+    access = get_access_token().strip()
+    if access and validate_access_token(access):
+        return access
+
+    rt = (refresh_token or get_refresh_token()).strip()
+    if not client_id or not rt:
+        return access
+
+    with _KAKAO_REFRESH_LOCK:
+        hydrate_tokens_from_json()
+        access = get_access_token().strip()
+        if access and validate_access_token(access):
+            logger.debug("카카오 refresh 대기 — 다른 스레드가 갱신한 access_token 사용")
+            return access
+
+        token_data = refresh_access_token_request(client_id, rt)
+        new_access = apply_token_response(token_data)
+        if new_access:
+            logger.info("카카오 액세스 토큰 자동 갱신 완료 (thread-safe)")
+        return new_access or ""
+
+
 def refresh_access_token_request(client_id: str, refresh_token: str) -> Dict[str, Any]:
     if not kakao_api_allowed():
-        _log_windows_kakao_block_once("토큰 갱신")
+        _log_kakao_env_block_once("토큰 갱신")
         raise RuntimeError(
-            "Windows 로컬에서는 카카오 토큰 갱신을 실행할 수 없습니다. "
-            "Vultr 서버에서만 refresh 하세요."
+            "환경 화이트리스트 불일치 — 카카오 토큰 갱신은 hostname=example1, "
+            "project=/home/bot2/Coin 에서만 실행할 수 있습니다."
         )
     token_url = "https://kauth.kakao.com/oauth/token"
     data = {

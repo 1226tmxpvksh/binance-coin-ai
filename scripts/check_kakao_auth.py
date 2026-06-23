@@ -20,20 +20,18 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(LIVE / ".env", override=True)
 
-import requests  # noqa: E402
-
 from kakao_utils import (  # noqa: E402
-    apply_token_response,
     get_access_token,
     get_refresh_token,
     hydrate_tokens_from_json,
-    is_windows_local_host,
-    refresh_access_token_request,
+    kakao_api_allowed,
+    refresh_kakao_access_token_sync,
+    validate_access_token,
 )
 
 
 def _alerts_enabled() -> bool:
-    if is_windows_local_host():
+    if not kakao_api_allowed():
         return False
     return os.getenv("KAKAO_ALERTS_ENABLED", "true").strip().lower() not in {
         "0",
@@ -44,17 +42,7 @@ def _alerts_enabled() -> bool:
 
 
 def _validate_access(access: str) -> bool:
-    if not access:
-        return False
-    try:
-        r = requests.get(
-            "https://kapi.kakao.com/v1/user/access_token_info",
-            headers={"Authorization": f"Bearer {access}"},
-            timeout=8,
-        )
-        return r.status_code == 200
-    except requests.RequestException:
-        return bool(access)
+    return validate_access_token(access)
 
 
 def main() -> int:
@@ -73,8 +61,7 @@ def main() -> int:
     refresh = get_refresh_token().strip()
     if refresh and refresh != "your_refresh_token_here":
         try:
-            token_data = refresh_access_token_request(client_id, refresh)
-            new_access = apply_token_response(token_data)
+            new_access = refresh_kakao_access_token_sync(client_id, refresh)
             if new_access and _validate_access(new_access):
                 return 0
         except Exception:
