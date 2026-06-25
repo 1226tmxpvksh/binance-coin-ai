@@ -9,7 +9,7 @@
 | **`ai_trading/`** | 메인 루프, 리포트, 선물 주문·청산(`binance_futures_tools.py`), 학습 로그, `README.md` 상세 가이드 |
 | **`btc_live_trading/`** | 공용 `.env`, 카카오 토큰(`kakao_utils.py`/`kakao_notifier.py`), 환율(`fx_rates.py`), 공용 전략 모듈(`strategy/`) |
 | **`btc_day_strategy/`** | 백테스트·전략 라이브러리 (`main_ai` 시작 시 연결 점검) |
-| **`scripts/`** | `coinbot_watch.sh`(서버: 인증+로그 한 번에), `auth_kakao.py`, `reset_live_ledger.py`, `emergency_exit.py` |
+| **`scripts/`** | `coinbot_watch.sh`(서버: 인증+로그), `auth_kakao.py`(대화형 카카오 인증), `check_kakao_auth.py`, `reset_live_ledger.py`, `emergency_exit.py` |
 
 **실전 매매**는 `AI_DRY_RUN=false`로 `py ai_trading\main_ai.py` 하나만 실행하면 됩니다. (레거시 단타·`main_live` 엔진은 제거됨)
 
@@ -25,13 +25,15 @@
 
 카카오 액세스 토큰은 발급 후 약 **6시간**이면 만료되므로, 봇은 `refresh_token`으로 자동 갱신합니다. 갱신 로직과 저장소는 모두 `btc_live_trading/` 안에 있습니다.
 
-### 다중 실행·로컬 PC 차단 (Family Revocation 방지)
+### 다중 실행·유령 봇 차단 (Family Revocation 방지)
 
 | 위험 | 대응 |
 |------|------|
-| **서버에 `main_ai.py`가 여러 개** 동시 실행 | `_acquire_single_instance_lock()` — 프로젝트 루트 `.coinbot.lock`에 `fcntl`(Linux) / `msvcrt`(Windows) 독점 락. 두 번째 인스턴스는 카카오 API 호출 전 `sys.exit(1)` |
-| **로컬 Windows + Vultr 서버**가 같은 토큰 공유 | `os.name=='nt'`이면 `_kakao_alerts_enabled()`가 **무조건 False** — 인증·갱신·알림·토큰 저장 전면 차단 (`kakao_api_allowed()`) |
-| **Windows `webbrowser.open`** | 바탕화면 `.url` 바로가기 생성 방지 — `open_kakao_auth_url()`은 Windows에서 URL만 출력 |
+| **서버에 `main_ai.py`가 여러 개** 동시 실행 | `_acquire_single_instance_lock()` — `.coinbot.lock` 독점 락. 두 번째는 `sys.exit(1)` |
+| **WSL·백업 폴더·로컬 PC**에서 같은 토큰 사용 | `kakao_api_allowed()` — **하드코딩** `hostname==example1` **및** `project==/home/bot2/Coin` 일 때만 카카오 API 허용 (`.env` 우회 불가) |
+| **동시 Refresh Race** | `refresh_kakao_access_token_sync()` — `threading.Lock` + Double-checked locking, Refresh HTTP 1회만 |
+| **1초에 AI 평가 폭주** | `_CYCLE_LOCK` + `AI_LOOP_SECONDS` 간격 가드 + 동일 15m 캔들 중복 OpenAI 호출 차단 |
+| **Windows `webbrowser.open`** | 바탕화면 `.url` 생성 방지 — `open_kakao_auth_url()`은 Windows에서 URL만 출력 |
 
 서버에서 좀비 프로세스 확인: `pgrep -af main_ai.py` → `systemctl stop coinbot.service` 후 재시작.
 
@@ -43,7 +45,8 @@
 - **refresh_token(마스터 열쇠) 회전 처리 — 응답 유무에 따른 완전 분기**: 카카오는 토큰 갱신 시 보안상 새 `refresh_token`을 함께 발급(회전)하기도 합니다. `apply_token_response`/`persist_kakao_tokens`가 응답의 `refresh_token` 필드를 다음과 같이 엄격히 구분 처리합니다.
   - **새 `refresh_token`이 있고 비어있지 않으면** → 회전으로 간주하고 **무조건 새 값으로 기존 값을 대체** 저장(`.env`+`kakao_code.json`+메모리 3곳).
   - **필드가 없거나 빈 문자열이면** → 회전 없음으로 간주하고 **기존 유효 `refresh_token`을 절대 유실하지 않고 유지**. (이전 버그: 빈 문자열을 "회전됨"으로 오인해 기존 마스터 열쇠를 지우던 구멍을 막음)
-- **저장 검증(write-after-read)**: 저장 직후 `kakao_code.json`을 다시 읽어 의도한 `refresh_token`이 실제로 기록됐는지 검증하고 성공/실패를 로그로 남깁니다. 검증 실패 시 즉시 `ERROR`로 경고합니다.
+- **저장 검증(write-after-read)**: 저장 직후 `kakao_code.json`을 다시 읽어 `refresh_token` 기록을 검증하고 ✅/❌ 로그를 남깁니다.
+- **저장 후 os.environ 동기화**: 검증 직후 `KAKAO_ACCESS_TOKEN` / `KAKAO_REFRESH_TOKEN`을 `os.environ`에 즉시 반영합니다.
 - **회전 빈도 최소화**: 매 알림마다 토큰을 갱신하면 회전이 과도하게 일어나 위험하므로, **유효한 액세스 토큰이 있으면 그대로 사용**하고 실제로 만료된 6시간 주기에만 갱신/회전이 일어나도록 했습니다(`_ensure_kakao_access_token` 검증 우선).
 - **Safety First — 카카오 알림 실패 시 매매 즉시 차단**: 카카오톡 알림은 단순 정보전달이 아니라 **시스템이 건강하게 살아있다는 생존 신호(Heartbeat)** 입니다. 따라서 카카오 알림은 매매 엔진의 **전제 조건**이며, 매 사이클 `run_cycle()`(차트 분석·주문) 직전에 인증 게이트(`_kakao_auth_ready()`)가 토큰 유효성을 점검합니다.
   - 토큰이 없거나 만료(`invalid_grant`)·갱신 실패·모듈 로드 실패·점검 중 예외 상태이면 → `[ERROR] 카카오 인증 실패 — 매매 로직을 실행하지 않습니다` 로그를 남기고 **그 사이클의 매매 로직을 통째로 건너뜁니다.**
@@ -87,11 +90,17 @@ journalctl -u coinbot.service -f | grep -iE "kakao|토큰|refresh|갱신"
 bash ~/Coin/scripts/coinbot_watch.sh
 ```
 
-1. 카카오 토큰이 없거나 만료면 → 터미널에 **로그인 URL + 코드 입력 칸**이 바로 나옵니다.
-2. PC 브라우저에서 URL 열고 로그인 → 이동된 주소창 전체 URL(또는 `code=` 뒤 값) 붙여넣기.
-3. `[OK] 카카오 토큰 저장 완료` 확인 → 서비스 자동 재시작 → **이어서 `journalctl -f` 로그**가 표시됩니다.
+1. 카카오 토큰이 없거나 만료면 → 터미널에 **로그인 URL + 코드 입력 칸**이 바로 나옵니다 (`auth_kakao.py` 대화형 모드).
+2. PC 브라우저에서 URL 열고 로그인 → 이동된 주소창 **전체 URL** 또는 `code=` 뒤 값 붙여넣기 (자동 파싱).
+3. `✅ 저장 완료` 확인 → 서비스 재시작 → **이어서 `journalctl -f` 로그**가 표시됩니다.
 
-**로컬 PC (Windows):** 카카오는 **코드가 자동으로 전부 끕니다.** 로컬에서 `main_ai.py`를 켜도 서버 토큰은 건드리지 않습니다. 카카오 인증은 **Vultr SSH**에서만 `bash ~/Coin/scripts/coinbot_watch.sh`.
+**인증만 따로 실행:**
+
+```bash
+python ~/Coin/scripts/auth_kakao.py
+```
+
+**로컬 PC / WSL / 백업 폴더:** 카카오 API는 **Vultr `/home/bot2/Coin` (hostname `example1`)에서만** 동작합니다. 로컬에서 `main_ai.py`를 켜도 서버 토큰은 건드리지 않습니다.
 
 **대안:** `.env`에 `KAKAO_AUTH_CODE=<인가코드>` 1회 설정 후 `systemctl restart coinbot.service` (성공 시 자동 저장·삭제).
 
@@ -127,4 +136,8 @@ AI_VOLUME_GATE_ENABLED=true      # 로컬 거래량 게이트
 AI_TRADE_ON_WEEKENDS=false
 ```
 
-데이터 흐름: **15m 스냅샷 → ATR·거래량 게이트 → AI(거래량 확인) → 리스크·주문 → 원금 기준 리포트**
+데이터 흐름: **15m 스냅샷(5분 1회) → ATR·거래량 게이트 → AI(거래량 확인) → 리스크·주문 → 원금 기준 리포트**
+
+### Git에 올리지 않는 파일
+
+`.env`, `kakao_code.json`, `trading_stats.json`, `virtual_trades.jsonl`, `ai_learning_logs.csv`, `.coinbot.lock` 등은 `.gitignore` 처리됩니다. WinSCP로 코드만 올리고, 토큰·운영 데이터는 서버에 유지하세요.

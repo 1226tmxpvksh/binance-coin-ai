@@ -160,11 +160,18 @@ py -3 ai_trading\main_ai.py
 - 이미 다른 인스턴스가 락을 쥐면 ERROR 로그 후 `sys.exit(1)` (**카카오 부트스트랩 전**).
 - 서버에서 `pgrep -af main_ai.py`로 1프로세스만 떠 있는지 확인.
 
-### Windows 로컬 PC
+### Windows / WSL / 로컬 PC
 
-- `os.name=='nt'`이면 카카오 인증·갱신·알림·토큰 저장 **전부 자동 차단** (`.env`의 `KAKAO_ALERTS_ENABLED=true`여도 무시).
-- 로컬에서 코드 테스트해도 Vultr 서버 토큰(Family Revocation)은 보호됨.
-- 카카오 인증은 서버 SSH → `bash ~/Coin/scripts/coinbot_watch.sh`만 사용.
+- 카카오 API는 **Vultr 정품 서버만** 허용: `hostname==example1`, `project==/home/bot2/Coin` (하드코딩, `.env` 우회 불가).
+- 로컬에서 `main_ai.py`를 실행해도 카카오·매매 테스트는 가능하나 **카카오 토큰은 서버에서만** 발급·갱신하세요.
+- 카카오 인증: SSH → `bash ~/Coin/scripts/coinbot_watch.sh` 또는 `python ~/Coin/scripts/auth_kakao.py`
+
+### 매매 루프 (5분 1회)
+
+- `_initialize_trading_loop_once()` — 기동·카카오 부트스트랩은 프로세스당 1회.
+- `_CYCLE_LOCK` — 사이클 중복 진입 차단.
+- `_wait_for_next_cycle_slot()` — `AI_LOOP_SECONDS`(기본 300) 미만 재실행 방지.
+- 동일 15m 캔들에 OpenAI 재호출 없음 (`candle_open_time_ms` 기준).
 
 ## 운영 및 모니터링
 
@@ -193,17 +200,21 @@ py -3 ai_trading\main_ai.py
 
 ## 카카오 401 처리
 
-카카오 401 또는 `expired_or_invalid_refresh_token`이 발생하면 refresh-token까지 만료된 상태입니다. 이는 코드 문제가 아니라 카카오 OAuth 보안 정책에 따른 정상 만료 상황입니다.
+카카오 401 또는 `expired_or_invalid_refresh_token`이 발생하면 refresh-token까지 만료된 상태입니다.
 
-이 경우 프로그램은 종료하지 않고 터미널에서 수동 복구 모드로 전환합니다.
+**서버에서 재인증 (권장):**
 
-1. 터미널에 출력된 카카오 인가 URL을 브라우저에서 엽니다.
-2. 카카오 로그인 및 동의를 완료합니다.
-3. 리다이렉트된 URL에서 `code=` 뒤 값을 복사합니다.
-4. 터미널의 `인가 코드(code):` 입력란에 새 인가 코드를 붙여넣습니다.
-5. 새 refresh-token이 저장되면 이후 액세스 토큰 만료는 다시 자동 갱신됩니다.
+```bash
+bash ~/Coin/scripts/coinbot_watch.sh
+# 또는
+python ~/Coin/scripts/auth_kakao.py
+```
 
-새 토큰은 `btc_live_trading\.env`와 `btc_live_trading\kakao_code.json`에 함께 저장됩니다. 인가 코드를 입력하지 않고 Enter를 누르면 카카오 알림만 건너뛰고 매매 루프는 계속 진행됩니다.
+1. 터미널에 카카오 로그인 URL이 출력됩니다.
+2. 브라우저에서 로그인 후 리다이렉트 URL **전체** 또는 `code=` 값을 붙여넣습니다.
+3. `✅ 저장 완료` 확인 후 `systemctl restart coinbot.service` (root).
+
+`auth_kakao.py`는 전체 URL·순수 코드 모두 자동 파싱합니다. 토큰은 `btc_live_trading/.env`와 `kakao_code.json`에 원자적으로 저장됩니다.
 
 KOE205가 발생하면 `KAKAO_REDIRECT_URI`와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인한 뒤 새 인가 코드를 다시 발급하세요.
 
@@ -261,14 +272,14 @@ py -3 scripts\emergency_exit.py
 
 ## 운영 데이터
 
-- `ai_trading\data\trading_stats.json`: 원장(가상 잔고·실현 손익 집계 등), 월간 집계, 오픈 포지션 상태. 실전 리포트 표시 잔고는 Binance API가 우선입니다.
-- `ai_trading\data\virtual_trades.jsonl`: 진입/청산 이벤트(가상·실전 공통 로그 형식)
-- `ai_trading\data\ai_learning_logs.csv`: 손실 거래 사후분석과 재발 방지 메모
-- `ai_trading\data\history\trading_stats_month_{YYYY-MM}_archived.json`: 매월 1일 09:00(KST) 이후 첫 로드 시 이전 달 원장 백업(월당 파일 1개, 덮어쓰기). `AI_STATS_HISTORY_MAX_FILES`(기본 6) 초과 시 오래된 파일 자동 삭제.
+- `ai_trading/data/trading_stats.json`, `virtual_trades.jsonl`, `ai_learning_logs.csv`, `history/` — **Git 제외**(서버·PC별 런타임 데이터).
+- `virtual_trades.jsonl`: `AI_TRADE_LOG_MAX_LINES`(기본 2000) 초과 시 꼬리만 유지.
+- `ai_learning_logs.csv`: `AI_LEARNING_LOG_MAX_ROWS`(기본 5000) 초과 시 `_prune_learning_log`로 트림.
+- `history/trading_stats_month_{YYYY-MM}_archived.json`: 월 백업. `AI_STATS_HISTORY_MAX_FILES`(기본 6) 초과 시 자동 삭제.
 
 운영 중 카카오 알림이 실패해도 위 로컬 데이터 파일은 계속 저장됩니다.
 
-- **학습 CSV 부하 완화**: 동일 사이클·파일 mtime 불변 시 재파싱 생략. 행 수는 `AI_LEARNING_LOG_MAX_ROWS`(기본 5000) 초과 시 **최근 행만** 유지 (`_prune_learning_log`, 기동 시 + append 시 110% 초과 트림).
+- **학습 CSV 부하 완화**: mtime 캐시 + append 시 110% 초과 트림.
 
 ## 변경·통합 이력 (실전 최적화)
 
@@ -277,8 +288,12 @@ py -3 scripts\emergency_exit.py
 | Binance 잔고 API | `main_ai`의 직접 `Client` 생성 제거 → `binance_futures_tools.fetch_futures_usdt_balance_from_env` 단일화 (`futures_wallet_usdt_balance`) |
 | 학습 로그 | `_load_learning_rows` mtime 캐시 + `_prune_learning_log` 디스크 트림 + append 후 캐시 무효화 |
 | 거래 로그 회전 | `virtual_trades.jsonl`은 `AI_TRADE_LOG_MAX_LINES`(기본 2000) 초과 시 오래된 라인 자동 삭제 |
-| 단일 실행 | `.coinbot.lock` + `fcntl`/`msvcrt` — 다중 `main_ai` Race Condition·토큰 몰살 방지 |
-| Windows 카카오 | `kakao_api_allowed()` / `_kakao_alerts_enabled()` — 로컬 PC에서 서버 토큰 보호 |
+| 단일 실행 | `.coinbot.lock` + `fcntl`/`msvcrt` |
+| 환경 화이트리스트 | `kakao_api_allowed()` — `example1` + `/home/bot2/Coin` 하드코딩 |
+| Thread-safe Refresh | `refresh_kakao_access_token_sync()` Double-checked locking |
+| 루프 중복 방지 | `_CYCLE_LOCK`, `_wait_for_next_cycle_slot`, 캔들 단위 AI 1회 |
+| 대화형 인증 | `scripts/auth_kakao.py` — URL 출력 + URL/코드 스마트 파싱 |
+| Windows 카카오 | 로컬·WSL·백업 폴더에서 카카오 API 전면 차단 |
 | 레거시 제거 | `btc_live_trading`의 `main_live`·스캘핑·`order_executor` 등 미사용 실전 엔진 일체 삭제, `ai_decisions.log`·`live_trading.log` 제거 |
 | 문서 | 저장소 루트 `README.md` 추가, 본 파일에 구조·실전 기준 정리 |
 

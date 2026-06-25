@@ -3,8 +3,13 @@ from __future__ import annotations
 import csv
 import json
 import os
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+
+_FILE_DISCOVERY_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+_FILE_DISCOVERY_TTL_SEC = 600.0
 
 
 @dataclass
@@ -80,6 +85,11 @@ def _load_json(path: str) -> List[Dict[str, Any]]:
 
 
 def _discover_trade_files(backtest_dir: str) -> List[str]:
+    now = time.time()
+    cached = _FILE_DISCOVERY_CACHE.get(backtest_dir)
+    if cached is not None and now < cached[0]:
+        return list(cached[1])
+
     candidates: List[str] = []
     for root, _, files in os.walk(backtest_dir):
         for name in files:
@@ -88,6 +98,7 @@ def _discover_trade_files(backtest_dir: str) -> List[str]:
                 continue
             if "trade" in lower or "result" in lower or "backtest" in lower:
                 candidates.append(os.path.join(root, name))
+    _FILE_DISCOVERY_CACHE[backtest_dir] = (now + _FILE_DISCOVERY_TTL_SEC, candidates)
     return candidates
 
 

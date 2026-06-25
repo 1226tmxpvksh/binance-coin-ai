@@ -151,6 +151,8 @@ _CYCLE_LOCK = threading.Lock()
 _GRACEFUL_SHUTDOWN_ONCE = threading.Event()
 _TRADING_LOOP_INITIALIZED = False
 _ORDER_EXECUTION_SETUP_LOGGED = False
+_LAST_CYCLE_COMPLETED_MONO: float = 0.0
+_LAST_EVALUATED_CANDLE_KEY: str = ""
 _ORPHAN_POSITION_ALERT_SENT = False
 _SIGNAL_HANDLERS_INSTALLED = False
 _LEARNING_ROWS_CACHE_MTIME: float | None = None
@@ -398,6 +400,64 @@ def _fetch_binance_futures_usdt_balance() -> float | None:
 
 def _report_bracket_title(dry_run: bool) -> str:
     return "[가상 매매 리포트]" if dry_run else "[실전 매매 리포트]"
+
+
+def _cycle_interval_seconds() -> int:
+    return max(30, _env_int("AI_LOOP_SECONDS", 300))
+
+
+def _wait_for_next_cycle_slot(loop_seconds: int) -> bool:
+    """이전 사이클 종료 후 loop_seconds 미만이면 대기. True면 이번 턴에서 사이클 실행 가능."""
+    global _LAST_CYCLE_COMPLETED_MONO
+    if _LAST_CYCLE_COMPLETED_MONO <= 0:
+        return True
+    elapsed = time.monotonic() - _LAST_CYCLE_COMPLETED_MONO
+    if elapsed >= loop_seconds:
+        return True
+    remaining = loop_seconds - elapsed
+    logger.debug("루프 간격 미달(%.1fs 남음) — 중복 사이클 대기", remaining)
+    time.sleep(remaining)
+    return True
+
+
+def _mark_cycle_completed() -> None:
+    global _LAST_CYCLE_COMPLETED_MONO
+    _LAST_CYCLE_COMPLETED_MONO = time.monotonic()
+
+
+def _candle_evaluation_key(snapshot: Dict[str, Any], symbol: str, interval: str) -> str:
+    open_ms = int(_safe_float(snapshot.get("candle_open_time_ms", 0)))
+    if open_ms > 0:
+        return f"{symbol}:{interval}:{open_ms}"
+    return f"{symbol}:{interval}:{int(_safe_float(snapshot.get('price', 0)))}"
+
+
+def _should_skip_duplicate_candle_eval(snapshot: Dict[str, Any], symbol: str, interval: str) -> bool:
+    """동일 15m 캔들에 대한 OpenAI 재평가 방지."""
+    global _LAST_EVALUATED_CANDLE_KEY
+    key = _candle_evaluation_key(snapshot, symbol, interval)
+    if key and key == _LAST_EVALUATED_CANDLE_KEY:
+        return True
+    _LAST_EVALUATED_CANDLE_KEY = key
+    return False
+
+
+def _load_backtest_context(
+    snapshot: Dict[str, Any],
+    *,
+    top_n: int = 5,
+) -> Tuple[Any, List[Dict[str, float]], float]:
+    """백테스트 요약·유사 케이스를 1회 스캔으로 로드(히스토리 파일 중복 순회 방지)."""
+    backtest_summary = load_backtest_summary(str(BACKTEST_DIR))
+    similar_cases = find_similar_backtest_cases(
+        current_rsi=float(snapshot["rsi"]),
+        current_atr_pct=float(snapshot["atr_pct"]),
+        current_ema_gap_pct=float(snapshot["ema_gap_pct"]),
+        backtest_dir=str(BACKTEST_DIR),
+        top_n=top_n,
+    )
+    similar_avg_pnl = sum(x["pnl"] for x in similar_cases) / len(similar_cases) if similar_cases else 0.0
+    return backtest_summary, similar_cases, similar_avg_pnl
 
 
 def _log_order_execution_setup(dry_run: bool) -> None:
@@ -2650,19 +2710,19 @@ def _run_cycle_impl() -> Dict[str, Any]:
             status_report_minutes=status_report_minutes,
         )
 
-    backtest_summary = load_backtest_summary(str(BACKTEST_DIR))
-    similar_cases = find_similar_backtest_cases(
-        current_rsi=float(snapshot["rsi"]),
-        current_atr_pct=float(snapshot["atr_pct"]),
-        current_ema_gap_pct=float(snapshot["ema_gap_pct"]),
-        backtest_dir=str(BACKTEST_DIR),
-        top_n=5,
-    )
-    similar_avg_pnl = sum(x["pnl"] for x in similar_cases) / len(similar_cases) if similar_cases else 0.0
+    backtest_summary, similar_cases, similar_avg_pnl = _load_backtest_context(snapshot)
     gate_open, gate_reason = _ai_entry_gate(snapshot)
     memory_block, memory_summary, memory_similarity = _find_closest_failure_memory(snapshot)
     context_text = backtest_summary.to_context_text() + f"\nSimilar-case mean pnl: {similar_avg_pnl:.4f}\n"
-    if gate_open:
+    duplicate_candle = _should_skip_duplicate_candle_eval(snapshot, symbol, interval)
+    if duplicate_candle:
+        model_ai_decision = {
+            "decision": "HOLD",
+            "reason": "동일 캔들 구간 — 중복 AI 평가 생략",
+            "confidence": 1.0,
+        }
+        stats["ai_calls_saved_by_gate"] = _safe_int(stats.get("ai_calls_saved_by_gate", 0)) + 1
+    elif gate_open:
         reflection_digest = _top_recent_loss_reflections(_env_int("AI_REFLECTION_DIGEST_COUNT", 5))
         model_ai_decision = get_ai_decision(
             context_text,
@@ -2877,11 +2937,12 @@ def _initialize_trading_loop_once(*, send_startup_report: bool = True) -> None:
 
 def run_forever() -> None:
     _initialize_trading_loop_once()
-    loop_seconds = max(30, _env_int("AI_LOOP_SECONDS", 300))
+    loop_seconds = _cycle_interval_seconds()
     while True:
         cycle_started = time.time()
         try:
-            # Safety First: 카카오 인증(생존 신호)이 확보되지 않으면 이번 사이클의
+            _wait_for_next_cycle_slot(loop_seconds)
+            # Safety First:
             # 매매 로직(차트 분석·주문)을 통째로 건너뛴다.
             if not _kakao_auth_ready():
                 logger.error(
@@ -2892,6 +2953,7 @@ def run_forever() -> None:
                 result = run_cycle()
                 if not result.get("cycle_skipped"):
                     print(_format_cycle_dashboard(result))
+                    _mark_cycle_completed()
         except KeyboardInterrupt:
             try:
                 with _SHUTDOWN_LOCK:
@@ -2920,6 +2982,7 @@ if __name__ == "__main__":
                 )
                 raise SystemExit(1)
             print(_format_cycle_dashboard(run_cycle()))
+            _mark_cycle_completed()
         except KeyboardInterrupt:
             try:
                 with _SHUTDOWN_LOCK:

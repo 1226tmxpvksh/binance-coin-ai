@@ -49,8 +49,14 @@ bash scripts/coinbot_watch.sh
 ```
 
 - 브라우저에서 URL 열고 로그인
-- 이동된 주소창 URL(또는 `code=` 뒤 값) → 터미널에 붙여넣기
-- `저장 완료` 나오면 OK
+- 이동된 주소창 **전체 URL** 또는 `code=` 뒤 값 → 터미널에 붙여넣기 (자동 파싱)
+- `✅ 저장 완료` 나오면 OK
+
+인증만 따로:
+
+```bash
+python ~/Coin/scripts/auth_kakao.py
+```
 
 **② root — 재시작**
 
@@ -84,7 +90,8 @@ sed -i 's/\r$//' /home/bot2/Coin/scripts/coinbot_watch.sh
 | `No module named 'dotenv'` | `source ~/venv/bin/activate` 후 다시 실행 |
 | `bot2 is not in the sudoers` | 재시작은 **root**에서 `systemctl restart` |
 | `$'\r': command not found` | §3 `sed` 실행 |
-| `main_ai.py`가 여러 개 실행됨 | `pgrep -af main_ai.py` → `systemctl stop coinbot.service` → 재시작 (Single Instance Lock 적용 후에도 좀비는 수동 정리) |
+| `main_ai.py`가 여러 개 실행됨 | `pgrep -af main_ai.py` → `systemctl stop coinbot.service` → 재시작 |
+| 로컬/WSL에서 카카오 인증 시도 | **불가** — Vultr `example1` + `/home/bot2/Coin` 에서만 허용 |
 
 ---
 

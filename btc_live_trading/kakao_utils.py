@@ -28,11 +28,9 @@ KAKAO_CODE_JSON = Path(os.path.abspath(_MODULE_DIR / "kakao_code.json"))
 DEFAULT_REDIRECT_URI = "https://example.com/oauth"
 LOCALHOST_REDIRECT_URI = "http://127.0.0.1:8765/oauth"
 
-# 정품 Vultr 운영 환경만 카카오 API 허용 (유령 봇·WSL·백업 폴더 차단)
-ALLOWED_KAKAO_HOSTNAME = (os.getenv("KAKAO_ALLOWED_HOSTNAME") or "example1").strip()
-ALLOWED_KAKAO_PROJECT_ROOT = (
-    (os.getenv("KAKAO_ALLOWED_PROJECT_ROOT") or "/home/bot2/Coin").strip().rstrip("/")
-)
+# 정품 Vultr 운영 환경만 카카오 API 허용 — .env 오버라이드 불가(하드코딩)
+ALLOWED_KAKAO_HOSTNAME = "example1"
+ALLOWED_KAKAO_PROJECT_ROOT = "/home/bot2/Coin"
 
 
 def _normalize_project_path(path: str) -> str:
@@ -55,7 +53,7 @@ def kakao_env_block_reason() -> str:
     """화이트리스트 불일치 사유(로그용). 일치하면 빈 문자열."""
     hostname = socket.gethostname().strip()
     project_root = _normalize_project_path(str(get_project_root()))
-    allowed_root = ALLOWED_KAKAO_PROJECT_ROOT.replace("\\", "/")
+    allowed_root = ALLOWED_KAKAO_PROJECT_ROOT
     reasons: list[str] = []
     if hostname != ALLOWED_KAKAO_HOSTNAME:
         reasons.append(f"hostname={hostname!r} (허용: {ALLOWED_KAKAO_HOSTNAME!r})")
@@ -340,6 +338,17 @@ def persist_kakao_tokens(access_token: str, refresh_token: Optional[str] = None)
                 _mask_token(saved_refresh),
                 _mask_token(eff_refresh),
             )
+
+    # --- os.environ 즉시 동기화: 파일 정본 → 메모리 (내부 Replay 방지) ---
+    saved_access, saved_refresh_final = _read_json_tokens()
+    if saved_access:
+        os.environ["KAKAO_ACCESS_TOKEN"] = saved_access
+    elif eff_access:
+        os.environ["KAKAO_ACCESS_TOKEN"] = eff_access
+    if saved_refresh_final:
+        os.environ["KAKAO_REFRESH_TOKEN"] = saved_refresh_final
+    elif eff_refresh:
+        os.environ["KAKAO_REFRESH_TOKEN"] = eff_refresh
 
     return json_ok and refresh_ok
 

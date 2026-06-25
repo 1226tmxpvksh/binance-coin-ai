@@ -21,7 +21,13 @@ def _parse_interval_seconds(interval: str) -> int:
 
 
 def _snapshot_cache_ttl_seconds(interval: str) -> int:
-    """15m 추세 매매: 루프(기본 300초)마다 Binance klines를 매번 긁지 않도록 TTL 적용."""
+    """루프 주기(AI_LOOP_SECONDS)와 동일하게 캐시 — 1루프당 1스냅샷 보장."""
+    raw_loop = os.environ.get("AI_LOOP_SECONDS", "").strip()
+    if raw_loop:
+        try:
+            return max(30, int(float(raw_loop)) - 5)
+        except ValueError:
+            pass
     raw = os.environ.get("AI_MARKET_CACHE_SECONDS", "").strip()
     if raw:
         try:
@@ -171,6 +177,7 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT", interval: str = "15m", limit:
         "symbol": symbol,
         "interval": interval,
         "price": last_price,
+        "candle_open_time_ms": int(klines[-1][0]),
         "rsi": rsi14,
         "ema20": ema20,
         "ema60": ema60,
