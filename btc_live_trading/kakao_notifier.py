@@ -14,6 +14,7 @@ from urllib.parse import quote
 from kakao_utils import (
     apply_token_response,
     exchange_authorization_code,
+    get_access_token,
     get_redirect_uri,
     get_refresh_token,
     hydrate_tokens_from_json,
@@ -70,12 +71,13 @@ def _response_error_payload(exc: Exception) -> tuple[str, str]:
 
 class KakaoNotifier:
     """카카오톡 알림 클래스"""
-    
+
     def __init__(
         self,
         access_token: str,
         enabled: bool = True,
         rest_api_key: str = "",
+        refresh_token: str = "",
         redirect_uri: Optional[str] = None,
         prompt_on_refresh_failure: bool = True,
     ):
@@ -84,24 +86,36 @@ class KakaoNotifier:
             access_token: 카카오 REST API 액세스 토큰
             enabled: 알림 활성화 여부
             rest_api_key: 카카오 REST API 키 (토큰 재발급용)
+            refresh_token: 리프레시 토큰 (미지정 시 kakao_code.json에서 동기화)
             redirect_uri: OAuth 리다이렉트 URI (미지정 시 KAKAO_REDIRECT_URI 또는 기본값)
         """
         self.access_token = access_token
         self.enabled = enabled
         self.rest_api_key = rest_api_key
+        self.refresh_token = refresh_token
         self.api_url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
         self.redirect_uri = (redirect_uri or get_redirect_uri()).strip()
         self.prompt_on_refresh_failure = prompt_on_refresh_failure
-        self._first_403_disable = True
-    
-    def send_message(self, title: str, description: str, retry_count: int = 0) -> bool:
+        self._sync_tokens_from_store()
+
+    def _sync_tokens_from_store(self) -> None:
+        """kakao_code.json/.env 정본 → 인스턴스 메모리 동기화."""
+        hydrate_tokens_from_json()
+        stored_access = get_access_token().strip()
+        stored_refresh = get_refresh_token().strip()
+        if stored_access:
+            self.access_token = stored_access
+        if stored_refresh and stored_refresh != "your_refresh_token_here":
+            self.refresh_token = stored_refresh
+
+    def send_message(self, title: str, description: str, retry: bool = True) -> bool:
         """
         카카오톡 메시지 전송 (SAlertR 방식 적용)
         
         Args:
             title: 메시지 제목
             description: 메시지 내용
-            retry_count: 재시도 횟수 (무한루프 방지)
+            retry: 401 시 1회 재시도 여부
         
         Returns:
             bool: 전송 성공 여부
@@ -113,183 +127,99 @@ class KakaoNotifier:
         if not kakao_api_allowed():
             logger.debug("환경 화이트리스트 불일치 — 카카오 메시지 전송 차단")
             return False
-        
-        if not self.access_token:
-            logger.warning("카카오톡 액세스 토큰이 없습니다")
+
+        self._sync_tokens_from_store()
+        if not self.access_token and not self._refresh_access_token():
+            logger.warning("카카오톡 액세스 토큰이 없고 자동 갱신도 실패했습니다")
             return False
-        
-        # 무한루프 방지 (최대 1회 재시도)
-        if retry_count > 1:
-            logger.error("카카오톡 메시지 전송 재시도 횟수 초과")
-            return False
-        
+
         try:
-            # 메시지 길이 제한 (보안상 중요)
-            message_text = f"{title}\n\n{description}"
+            message_text = f"{title}\n{description}"
             if len(message_text) > MAX_MESSAGE_LENGTH:
-                message_text = message_text[:MAX_MESSAGE_LENGTH - 3] + "..."
-                logger.warning(f"메시지가 너무 길어 잘렸습니다: {len(message_text)} -> {MAX_MESSAGE_LENGTH}")
-            
-            headers = {
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
-            
+                message_text = message_text[:MAX_MESSAGE_LENGTH]
+
             template_object = {
                 "object_type": "text",
                 "text": message_text,
                 "link": {
                     "web_url": "https://www.binance.com",
-                    "mobile_web_url": "https://www.binance.com"
-                }
+                    "mobile_web_url": "https://www.binance.com",
+                },
             }
-            
-            payload = {
-                "template_object": json.dumps(template_object)
-            }
-            
+
             response = requests.post(
                 self.api_url,
-                headers=headers,
-                data=payload,
-                timeout=10
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={"template_object": json.dumps(template_object)},
+                timeout=10,
             )
-            
+
             if response.status_code == 200:
                 logger.info("카카오톡 메시지 전송 성공")
                 return True
-            elif response.status_code == 401:
-                # 토큰 만료 - 자동 재발급 시도 (SAlertR 방식)
-                if retry_count == 0:  # 첫 시도에서만 재시도
-                    logger.warning("401 Unauthorized: Access Token이 만료되었습니다. 갱신 후 재시도합니다.")
-                    
-                    # 토큰 자동 갱신
-                    if self._auto_refresh_token():
-                        # 갱신 성공 시 재시도 (1회만)
-                        logger.info("토큰 갱신 성공, 메시지 재전송 시도")
-                        return self.send_message(title, description, retry_count + 1)
-                    else:
-                        logger.error("토큰 자동 갱신 실패")
-                        return False
-                else:
-                    logger.error("토큰 갱신 후에도 401 에러 발생")
-                    return False
-                    
-            elif response.status_code == 403:
-                # 권한 부족 - 동의항목 설정 필요
-                logger.error("=" * 80)
-                logger.error("⚠️ 카카오톡 메시지 전송 권한이 없습니다! (403)")
-                logger.error("=" * 80)
-                logger.error("")
-                auth_url = ""
+            if response.status_code == 401 and retry and self._refresh_access_token():
+                logger.info("401 → 토큰 갱신 후 메시지 재전송")
+                return self.send_message(title, description, retry=False)
+            if response.status_code == 401:
+                logger.error("토큰 갱신 후에도 401 — 카카오 재인증이 필요합니다")
+                return False
+            if response.status_code == 403:
+                logger.error("카카오톡 메시지 전송 권한 없음(403). 동의항목 '카카오톡 메시지 전송' 확인.")
                 if self.rest_api_key and self.rest_api_key != "your_rest_api_key_here":
-                    _validate_redirect_uri_config(self.redirect_uri)
                     auth_url = _build_kakao_auth_url(self.rest_api_key, self.redirect_uri)
-                logger.error("🔗 토큰 재발급 URL (브라우저에서 열기):")
-                logger.error(f"   {auth_url}")
-                logger.error("KOE205 발생 시 KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인하세요.")
-                logger.error("=" * 80)
-
-                if self._first_403_disable:
-                    self.enabled = False
-                    self._first_403_disable = False
-                    logger.warning("카카오톡 알림이 자동으로 비활성화되었습니다.")
-
+                    if auth_url:
+                        logger.error("재인증 URL: %s", auth_url)
                 return False
-            else:
-                # 응답 내용에서 민감한 정보 제거
-                error_msg = f"status={response.status_code}"
-                logger.error(f"카카오톡 메시지 전송 실패: {error_msg}")
-                return False
-                
+
+            logger.error("카카오톡 메시지 전송 실패: status=%s body=%s", response.status_code, response.text)
+            return False
+
         except requests.exceptions.Timeout:
-            if retry_count == 0:
-                logger.error("카카오톡 메시지 전송 타임아웃")
+            logger.error("카카오톡 메시지 전송 타임아웃")
             return False
-        except requests.exceptions.RequestException as e:
-            if retry_count == 0:
-                logger.error(f"카카오톡 메시지 전송 네트워크 오류: {type(e).__name__}")
+        except requests.exceptions.RequestException as exc:
+            logger.error("카카오톡 메시지 전송 네트워크 오류: %s", exc)
             return False
-        except Exception as e:
-            if retry_count == 0:
-                logger.error(f"카카오톡 메시지 전송 오류: {type(e).__name__}")
+        except Exception as exc:
+            logger.error("카카오톡 메시지 전송 오류: %s", type(exc).__name__)
             return False
-    
-    def _auto_refresh_token(self) -> bool:
-        """
-        토큰 자동 갱신 (사용자 입력 없이)
-        리프레시 토큰이 있으면 자동 갱신, 없으면 수동 갱신 프롬프트
-        
-        Returns:
-            bool: 갱신 성공 여부
-        """
-        hydrate_tokens_from_json()
-        refresh_token = get_refresh_token()
 
-        if refresh_token and refresh_token != "your_refresh_token_here":
-            logger.info("리프레시 토큰을 사용하여 액세스 토큰 자동 갱신 중...")
-            new_token = self._refresh_access_token(refresh_token)
-
-            if new_token:
-                self.access_token = new_token
-                logger.info("✅ 액세스 토큰 자동 갱신 완료")
-                return True
-
-            logger.warning("리프레시 토큰 갱신 실패, 수동 갱신 필요")
-        
-        # 리프레시 토큰이 없으면 수동 갱신 프롬프트
-        logger.warning("리프레시 토큰이 없거나 만료되었습니다. 수동 토큰 갱신이 필요합니다.")
-        
-        if self.rest_api_key and self.rest_api_key != "your_rest_api_key_here":
-            _validate_redirect_uri_config(self.redirect_uri)
-            auth_url = _build_kakao_auth_url(self.rest_api_key, self.redirect_uri)
-            logger.error("=" * 80)
-            logger.error("⚠️ 카카오톡 액세스 토큰이 만료되었습니다!")
-            logger.error("리프레시 토큰까지 만료된 경우 새 인가 코드 발급이 필요합니다.")
-            logger.error("=" * 80)
-            logger.error("🔗 토큰 재발급 URL (브라우저에서 열기):")
-            logger.error(f"   {auth_url}")
-            logger.error("절차: URL 접속 → 로그인/동의 → 리다이렉트 URL의 code= 값 복사 → 프롬프트에 입력")
-            logger.error("KOE205 발생 시 KAKAO_REDIRECT_URI와 카카오 개발자 콘솔 Redirect URI가 정확히 같은지 확인하세요.")
-            logger.error("=" * 80)
-            
+    def _refresh_access_token(self) -> bool:
+        """리프레시 토큰으로 액세스 토큰 갱신(thread-safe, kakao_code.json/.env 동기화)."""
+        self._sync_tokens_from_store()
+        refresh_token = (self.refresh_token or get_refresh_token()).strip()
+        if not self.rest_api_key or self.rest_api_key == "your_rest_api_key_here" or not refresh_token:
             if self.prompt_on_refresh_failure:
-                self._prompt_token_refresh()
-                return True  # 프롬프트 실행됨
-
-            logger.warning("무인 실행 모드라 토큰 갱신 프롬프트를 생략합니다.")
-            self.enabled = False
+                return self._prompt_refresh_or_fail()
             return False
-        
-        return False
-    
-    def _refresh_access_token(self, refresh_token: str) -> Optional[str]:
-        """
-        리프레시 토큰으로 액세스 토큰 갱신
-        
-        Args:
-            refresh_token: 리프레시 토큰
-        
-        Returns:
-            새로운 액세스 토큰 (실패 시 None)
-        """
-        if not self.rest_api_key or self.rest_api_key == "your_rest_api_key_here":
-            logger.error("KAKAO_REST_API_KEY가 없어 토큰을 갱신할 수 없습니다.")
-            return None
         try:
             access_token = refresh_kakao_access_token_sync(self.rest_api_key, refresh_token)
             if access_token:
                 self.access_token = access_token
-            return access_token
-        except Exception as e:
-            error_code, error_description = _response_error_payload(e)
+                self._sync_tokens_from_store()
+                logger.info("✅ 카카오 액세스 토큰 자동 갱신 완료")
+                return True
+        except Exception as exc:
+            error_code, error_description = _response_error_payload(exc)
             if error_code == "expired_or_invalid_refresh_token":
-                logger.error("카카오 리프레시 토큰 만료/무효: 새 인가 코드 발급이 필요합니다.")
+                logger.error("카카오 리프레시 토큰 만료/무효 — 새 인가 코드가 필요합니다.")
             elif error_code:
-                logger.error("토큰 갱신 요청 오류: %s (%s)", error_code, error_description or type(e).__name__)
+                logger.error("토큰 갱신 요청 오류: %s (%s)", error_code, error_description or type(exc).__name__)
             else:
-                logger.error("토큰 갱신 요청 오류: %s", type(e).__name__)
-            return None
+                logger.error("토큰 갱신 요청 오류: %s", type(exc).__name__)
+        if self.prompt_on_refresh_failure:
+            return self._prompt_refresh_or_fail()
+        return False
+
+    def _prompt_refresh_or_fail(self) -> bool:
+        """대화형 환경이면 수동 재인증, 무인(systemd)이면 False."""
+        if self.rest_api_key and self.rest_api_key != "your_rest_api_key_here":
+            _validate_redirect_uri_config(self.redirect_uri)
+            auth_url = _build_kakao_auth_url(self.rest_api_key, self.redirect_uri)
+            logger.error("카카오 토큰 만료 — 재인증 URL: %s", auth_url or "(URL 생성 실패)")
+            self._prompt_token_refresh()
+            return bool(self.access_token)
+        return False
     
     def _prompt_token_refresh(self):
         """토큰 재발급 인터랙티브 프롬프트"""

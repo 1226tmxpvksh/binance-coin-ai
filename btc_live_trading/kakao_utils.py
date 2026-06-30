@@ -517,7 +517,7 @@ def validate_access_token(access_token: str) -> bool:
         )
         return response.status_code == 200
     except requests.RequestException:
-        return bool(token)
+        return False
 
 
 def refresh_kakao_access_token_sync(client_id: str, refresh_token: str = "") -> str:

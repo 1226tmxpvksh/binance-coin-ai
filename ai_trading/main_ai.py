@@ -1277,21 +1277,17 @@ def _validate_kakao_access_token(access_token: str) -> bool:
         return False
     if KAKAO_AUTH_EXHAUSTED:
         return False
+    if _validate_kakao_access_token_util is not None:
+        return _validate_kakao_access_token_util(access_token)
     try:
         response = requests.get(
             "https://kapi.kakao.com/v1/user/access_token_info",
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=8,
         )
-        if response.status_code == 200:
-            return True
-        if not KAKAO_AUTH_LINK_LOGGED:
-            logger.warning("카카오 액세스 토큰 유효성 확인 실패: HTTP %s", response.status_code)
+        return response.status_code == 200
+    except requests.RequestException:
         return False
-    except requests.RequestException as exc:
-        if not KAKAO_AUTH_LINK_LOGGED:
-            logger.warning("카카오 액세스 토큰 유효성 확인 생략: %s", type(exc).__name__)
-        return bool(access_token)
 
 
 def _refresh_kakao_access_token(
@@ -1359,47 +1355,54 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
         if refreshed:
             return refreshed
         if KAKAO_AUTH_EXHAUSTED:
+            if show_auth_link:
+                recovered = _manual_kakao_authorization_recovery(
+                    rest_api_key, "리프레시 토큰이 만료되었거나 유효하지 않습니다."
+                )
+                if recovered:
+                    return recovered
             return ""
-
-    if refresh_token and rest_api_key:
-        if show_auth_link:
-            recovered = _manual_kakao_authorization_recovery(rest_api_key, "리프레시 토큰이 만료되었거나 유효하지 않습니다.")
-            if recovered:
-                return recovered
-        if not KAKAO_AUTH_EXHAUSTED:
-            _mark_kakao_auth_exhausted("리프레시 토큰이 만료되었거나 유효하지 않습니다.")
+        # 네트워크 등 일시적 갱신 실패 — exhausted 로 표시하지 않고 다음 사이클 재시도
+        logger.warning("카카오 토큰 갱신 일시 실패 — 다음 사이클에서 재시도합니다.")
         return ""
 
     if show_auth_link:
-        recovered = _manual_kakao_authorization_recovery(rest_api_key, "사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
+        recovered = _manual_kakao_authorization_recovery(
+            rest_api_key, "사용 가능한 액세스 토큰/리프레시 토큰이 없습니다."
+        )
         if recovered:
             return recovered
-    if not KAKAO_AUTH_EXHAUSTED:
+    if not refresh_token and not KAKAO_AUTH_EXHAUSTED:
         _mark_kakao_auth_exhausted("사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
     return ""
 
 
-def _notify_kakao(title: str, body: str) -> None:
-    # 봇 방어막: 카카오 알림 관련 어떤 예외도 매매 루프로 전파되지 않도록 전체를 격리한다.
+def _notify_kakao(title: str, body: str) -> bool:
+    """카카오 알림 전송. 실패해도 매매 루프에는 영향 없음(다음 사이클 재시도)."""
     try:
         if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
-            return
+            return False
         if not _kakao_alerts_enabled():
-            return
-        access = _ensure_kakao_access_token(show_auth_link=True)
-        rest = os.getenv("KAKAO_REST_API_KEY", "").strip()
-        if not access or not rest:
-            return
+            return False
+        _hydrate_kakao_tokens()
+        rest = _env_str("KAKAO_REST_API_KEY", "")
+        if not rest:
+            return False
+        refresh = _get_kakao_refresh_token().strip() if _get_kakao_refresh_token else ""
         notifier = KakaoNotifier(
-            access_token=access,
+            access_token=get_access_token().strip(),
             enabled=True,
             rest_api_key=rest,
+            refresh_token=refresh,
             prompt_on_refresh_failure=False,
         )
-        notifier.send_message(title, body)
+        ok = notifier.send_message(title, body)
+        if not ok:
+            logger.warning("카카오 알림 전송 실패(다음 사이클 재시도): %s", title[:60])
+        return ok
     except Exception as exc:
-        # 알림 실패는 로그만 남기고 매매는 그대로 진행한다.
         logger.error("카카오 알림 전송 중 예외 발생(매매에는 영향 없음): %s", type(exc).__name__)
+        return False
 
 
 def _kakao_auth_ready() -> bool:
