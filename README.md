@@ -1,143 +1,187 @@
-# Coin — BTC 트레이딩 모노레포
+# AI 코인 자동매매 시스템
 
-실전 AI 매매는 **`ai_trading`** 엔진(`main_ai.py`)을 기준으로 운영합니다. 바이낸스 USDT-M 선물 키·카카오 알림·`.env`는 **`btc_live_trading`** 쪽과 공유합니다.
+Binance USDT-M 선물 **BTC/USDT** 차트를 AI가 실시간 분석하고, 조건 충족 시 자동으로 진입·청산하는 **24/7 무인 매매 봇**입니다.  
+매매 판단·리스크 관리·알림·토큰 갱신까지 하나의 데몬 프로세스(`main_ai.py`)로 통합 운영합니다.
 
-## 디렉터리 요약
+```
+15m 시장 스냅샷 → 기술적 게이트(ATR·거래량) → OpenAI 판단 → 리스크·주문 → 카카오톡 리포트
+```
+
+---
+
+## 시스템 개요
+
+| 항목 | 설명 |
+|------|------|
+| **대상 시장** | Binance USDT-M 선물 BTC/USDT (15분봉 기준) |
+| **판단 엔진** | OpenAI GPT — 진입·모니터링·손실 사후분석 |
+| **운영 주기** | **5분마다** 시장 감시 (`AI_LOOP_SECONDS=300`) |
+| **알림** | 카카오톡 나에게 보내기 — 매매 신호·상태 리포트·오류 즉시 통보 |
+| **배포** | Vultr Linux + **systemd** (`coinbot.service`) 24/7 데몬 |
+
+시스템은 **5분 단위로 시장을 감시**하며, 진입·청산·리스크 경고 등 **매매 신호가 발생하면 즉시 카카오톡으로 통보**합니다.  
+평시에는 `AI_STATUS_REPORT_MINUTES`(기본 60분) 간격으로 상태 리포트를 발송합니다.
+
+---
+
+## 주요 기술적 특징
+
+### 1. Stateless 알림 아키텍처 (Stale Token 제거)
+
+24/7 데몬 환경에서 `KakaoNotifier`가 초기화 시점의 토큰을 메모리에 보관하면, 백그라운드 갱신(`kakao_utils`)과 불일치가 생겨 **Replay Attack → 토큰 패밀리 전체 폐기**가 발생할 수 있습니다.
+
+**해결:** 알림 모듈은 토큰을 인스턴스 상태(`self`)에 **전혀 보관하지 않습니다.**  
+전송·갱신 시마다 `kakao_code.json` 정본과 `os.environ`에서 **실시간 조회**만 수행합니다.
+
+```
+KakaoNotifier.send_message()
+  └─ hydrate_tokens_from_json() → get_access_token()   # 매 호출 fresh read
+  └─ 401 시 refresh_kakao_access_token_sync()          # 중앙 Thread-safe 갱신
+```
+
+### 2. Kakao OAuth2 — Thread-safe 토큰 관리
+
+| 메커니즘 | 구현 |
+|----------|------|
+| **중앙 갱신 채널** | `refresh_kakao_access_token_sync()` — Double-checked locking, Refresh HTTP 1회만 |
+| **원자적 저장** | 임시 파일 → `os.replace` → write-after-read 검증 |
+| **회전 처리** | refresh_token 회전 시 `.env` + `kakao_code.json` + `os.environ` 3곳 동기화 |
+| **환경 화이트리스트** | `kakao_api_allowed()` — 정품 서버·경로에서만 API 허용 (로컬/WSL 차단) |
+| **Safety First** | 카카오 Heartbeat 실패 시 해당 사이클 매매 차단, 프로세스는 유지·재시도 |
+
+액세스 토큰은 약 **6시간**마다 만료되며, 유효 토큰이 있으면 불필요한 refresh를 하지 않아 **마스터 열쇠 회전 빈도를 최소화**합니다.
+
+### 3. 다층 방어 기제
+
+| 계층 | 내용 |
+|------|------|
+| **단일 프로세스** | `.coinbot.lock` + `fcntl`/`msvcrt` — 중복 `main_ai.py` 실행 차단 |
+| **루프 중복 방지** | `_CYCLE_LOCK` + `AI_LOOP_SECONDS` 간격 가드 + 동일 15m 캔들 AI 1회 |
+| **네트워크 복원력** | 카카오 401 → 중앙 갱신 후 1회 재전송; 일시적 갱신 실패는 exhausted 처리 없이 다음 사이클 재시도 |
+| **진입 게이트** | ATR 최소 변동성, 7일 평균 대비 거래량 급증(`AI_VOLUME_MIN_RATIO`), 주말 신규 진입 차단 |
+| **매매 모드** | `AI_DRY_RUN=true` 가상 매매 / `false` 실전 매매 — 동일 코드 경로 |
+| **원금 복구 리포팅** | 잔고 < 초기 원금 시 「원금 복구 중」 표기, 착시 수익 방지 |
+
+---
+
+## 기술 스택
+
+| 영역 | 기술 |
+|------|------|
+| **언어** | Python 3 |
+| **거래소** | Binance Futures API (USDT-M) |
+| **AI** | OpenAI GPT (`gpt-4o` 진입 / `gpt-4o-mini` 모니터링) |
+| **알림** | Kakao REST API (OAuth2, 나에게 보내기) |
+| **서비스 관리** | systemd (`coinbot.service`) |
+| **배포** | Vultr VPS, WinSCP + SSH |
+| **데이터** | JSON 원장, JSONL 거래 로그, CSV 학습 로그 |
+
+---
+
+## 아키텍처
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  systemd (coinbot.service)                                  │
+│  └─ ai_trading/main_ai.py          ← 메인 루프 (5분 주기)   │
+│       ├─ data/market_data.py       ← Binance 15m 스냅샷     │
+│       ├─ ai_logic/decision_engine  ← OpenAI 매매 판단       │
+│       ├─ binance_futures_tools     ← 선물 주문·청산         │
+│       ├─ reporting.py              ← 원장·리포트            │
+│       └─ _notify_kakao()           ← 알림 (Stateless)       │
+├─────────────────────────────────────────────────────────────┤
+│  btc_live_trading/                                          │
+│       ├─ kakao_utils.py            ← OAuth2·토큰 정본       │
+│       ├─ kakao_notifier.py         ← 카카오 메시지 (무상태) │
+│       └─ strategy/                 ← 공용 리스크·전략       │
+├─────────────────────────────────────────────────────────────┤
+│  btc_day_strategy/                 ← 백테스트·전략 검증     │
+│  scripts/                          ← 인증·운영 스크립트     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**데이터 흐름:** 15m 스냅샷(5분 1회) → ATR·거래량 게이트 → AI 판단 → 리스크·주문 → 원금 기준 리포트 → 카카오톡
+
+---
+
+## 프로젝트 구조
 
 | 경로 | 역할 |
 |------|------|
-| **`ai_trading/`** | 메인 루프, 리포트, 선물 주문·청산(`binance_futures_tools.py`), 학습 로그, `README.md` 상세 가이드 |
-| **`btc_live_trading/`** | 공용 `.env`, 카카오 토큰(`kakao_utils.py`/`kakao_notifier.py`), 환율(`fx_rates.py`), 공용 전략 모듈(`strategy/`) |
-| **`btc_day_strategy/`** | 백테스트·전략 라이브러리 (`main_ai` 시작 시 연결 점검) |
-| **`scripts/`** | `coinbot_watch.sh`(서버: 인증+로그), `auth_kakao.py`(대화형 카카오 인증), `check_kakao_auth.py`, `reset_live_ledger.py`, `emergency_exit.py` |
+| **`ai_trading/`** | 메인 루프, AI 판단, 선물 주문, 리포트, 학습 로그 |
+| **`btc_live_trading/`** | `.env`, 카카오 OAuth, 환율, 공용 전략 모듈 |
+| **`btc_day_strategy/`** | 백테스트·전략 라이브러리 |
+| **`scripts/`** | `coinbot_watch.sh`, `auth_kakao.py`, `check_kakao_auth.py` 등 |
 
-**실전 매매**는 `AI_DRY_RUN=false`로 `py ai_trading\main_ai.py` 하나만 실행하면 됩니다. (레거시 단타·`main_live` 엔진은 제거됨)
+---
 
-**서버(Vultr)에서 봇 켜기·카카오 인증:** **[START.md](START.md)** ← 시작 절차 전체 정리
+## 운영 가이드
 
-자세한 환경변수·데이터 파일·리스크 관리는 **`ai_trading/README.md`** 를 참고하세요.
+### 일상 배포 (코드 수정 후)
 
-## 운영 및 모니터링
+```bash
+# 서버 SSH (root)
+pgrep -af main_ai.py
+systemctl restart coinbot.service
+journalctl -u coinbot.service -f
+```
 
-`main_ai.py` 실행 시 매 루프마다 콘솔에 **구조화된 대시보드**가 출력됩니다(AI 판단, 시장 지표, 잔고, 보유 포지션). 예시와 상세 설명은 [`ai_trading/README.md`](ai_trading/README.md)의 **운영 및 모니터링** 섹션을 참고하세요.
+정상 로그: `카카오톡 메시지 전송 성공`, `[AI 매매 판단]` 대시보드
 
-## 카카오톡 토큰 관리 및 트러블슈팅
-
-카카오 액세스 토큰은 발급 후 약 **6시간**이면 만료되므로, 봇은 `refresh_token`으로 자동 갱신합니다. 갱신 로직과 저장소는 모두 `btc_live_trading/` 안에 있습니다.
-
-### 다중 실행·유령 봇 차단 (Family Revocation 방지)
-
-| 위험 | 대응 |
-|------|------|
-| **서버에 `main_ai.py`가 여러 개** 동시 실행 | `_acquire_single_instance_lock()` — `.coinbot.lock` 독점 락. 두 번째는 `sys.exit(1)` |
-| **WSL·백업 폴더·로컬 PC**에서 같은 토큰 사용 | `kakao_api_allowed()` — **하드코딩** `hostname==example1` **및** `project==/home/bot2/Coin` 일 때만 카카오 API 허용 (`.env` 우회 불가) |
-| **동시 Refresh Race** | `refresh_kakao_access_token_sync()` — `threading.Lock` + Double-checked locking, Refresh HTTP 1회만 |
-| **1초에 AI 평가 폭주** | `_CYCLE_LOCK` + `AI_LOOP_SECONDS` 간격 가드 + 동일 15m 캔들 중복 OpenAI 호출 차단 |
-| **Windows `webbrowser.open`** | 바탕화면 `.url` 생성 방지 — `open_kakao_auth_url()`은 Windows에서 URL만 출력 |
-
-서버에서 좀비 프로세스 확인: `pgrep -af main_ai.py` → `systemctl stop coinbot.service` 후 재시작.
-
-### 자동 갱신 동작 방식
-
-- **토큰 저장 위치**: `btc_live_trading/kakao_code.json`(access/refresh) + `btc_live_trading/.env`. 두 곳이 항상 동기화됩니다.
-- **절대경로 처리**: `kakao_utils.py`가 실행 위치(CWD)와 무관하게 모듈 기준 절대경로(`os.path.abspath`)로 파일을 읽고 씁니다. systemd `WorkingDirectory`가 달라도 다른 파일을 건드리지 않습니다.
-- **원자적 저장**: 토큰 파일은 임시 파일에 먼저 쓴 뒤 `os.replace`로 교체합니다. 저장 중 프로세스가 죽거나 재시작돼도 `kakao_code.json`이 깨지지 않습니다. (이전에는 쓰기 도중 중단 시 파일이 손상돼 다음 갱신이 영구 실패했음)
-- **refresh_token(마스터 열쇠) 회전 처리 — 응답 유무에 따른 완전 분기**: 카카오는 토큰 갱신 시 보안상 새 `refresh_token`을 함께 발급(회전)하기도 합니다. `apply_token_response`/`persist_kakao_tokens`가 응답의 `refresh_token` 필드를 다음과 같이 엄격히 구분 처리합니다.
-  - **새 `refresh_token`이 있고 비어있지 않으면** → 회전으로 간주하고 **무조건 새 값으로 기존 값을 대체** 저장(`.env`+`kakao_code.json`+메모리 3곳).
-  - **필드가 없거나 빈 문자열이면** → 회전 없음으로 간주하고 **기존 유효 `refresh_token`을 절대 유실하지 않고 유지**. (이전 버그: 빈 문자열을 "회전됨"으로 오인해 기존 마스터 열쇠를 지우던 구멍을 막음)
-- **저장 검증(write-after-read)**: 저장 직후 `kakao_code.json`을 다시 읽어 `refresh_token` 기록을 검증하고 ✅/❌ 로그를 남깁니다.
-- **저장 후 os.environ 동기화**: 검증 직후 `KAKAO_ACCESS_TOKEN` / `KAKAO_REFRESH_TOKEN`을 `os.environ`에 즉시 반영합니다.
-- **회전 빈도 최소화**: 매 알림마다 토큰을 갱신하면 회전이 과도하게 일어나 위험하므로, **유효한 액세스 토큰이 있으면 그대로 사용**하고 실제로 만료된 6시간 주기에만 갱신/회전이 일어나도록 했습니다(`_ensure_kakao_access_token` 검증 우선).
-- **Safety First — 카카오 알림 실패 시 매매 즉시 차단**: 카카오톡 알림은 단순 정보전달이 아니라 **시스템이 건강하게 살아있다는 생존 신호(Heartbeat)** 입니다. 따라서 카카오 알림은 매매 엔진의 **전제 조건**이며, 매 사이클 `run_cycle()`(차트 분석·주문) 직전에 인증 게이트(`_kakao_auth_ready()`)가 토큰 유효성을 점검합니다.
-  - 토큰이 없거나 만료(`invalid_grant`)·갱신 실패·모듈 로드 실패·점검 중 예외 상태이면 → `[ERROR] 카카오 인증 실패 — 매매 로직을 실행하지 않습니다` 로그를 남기고 **그 사이클의 매매 로직을 통째로 건너뜁니다.**
-  - 봇 프로세스 자체는 죽지 않고 매 주기마다 인증을 재점검하므로, 대화형 재인증(아래 참고) 후에는 매매가 자동 재개됩니다.
-  - 예외적으로 운영자가 의도적으로 알림을 끈 경우(`KAKAO_ALERTS_ENABLED=false`)에만 게이트를 우회하여 알림 없이 매매를 진행합니다.
-- **터미널 대화형 인증 내장 (No Auth, No Start + But Interactive)**: `main_ai.py` 가동 시 마스터 열쇠가 없거나 `invalid_grant` 상태이면, 봇이 ERROR만 뱉고 끝나는 게 아니라 **일시 중지(Pause) 후 터미널에 카카오 로그인 URL을 출력하고 `input()`으로 인가 코드 입력을 직접 기다립니다**(`_interactive_kakao_auth_until_done`). 코드 입력 → 토큰 발급 → 원자적 저장 + 저장 후 검증(✅)까지 성공해야 운영 시작 카톡을 쏘고 매매 루프로 진입합니다. 잘못된/만료된 코드를 넣어도 죽지 않고 재입력을 받습니다.
-
-### 토큰 갱신 로그 확인 (Vultr / systemd)
-
-**`journalctl -u coinbot.service -f`만 실행하면 인증 입력 칸이 나오지 않습니다** (journalctl은 읽기 전용 로그 뷰어). 대신 아래 스크립트를 사용하세요 — 인증이 필요하면 **URL + 입력 칸**을 먼저 띄운 뒤 자동으로 로그를 팔로우합니다.
+### 카카오 재인증 (토큰 만료 시)
 
 ```bash
 bash ~/Coin/scripts/coinbot_watch.sh
-```
-
-로그만 필터링하려면:
-
-```bash
-journalctl -u coinbot.service -f | grep -iE "kakao|토큰|refresh|갱신"
-```
-
-정상 동작 시 6시간 주기로 아래와 같은 로그가 보입니다.
-
-- `카카오 액세스 토큰 자동 갱신 완료`
-- `kakao_code.json 갱신 완료: /.../kakao_code.json`
-- `✅ refresh_token 저장 검증 통과: ...(kakao_code.json)` ← 마스터 열쇠가 파일에 확실히 기록됨
-- (실제 회전 시) `🔑 카카오 마스터 열쇠 회전 감지: <기존>… → <신규>… (새 refresh_token 저장)`
-
-반대로 아래 로그가 보이면 즉시 재인증이 필요합니다.
-
-- `❌ refresh_token 저장 검증 실패!` ← 파일 기록이 어긋남(권한/디스크 점검)
-- `카카오 리프레시 토큰 만료/무효: 새 인가 코드 발급이 필요합니다.`
-
-### 알림이 끊겼을 때 (대화형 재인증)
-
-`refresh_token`까지 만료되면 새 인가 코드가 필요합니다.
-
-**서버 SSH (권장 — journalctl 대신 이 명령):**
-
-```bash
-bash ~/Coin/scripts/coinbot_watch.sh
-```
-
-1. 카카오 토큰이 없거나 만료면 → 터미널에 **로그인 URL + 코드 입력 칸**이 바로 나옵니다 (`auth_kakao.py` 대화형 모드).
-2. PC 브라우저에서 URL 열고 로그인 → 이동된 주소창 **전체 URL** 또는 `code=` 뒤 값 붙여넣기 (자동 파싱).
-3. `✅ 저장 완료` 확인 → 서비스 재시작 → **이어서 `journalctl -f` 로그**가 표시됩니다.
-
-**인증만 따로 실행:**
-
-```bash
+# 또는
 python ~/Coin/scripts/auth_kakao.py
 ```
 
-**로컬 PC / WSL / 백업 폴더:** 카카오 API는 **Vultr `/home/bot2/Coin` (hostname `example1`)에서만** 동작합니다. 로컬에서 `main_ai.py`를 켜도 서버 토큰은 건드리지 않습니다.
+→ URL 로그인 → code 붙여넣기 → `systemctl restart coinbot.service`
 
-**대안:** `.env`에 `KAKAO_AUTH_CODE=<인가코드>` 1회 설정 후 `systemctl restart coinbot.service` (성공 시 자동 저장·삭제).
+### 로컬 실행 (개발·Dry-run)
 
-**경로 주의:** 토큰은 `btc_live_trading/kakao_code.json` / `.env`에 저장됩니다. 인증·갱신은 **서버에서만** 하세요.
-
-`KAKAO_REDIRECT_URI`는 카카오 개발자 콘솔 등록값과 **1글자도 다르면 안 됩니다**(KOE205/KOE006).
-
-알림만 끄려면 `.env`에 `KAKAO_ALERTS_ENABLED=false` (게이트 우회, 매매만 진행).
-
-## 전략 요약 및 아키텍처 (15m 추세 매매)
-
-| 단계 | 구현 | 설명 |
-|------|------|------|
-| 시장 데이터 | `ai_trading/data/market_data.py` | Binance 15m klines → RSI/EMA/BB/ATR + **7일(672봉) 평균 거래량 대비 현재 거래량** |
-| 거래량 필터 | `main_ai._apply_volume_entry_filter`, `decision_engine` | `volume_ratio ≥ AI_VOLUME_MIN_RATIO`(기본 1.5)일 때만 진입 허용; AI 프롬프트에 `volume_surge` 전달 |
-| 변동성 필터 | `main_ai._apply_atr_entry_filter` | `atr_pct`가 `AI_ATR_MIN_ENTRY_PCT` 미만이면 횡보장으로 HOLD |
-| 주말 차단 | `main_ai._is_weekend_trading_blocked` | `AI_TRADE_ON_WEEKENDS=false` 시 토·일 신규 진입·AI 분석 생략, 보유 포지션 청산만 |
-| AI 판단 | `ai_trading/ai_logic/decision_engine.py` | OpenAI 진입/모니터링 (거래량 동반 돌파 우선) |
-| 주문·청산 | `ai_trading/binance_futures_tools.py` | Binance USDT-M 선물 API |
-| 원장·리포트 | `ai_trading/reporting.py` | `trading_stats.json`; **원금 복구 중**이면 월 실현손익 착시 방지 표기 |
-
-### 원금 복구 우선 리포팅
-
-`현재 잔고(총 평가금) < initial_balance_krw`(기본 500,000원)이면 카카오·콘솔에서 **「원금 복구 중」** 상태를 표시하고, 월 실현손익·순수익은 **실질 0원**으로 보여 줍니다. 잔고가 원금을 회복한 뒤부터만 양수 월손익을 표기합니다. (`reporting.build_monthly_pnl_display`)
-
-### 주요 환경변수 (`.env`)
-
-```env
-AI_TIMEFRAME=15m
-AI_VOLUME_LOOKBACK_DAYS=7
-AI_VOLUME_MIN_RATIO=1.5          # 7일 평균 대비 150% 이상 = 거래량 급증
-AI_VOLUME_GATE_ENABLED=true      # 로컬 거래량 게이트
-AI_TRADE_ON_WEEKENDS=false
+```bash
+py -3 ai_trading\main_ai.py
 ```
 
-데이터 흐름: **15m 스냅샷(5분 1회) → ATR·거래량 게이트 → AI(거래량 확인) → 리스크·주문 → 원금 기준 리포트**
+`.env`에서 `AI_DRY_RUN=true` 권장. 카카오 API는 **운영 서버에서만** 동작합니다.
 
-### Git에 올리지 않는 파일
+---
 
-`.env`, `kakao_code.json`, `trading_stats.json`, `virtual_trades.jsonl`, `ai_learning_logs.csv`, `.coinbot.lock` 등은 `.gitignore` 처리됩니다. WinSCP로 코드만 올리고, 토큰·운영 데이터는 서버에 유지하세요.
+## 환경 변수 (핵심)
+
+```env
+AI_DRY_RUN=false                 # true=가상, false=실전
+AI_LOOP_SECONDS=300              # 감시 주기 (초)
+AI_TIMEFRAME=15m
+AI_STATUS_REPORT_MINUTES=60      # 상태 리포트 간격 (분)
+AI_VOLUME_MIN_RATIO=1.5          # 7일 평균 대비 거래량 급증 기준
+KAKAO_ALERTS_ENABLED=true        # false 시 알림·게이트 우회
+```
+
+전체 목록은 [`ai_trading/README.md`](ai_trading/README.md) 참고.
+
+---
+
+## 상세 문서
+
+| 문서 | 내용 |
+|------|------|
+| [**START.md**](START.md) | Vultr 서버 일상 시작·카카오 재인증 |
+| [**ai_trading/README.md**](ai_trading/README.md) | 환경변수, 리스크, 대시보드, 카카오 운영 |
+| [**btc_live_trading/VULTR_DEPLOY.md**](btc_live_trading/VULTR_DEPLOY.md) | 최초 서버 배포(systemd, venv) |
+| [**btc_day_strategy/README.md**](btc_day_strategy/README.md) | 일봉 백테스트·전략 비교 |
+
+---
+
+## Git 제외 (민감·런타임 데이터)
+
+`.env`, `kakao_code.json`, `trading_stats.json`, `virtual_trades.jsonl`, `ai_learning_logs.csv`, `.coinbot.lock`  
+→ WinSCP로 **코드만** 업로드하고, 토큰·운영 데이터는 서버에 유지합니다.
+
+---
+
+## 라이선스·면책
+
+본 프로젝트는 개인 학습·포트폴리오 목적으로 작성되었습니다.  
+암호화폐 자동매매는 원금 손실 위험이 있으며, 실전 투자 결정과 그에 따른 책임은 운영자에게 있습니다.
