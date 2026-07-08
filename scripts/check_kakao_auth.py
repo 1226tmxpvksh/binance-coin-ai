@@ -61,7 +61,7 @@ def main() -> int:
     refresh = get_refresh_token().strip()
     if refresh and refresh != "your_refresh_token_here":
         try:
-            new_access = refresh_kakao_access_token_sync(client_id, refresh)
+            new_access = refresh_kakao_access_token_sync(client_id, "")
             if new_access and _validate_access(new_access):
                 return 0
         except Exception:

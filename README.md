@@ -16,11 +16,13 @@ Binance USDT-M 선물 **BTC/USDT** 차트를 AI가 실시간 분석하고, 조�
 | **대상 시장** | Binance USDT-M 선물 BTC/USDT (15분봉 기준) |
 | **판단 엔진** | OpenAI GPT — 진입·모니터링·손실 사후분석 |
 | **운영 주기** | **5분마다** 시장 감시 (`AI_LOOP_SECONDS=300`) |
-| **알림** | 카카오톡 나에게 보내기 — 매매 신호·상태 리포트·오류 즉시 통보 |
+| **알림** | 카카오톡 — **하루 1회(KST) 상태 리포트** + **토큰 갱신 성공 시 즉시 통보** |
 | **배포** | Vultr Linux + **systemd** (`coinbot.service`) 24/7 데몬 |
 
-시스템은 **5분 단위로 시장을 감시**하며, 진입·청산·리스크 경고 등 **매매 신호가 발생하면 즉시 카카오톡으로 통보**합니다.  
-평시에는 `AI_STATUS_REPORT_MINUTES`(기본 60분) 간격으로 상태 리포트를 발송합니다.
+시스템은 **5분 단위로 시장을 감시**하며, 카카오 토큰은 매 사이클 Heartbeat로 검증·갱신합니다.  
+평시에는 **하루 1회(KST)** 상태 리포트를 발송합니다 (`AI_STATUS_REPORT_MINUTES=1440`, `KAKAO_ONCE_PER_DAY=true`).  
+리포트에는 **당일(KST) 매수·매도(진입·청산) 내역**이 포함됩니다.  
+액세스 토큰이 HTTP로 갱신되면 **갱신 성공 알림**을 별도로 보냅니다(일일 1회 한도 제외).
 
 ---
 
@@ -48,6 +50,7 @@ KakaoNotifier.send_message()
 | **회전 처리** | refresh_token 회전 시 `.env` + `kakao_code.json` + `os.environ` 3곳 동기화 |
 | **환경 화이트리스트** | `kakao_api_allowed()` — 정품 서버·경로에서만 API 허용 (로컬/WSL 차단) |
 | **Safety First** | 카카오 Heartbeat 실패 시 해당 사이클 매매 차단, 프로세스는 유지·재시도 |
+| **토큰 갱신 알림** | HTTP refresh 성공 시 카카오 통보 (`register_kakao_token_refresh_listener`) |
 
 액세스 토큰은 약 **6시간**마다 만료되며, 유효 토큰이 있으면 불필요한 refresh를 하지 않아 **마스터 열쇠 회전 빈도를 최소화**합니다.
 
@@ -154,7 +157,8 @@ py -3 ai_trading\main_ai.py
 AI_DRY_RUN=false                 # true=가상, false=실전
 AI_LOOP_SECONDS=300              # 감시 주기 (초)
 AI_TIMEFRAME=15m
-AI_STATUS_REPORT_MINUTES=60      # 상태 리포트 간격 (분)
+AI_STATUS_REPORT_MINUTES=1440     # 상태 리포트: 1440=하루 1회(KST)
+KAKAO_ONCE_PER_DAY=true           # true=일일 상태 리포트 1회(토큰 갱신 알림은 제외)
 AI_VOLUME_MIN_RATIO=1.5          # 7일 평균 대비 거래량 급증 기준
 KAKAO_ALERTS_ENABLED=true        # false 시 알림·게이트 우회
 ```

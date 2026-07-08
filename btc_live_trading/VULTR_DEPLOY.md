@@ -100,6 +100,7 @@ python ~/Coin/scripts/auth_kakao.py
 - 토큰 만료/없음 → 터미널에 **카카오 URL + input() 대기** → 전체 URL 또는 code 붙여넣기 → `✅ 저장 완료`
 - 재시작: `systemctl restart coinbot.service` (root)
 - **카카오 API는 `/home/bot2/Coin` + hostname `example1`에서만** 동작 (화이트리스트 하드코딩)
+- `KakaoNotifier`는 **Stateless** — 토큰을 메모리에 보관하지 않고 `kakao_utils` 정본에서 실시간 조회
 
 대안: `.env`에 `KAKAO_AUTH_CODE=<코드>` 1회 설정 후 `systemctl restart coinbot`
 알림만 끄려면 `.env`에 `KAKAO_ALERTS_ENABLED=false`.
@@ -112,7 +113,8 @@ python ~/Coin/scripts/auth_kakao.py
 |------|------|
 | **단일 실행** | `.coinbot.lock` — 1프로세스만. `pgrep -af main_ai.py`로 확인 |
 | **카카오 화이트리스트** | `example1` + `/home/bot2/Coin` 외 환경에서는 API 차단 |
-| **매매 주기** | `AI_LOOP_SECONDS=300` (5분 1회 AI 평가) |
+| **매매 주기** | `AI_LOOP_SECONDS=300` (5분 1회 시장 감시) |
+| **카카오 알림** | Stateless `KakaoNotifier` + `refresh_kakao_access_token_sync()` |
 | IP 변경 | 인스턴스 재생성 시 IP 바뀜 → 바이낸스 화이트리스트 재등록 |
 | 드라이런 | 처음엔 `.env`의 `AI_DRY_RUN=true`로 검증 권장 |
 | 방화벽 | 아웃바운드만 필요(바이낸스·카카오·OpenAI). 인바운드 불필요 |

@@ -1,21 +1,23 @@
 """
 카카오톡 알림 모듈
-거래 신호, 체결, 손익 등을 카카오톡 '나에게 보내기'로 알림
+거래 신호, 체결, 청산, 에러를 간단히 전송한다.
+
+토큰은 전송·갱신 직전 kakao_utils 정본에서 동기화하고,
+갱신 HTTP는 refresh_kakao_access_token_sync() 단일 경로만 사용한다.
 """
 
-import logging
-import requests
+from __future__ import annotations
+
 import json
+import logging
 import os
-from typing import Optional
 from datetime import datetime
-from urllib.parse import quote
+from typing import Optional
+
+import requests
 
 from kakao_utils import (
-    apply_token_response,
-    exchange_authorization_code,
     get_access_token,
-    get_redirect_uri,
     get_refresh_token,
     hydrate_tokens_from_json,
     kakao_api_allowed,
@@ -24,49 +26,10 @@ from kakao_utils import (
 
 logger = logging.getLogger(__name__)
 
-# 외부 전송을 위한 메시지 최대 길이 제한
 MAX_MESSAGE_LENGTH = 1000
-
-
-def _build_kakao_auth_url(rest_api_key: str, redirect_uri: str) -> str:
-    if not rest_api_key or not redirect_uri:
-        return ""
-    encoded_redirect_uri = quote(redirect_uri.strip(), safe="")
-    return (
-        "https://kauth.kakao.com/oauth/authorize?"
-        f"client_id={rest_api_key}&redirect_uri={encoded_redirect_uri}&response_type=code"
-    )
-
-
-def _validate_redirect_uri_config(redirect_uri: str) -> bool:
-    env_redirect_uri = os.getenv("KAKAO_REDIRECT_URI", "").strip()
-    if not redirect_uri:
-        logger.error("KAKAO_REDIRECT_URI가 비어 있습니다. 카카오 개발자 콘솔 Redirect URI와 동일하게 설정하세요.")
-        return False
-    if redirect_uri in {"https://example.com/oauth", "your_redirect_uri_here"}:
-        logger.error("KAKAO_REDIRECT_URI가 기본 예시값입니다. 실제 등록 URI로 변경하세요.")
-        return False
-    if not redirect_uri.startswith(("http://", "https://")):
-        logger.error("KAKAO_REDIRECT_URI 형식이 올바르지 않습니다: %s", redirect_uri)
-        return False
-    if env_redirect_uri and env_redirect_uri != redirect_uri:
-        logger.error("KAKAO_REDIRECT_URI 불일치: env=%s, notifier=%s", env_redirect_uri, redirect_uri)
-        return False
-    return True
-
-
-def _response_error_payload(exc: Exception) -> tuple[str, str]:
-    response = getattr(exc, "response", None)
-    if response is None:
-        return "", ""
-    try:
-        payload = response.json()
-        return (
-            str(payload.get("error") or "").strip(),
-            str(payload.get("error_description") or "").strip(),
-        )
-    except Exception:
-        return "", str(getattr(response, "text", "") or "").strip()
+REQUEST_TIMEOUT_SECONDS = 10
+MAX_REFRESH_RETRY_COUNT = 1
+KAKAO_MEMO_API_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
 
 
 class KakaoNotifier:
@@ -74,54 +37,44 @@ class KakaoNotifier:
 
     def __init__(
         self,
-        access_token: str,
+        access_token: str = "",
         enabled: bool = True,
         rest_api_key: str = "",
         refresh_token: str = "",
+        env_path: Optional[str] = None,
+        *,
         redirect_uri: Optional[str] = None,
-        prompt_on_refresh_failure: bool = True,
+        prompt_on_refresh_failure: bool = False,
     ):
-        """
-        Args:
-            access_token: 카카오 REST API 액세스 토큰
-            enabled: 알림 활성화 여부
-            rest_api_key: 카카오 REST API 키 (토큰 재발급용)
-            refresh_token: 리프레시 토큰 (미지정 시 kakao_code.json에서 동기화)
-            redirect_uri: OAuth 리다이렉트 URI (미지정 시 KAKAO_REDIRECT_URI 또는 기본값)
-        """
-        self.access_token = access_token
         self.enabled = enabled
-        self.rest_api_key = rest_api_key
-        self.refresh_token = refresh_token
-        self.api_url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
-        self.redirect_uri = (redirect_uri or get_redirect_uri()).strip()
+        self.rest_api_key = (rest_api_key or os.getenv("KAKAO_REST_API_KEY", "")).strip()
+        self.api_url = KAKAO_MEMO_API_URL
+        self.env_path = env_path or os.path.join(os.path.dirname(__file__), ".env")
         self.prompt_on_refresh_failure = prompt_on_refresh_failure
+        # 생성자 인자는 초기값일 뿐 — send/refresh 직전 _sync_tokens_from_store()로 덮어씀
+        self.access_token = access_token
+        self.refresh_token = refresh_token
         self._sync_tokens_from_store()
 
     def _sync_tokens_from_store(self) -> None:
-        """kakao_code.json/.env 정본 → 인스턴스 메모리 동기화."""
+        """kakao_code.json / os.environ 정본 → 인스턴스 동기화."""
         hydrate_tokens_from_json()
-        stored_access = get_access_token().strip()
-        stored_refresh = get_refresh_token().strip()
-        if stored_access:
-            self.access_token = stored_access
-        if stored_refresh and stored_refresh != "your_refresh_token_here":
-            self.refresh_token = stored_refresh
+        live_access = get_access_token().strip()
+        live_refresh = get_refresh_token().strip()
+        if live_access:
+            self.access_token = live_access
+        if live_refresh and live_refresh != "your_refresh_token_here":
+            self.refresh_token = live_refresh
 
-    def send_message(self, title: str, description: str, retry: bool = True) -> bool:
-        """
-        카카오톡 메시지 전송 (SAlertR 방식 적용)
-        
-        Args:
-            title: 메시지 제목
-            description: 메시지 내용
-            retry: 401 시 1회 재시도 여부
-        
-        Returns:
-            bool: 전송 성공 여부
-        """
+    def _rest_api_key(self) -> str:
+        key = (self.rest_api_key or os.getenv("KAKAO_REST_API_KEY", "")).strip()
+        if key == "your_rest_api_key_here":
+            return ""
+        return key
+
+    def send_message(self, title: str, description: str, retry_count: int = 0) -> bool:
         if not self.enabled:
-            logger.debug("카카오톡 알림이 비활성화되어 있습니다")
+            logger.debug("카카오 알림 비활성화: %s", title)
             return False
 
         if not kakao_api_allowed():
@@ -129,221 +82,108 @@ class KakaoNotifier:
             return False
 
         self._sync_tokens_from_store()
-        if not self.access_token and not self._refresh_access_token():
-            logger.warning("카카오톡 액세스 토큰이 없고 자동 갱신도 실패했습니다")
-            return False
 
+        if not self.access_token:
+            logger.warning("카카오 액세스 토큰이 없습니다. 자동 갱신을 시도합니다.")
+            if not self._refresh_access_token():
+                logger.error("카카오 액세스 토큰이 없고 자동 갱신에도 실패했습니다.")
+                return False
+            self._sync_tokens_from_store()
+
+        message_text = f"{title}\n{description}"
+        if len(message_text) > MAX_MESSAGE_LENGTH:
+            logger.warning(
+                "카카오 메시지 길이 제한 초과: %s -> %s",
+                len(message_text),
+                MAX_MESSAGE_LENGTH,
+            )
+            message_text = message_text[:MAX_MESSAGE_LENGTH]
+
+        payload = {
+            "object_type": "text",
+            "text": message_text,
+            "link": {
+                "web_url": "https://www.binance.com",
+                "mobile_web_url": "https://www.binance.com",
+            },
+        }
+        headers = {"Authorization": f"Bearer {self.access_token}"}
         try:
-            message_text = f"{title}\n{description}"
-            if len(message_text) > MAX_MESSAGE_LENGTH:
-                message_text = message_text[:MAX_MESSAGE_LENGTH]
-
-            template_object = {
-                "object_type": "text",
-                "text": message_text,
-                "link": {
-                    "web_url": "https://www.binance.com",
-                    "mobile_web_url": "https://www.binance.com",
-                },
-            }
-
             response = requests.post(
                 self.api_url,
-                headers={"Authorization": f"Bearer {self.access_token}"},
-                data={"template_object": json.dumps(template_object)},
-                timeout=10,
+                headers=headers,
+                data={"template_object": json.dumps(payload)},
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
-
             if response.status_code == 200:
-                logger.info("카카오톡 메시지 전송 성공")
+                logger.info("카카오 알림 전송 성공: %s", title)
                 return True
-            if response.status_code == 401 and retry and self._refresh_access_token():
-                logger.info("401 → 토큰 갱신 후 메시지 재전송")
-                return self.send_message(title, description, retry=False)
-            if response.status_code == 401:
-                logger.error("토큰 갱신 후에도 401 — 카카오 재인증이 필요합니다")
-                return False
-            if response.status_code == 403:
-                logger.error("카카오톡 메시지 전송 권한 없음(403). 동의항목 '카카오톡 메시지 전송' 확인.")
-                if self.rest_api_key and self.rest_api_key != "your_rest_api_key_here":
-                    auth_url = _build_kakao_auth_url(self.rest_api_key, self.redirect_uri)
-                    if auth_url:
-                        logger.error("재인증 URL: %s", auth_url)
+
+            if response.status_code == 401 and retry_count < MAX_REFRESH_RETRY_COUNT:
+                logger.warning("카카오 액세스 토큰 만료 또는 무효 상태입니다. 자동 갱신을 시도합니다.")
+                if self._refresh_access_token():
+                    logger.info("카카오 액세스 토큰 갱신 성공. 메시지 전송을 재시도합니다.")
+                    return self.send_message(title, description, retry_count + 1)
+                logger.error("카카오 액세스 토큰 갱신 실패로 메시지 전송을 중단합니다.")
                 return False
 
-            logger.error("카카오톡 메시지 전송 실패: status=%s body=%s", response.status_code, response.text)
+            logger.error("카카오 알림 전송 실패: status=%s body=%s", response.status_code, response.text)
             return False
-
-        except requests.exceptions.Timeout:
-            logger.error("카카오톡 메시지 전송 타임아웃")
-            return False
-        except requests.exceptions.RequestException as exc:
-            logger.error("카카오톡 메시지 전송 네트워크 오류: %s", exc)
+        except requests.RequestException as exc:
+            logger.error("카카오 알림 전송 중 네트워크 오류: %s", exc)
             return False
         except Exception as exc:
-            logger.error("카카오톡 메시지 전송 오류: %s", type(exc).__name__)
+            logger.error("카카오 알림 전송 중 오류: %s", exc)
             return False
 
     def _refresh_access_token(self) -> bool:
-        """리프레시 토큰으로 액세스 토큰 갱신(thread-safe, kakao_code.json/.env 동기화)."""
-        self._sync_tokens_from_store()
-        refresh_token = (self.refresh_token or get_refresh_token()).strip()
-        if not self.rest_api_key or self.rest_api_key == "your_rest_api_key_here" or not refresh_token:
-            if self.prompt_on_refresh_failure:
-                return self._prompt_refresh_or_fail()
+        client_id = self._rest_api_key()
+        if not client_id:
+            logger.error("카카오 토큰 갱신 실패: REST API 키가 없습니다.")
             return False
+
+        self._sync_tokens_from_store()
+        if not self.refresh_token:
+            logger.error("카카오 토큰 갱신 실패: 리프레시 토큰이 없습니다.")
+            return False
+
         try:
-            access_token = refresh_kakao_access_token_sync(self.rest_api_key, refresh_token)
-            if access_token:
-                self.access_token = access_token
-                self._sync_tokens_from_store()
-                logger.info("✅ 카카오 액세스 토큰 자동 갱신 완료")
-                return True
+            new_access = refresh_kakao_access_token_sync(client_id, "").strip()
         except Exception as exc:
-            error_code, error_description = _response_error_payload(exc)
-            if error_code == "expired_or_invalid_refresh_token":
-                logger.error("카카오 리프레시 토큰 만료/무효 — 새 인가 코드가 필요합니다.")
-            elif error_code:
-                logger.error("토큰 갱신 요청 오류: %s (%s)", error_code, error_description or type(exc).__name__)
-            else:
-                logger.error("토큰 갱신 요청 오류: %s", type(exc).__name__)
-        if self.prompt_on_refresh_failure:
-            return self._prompt_refresh_or_fail()
-        return False
+            logger.error("카카오 토큰 갱신 요청 실패: %s", exc)
+            return False
 
-    def _prompt_refresh_or_fail(self) -> bool:
-        """대화형 환경이면 수동 재인증, 무인(systemd)이면 False."""
-        if self.rest_api_key and self.rest_api_key != "your_rest_api_key_here":
-            _validate_redirect_uri_config(self.redirect_uri)
-            auth_url = _build_kakao_auth_url(self.rest_api_key, self.redirect_uri)
-            logger.error("카카오 토큰 만료 — 재인증 URL: %s", auth_url or "(URL 생성 실패)")
-            self._prompt_token_refresh()
-            return bool(self.access_token)
-        return False
-    
-    def _prompt_token_refresh(self):
-        """토큰 재발급 인터랙티브 프롬프트"""
-        try:
-            print("\n" + "=" * 80)
-            print("🔄 카카오톡 토큰 갱신")
-            print("=" * 80)
-            
-            response = input("\n토큰을 지금 갱신하시겠습니까? (y/n): ").strip().lower()
-            
-            if response != 'y':
-                print("❌ 토큰 갱신을 건너뜁니다. 카카오톡 알림이 비활성화됩니다.")
-                self.enabled = False
-                return
-            
-            # Authorization Code 입력
-            print("\n📝 Authorization Code 입력")
-            print(f"   현재 redirect_uri: {self.redirect_uri}")
-            print("   카카오 개발자 콘솔 Redirect URI와 위 값이 1글자도 다르면 KOE205가 발생합니다.")
-            print("   (브라우저에서 리다이렉트된 URL의 'code=' 뒤 값을 복사하세요)")
-            print("   💡 붙여넣기: 마우스 우클릭 또는 Ctrl+V")
-            auth_code = input("Code: ").strip()
-            
-            if not auth_code:
-                print("❌ 코드가 입력되지 않았습니다.")
-                self.enabled = False
-                return
-            
-            # 액세스 토큰 발급
-            print("\n⏳ 토큰 발급 중...")
-            new_token = self._get_access_token_from_code(auth_code)
-            
-            if new_token:
-                # 현재 인스턴스 토큰 업데이트 (_get_access_token_from_code에서 이미 저장됨)
-                self.access_token = new_token
-                self.enabled = True
+        if not new_access:
+            logger.error("카카오 토큰 갱신 실패: 새 액세스 토큰을 받지 못했습니다.")
+            return False
 
-                print("=" * 80)
-                logger.info("카카오톡 토큰 갱신 완료")
+        self._sync_tokens_from_store()
+        logger.info("카카오 액세스 토큰 자동 갱신 완료")
+        return True
 
-                print("\n🧪 새 토큰으로 테스트 메시지 전송 중...")
-                
-                self.enabled = True  # 테스트를 위해 활성화
-                test_result = self.send_message(
-                    "✅ 카카오톡 연결 성공",
-                    f"토큰이 갱신되어 알림이 정상 작동합니다.\n갱신 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-                
-                if test_result:
-                    print("✅ 테스트 메시지 전송 성공! 카카오톡을 확인하세요.")
-                    print("💡 프로그램이 계속 실행됩니다. 재시작 불필요!")
-                else:
-                    print("⚠️ 테스트 메시지 전송 실패")
-                    print("📝 카카오 개발자 콘솔에서 '동의항목' 설정 확인:")
-                    print("   https://developers.kakao.com/console/app → 동의항목")
-                    print("   '카카오톡 메시지 전송' 권한 활성화 필요")
-            else:
-                print("\n❌ 토큰 발급에 실패했습니다.")
-                self.enabled = False
-                
-        except KeyboardInterrupt:
-            print("\n\n❌ 토큰 갱신이 취소되었습니다.")
-            self.enabled = False
-        except Exception as e:
-            logger.error(f"토큰 갱신 중 오류: {type(e).__name__}")
-            self.enabled = False
-    
-    def _get_access_token_from_code(self, auth_code: str) -> Optional[str]:
-        """Authorization Code로 액세스 토큰 발급"""
-        try:
-            token_data = exchange_authorization_code(
-                self.rest_api_key, self.redirect_uri, auth_code
-            )
-            access_token = token_data.get("access_token")
-            refresh_token = token_data.get("refresh_token")
-            if refresh_token:
-                masked_token = (
-                    refresh_token[:8] + "..." + refresh_token[-4:]
-                    if len(refresh_token) > 12
-                    else "***"
-                )
-                logger.info("리프레시 토큰도 발급되었습니다: %s", masked_token)
-                logger.info("리프레시 토큰이 저장되어 다음부터 자동 갱신됩니다.")
-            if access_token:
-                apply_token_response(token_data)
-            return access_token
-        except Exception as e:
-            error_code, error_description = _response_error_payload(e)
-            if error_code == "KOE205" or "KOE205" in error_description:
-                logger.error("토큰 발급 실패(KOE205): KAKAO_REDIRECT_URI가 카카오 개발자 콘솔 Redirect URI와 다릅니다.")
-            elif error_code:
-                logger.error("토큰 발급 요청 오류: %s (%s)", error_code, error_description or type(e).__name__)
-            else:
-                logger.error("토큰 발급 요청 오류: %s", type(e).__name__)
-            return None
-    
     def notify_start(self):
-        """프로그램 시작 알림"""
-        title = "🚀 실전 매매 프로그램 시작"
-        description = (
-            f"시작 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"상태: 모니터링 중..."
+        return self.send_message(
+            "실전 매매 시작",
+            f"프로그램이 시작되었습니다.\n시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         )
-        return self.send_message(title, description)
-    
-    def notify_entry_signal(
-        self,
-        side: str,
-        price: float,
-        market_state: str,
-        reason: str
-    ):
-        """진입 신호 알림"""
-        emoji = "🟢" if side == "LONG" else "🔴"
-        title = f"{emoji} 진입 신호 감지!"
-        description = (
-            f"방향: {side}\n"
-            f"현재가: ${price:,.2f}\n"
-            f"시장 상태: {market_state}\n"
-            f"사유: {reason}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+    def notify_dry_run_mode(self):
+        return self.send_message(
+            "테스트 모드 실행",
+            f"실제 주문 없이 시뮬레이션으로 동작합니다.\n시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         )
-        return self.send_message(title, description)
-    
+
+    def notify_entry_signal(self, side: str, price: float, market_state: str, reason: str):
+        return self.send_message(
+            f"{side} 진입 신호",
+            (
+                f"목표가: ${price:,.2f}\n"
+                f"시장 상태: {market_state}\n"
+                f"사유: {reason}\n"
+                f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
+        )
+
     def notify_order_filled(
         self,
         side: str,
@@ -352,21 +192,21 @@ class KakaoNotifier:
         stop_loss: float,
         take_profit: float,
         position_value: float,
-        order_type: str = "MARKET"
+        order_type: str = "MARKET",
     ):
-        """주문 체결 알림"""
-        title = f"✅ 주문 체결 완료 ({order_type})"
-        description = (
-            f"방향: {side}\n"
-            f"진입가: ${entry_price:,.2f}\n"
-            f"수량: {size:.6f} BTC\n"
-            f"포지션 가치: ${position_value:,.2f}\n\n"
-            f"손절가: ${stop_loss:,.2f}\n"
-            f"익절가: ${take_profit:,.2f}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        return self.send_message(
+            f"주문 체결 완료 ({order_type})",
+            (
+                f"방향: {side}\n"
+                f"진입가: ${entry_price:,.2f}\n"
+                f"수량: {size:.6f} BTC\n"
+                f"포지션 가치: ${position_value:,.2f}\n"
+                f"손절가: ${stop_loss:,.2f}\n"
+                f"익절가: ${take_profit:,.2f}\n"
+                f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
         )
-        return self.send_message(title, description)
-    
+
     def notify_position_closed(
         self,
         side: str,
@@ -375,123 +215,86 @@ class KakaoNotifier:
         pnl: float,
         profit_rate: float,
         reason: str,
-        balance: float
+        balance: float,
     ):
-        """포지션 청산 알림"""
-        emoji = "💰" if pnl > 0 else "⚠️"
         sign = "+" if pnl >= 0 else ""
-        
-        title = f"{emoji} 포지션 청산"
-        description = (
-            f"방향: {side}\n"
-            f"진입가: ${entry_price:,.2f}\n"
-            f"청산가: ${exit_price:,.2f}\n\n"
-            f"손익: {sign}${pnl:,.2f} ({sign}{profit_rate:.2f}%)\n\n"
-            f"청산 사유: {reason}\n"
-            f"현재 잔고: ${balance:,.2f}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        return self.send_message(
+            "포지션 청산",
+            (
+                f"방향: {side}\n"
+                f"진입가: ${entry_price:,.2f}\n"
+                f"청산가: ${exit_price:,.2f}\n"
+                f"손익: {sign}${pnl:,.2f} ({sign}{profit_rate:.2f}%)\n"
+                f"사유: {reason}\n"
+                f"현재 잔고: ${balance:,.2f}\n"
+                f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
         )
-        return self.send_message(title, description)
-    
+
     def notify_error(self, error_message: str):
-        """에러 알림"""
-        title = "❌ 에러 발생!"
-        description = (
-            f"{error_message}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        return self.send_message(
+            "에러 발생",
+            f"{error_message}\n시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         )
-        return self.send_message(title, description)
-    
-    def notify_insufficient_balance(
-        self,
-        current_balance_usdt: float,
-        required_min_usdt: float,
-    ):
-        """선물 USDT가 최소 진입 기준 미만일 때 알림"""
-        title = "💰 잔고 부족 (신규 진입 보류)"
+
+    def notify_insufficient_balance(self, current_balance_usdt: float, required_min_usdt: float):
         shortage = max(0.0, required_min_usdt - current_balance_usdt)
-        description = (
-            f"잔고가 부족합니다.\n\n"
-            f"현재(USDT-M 선물): ${current_balance_usdt:,.2f}\n"
-            f"설정 최소: ${required_min_usdt:,.2f}\n"
-            f"부족분(참고): 약 ${shortage:,.2f}\n\n"
-            f"바이낸스 선물 지갑으로 USDT를 입금해 주세요.\n"
-            f"오늘은 신규 진입을 하지 않으며, 내일 다시 잔고를 확인합니다.\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        return self.send_message(
+            "잔고 부족",
+            (
+                f"현재 잔고: ${current_balance_usdt:,.2f}\n"
+                f"필요 최소액: ${required_min_usdt:,.2f}\n"
+                f"부족액: ${shortage:,.2f}\n"
+                f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
         )
-        return self.send_message(title, description)
 
     def notify_no_entry(self, market_state: str, reason: str):
-        """당일 신규 진입이 없는 사유 알림"""
-        title = "ℹ️ 오늘 신규 진입 없음"
-        description = (
-            f"시장 상태: {market_state}\n"
-            f"사유: {reason}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        return self.send_message(
+            "오늘은 진입 없음",
+            (
+                f"시장 상태: {market_state}\n"
+                f"사유: {reason}\n"
+                f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
         )
-        return self.send_message(title, description)
-    
+
+    def notify_emergency_stop(self, reason: str, total_loss: float):
+        return self.send_message(
+            "긴급 정지",
+            (
+                f"사유: {reason}\n"
+                f"총 손실: -${total_loss:,.2f}\n"
+                f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
+        )
+
     def notify_daily_summary(
         self,
         total_trades: int,
         winning_trades: int,
         daily_pnl: float,
-        balance: float
+        balance: float,
     ):
-        """일일 요약 알림"""
-        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-        sign = "+" if daily_pnl >= 0 else ""
-        
-        title = "📊 일일 거래 요약"
-        description = (
-            f"총 거래: {total_trades}회\n"
-            f"승리: {winning_trades}회\n"
-            f"승률: {win_rate:.1f}%\n\n"
-            f"일일 손익: {sign}${daily_pnl:,.2f}\n"
-            f"현재 잔고: ${balance:,.2f}\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
+        return self.send_message(
+            "일일 요약",
+            (
+                f"총 거래: {total_trades}회\n"
+                f"승리: {winning_trades}회\n"
+                f"일일 손익: ${daily_pnl:,.2f}\n"
+                f"승률: {win_rate:.2f}%\n"
+                f"잔고: ${balance:,.2f}\n"
+                f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
         )
-        return self.send_message(title, description)
-    
-    def notify_emergency_stop(self, reason: str, total_loss: float):
-        """긴급 정지 알림"""
-        title = "🚨 긴급 정지! 🚨"
-        description = (
-            f"사유: {reason}\n"
-            f"총 손실: -${total_loss:,.2f}\n\n"
-            f"프로그램이 중단되었습니다.\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        return self.send_message(title, description)
-    
-    def notify_dry_run_mode(self):
-        """테스트 모드 알림"""
-        title = "🧪 테스트 모드(DRY RUN) 실행 중"
-        description = (
-            f"실제 주문이 실행되지 않습니다.\n"
-            f"모든 거래는 시뮬레이션됩니다.\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        return self.send_message(title, description)
-    
-    def notify_limit_order_attempt(self, side: str, price: float, quantity: float):
-        """LIMIT 주문 시도 알림"""
-        title = "💡 LIMIT 주문 시도"
-        description = (
-            f"방향: {side}\n"
-            f"가격: ${price:,.2f}\n"
-            f"수량: {quantity:.6f} BTC\n"
-            f"대기 중... (5초)\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        return self.send_message(title, description)
-    
-    def notify_limit_to_market_fallback(self):
-        """LIMIT → MARKET 전환 알림"""
-        title = "🔄 MARKET 주문으로 전환"
-        description = (
-            f"LIMIT 주문 미체결\n"
-            f"MARKET 주문으로 재시도 중...\n"
-            f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        return self.send_message(title, description)
+
+
+class SilentNotifier:
+    """알림 비활성화 시 사용하는 무동작 알림기"""
+
+    def __getattr__(self, name):
+        def silent_method(*args, **kwargs):
+            return True
+
+        return silent_method

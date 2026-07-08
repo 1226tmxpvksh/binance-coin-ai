@@ -25,7 +25,10 @@
 - 5분 주기 시장 감시와 단발 점검 실행을 지원합니다.
 - RSI/EMA/Bollinger 로컬 게이트를 먼저 통과한 경우에만 진입용 AI 판단을 호출해 OpenAI 토큰 사용량을 줄입니다.
 - `trading_stats.json`, `virtual_trades.jsonl`, `ai_learning_logs.csv`에 운영 상태와 학습 기록을 저장합니다.
-- 카카오 액세스 토큰 만료 시 refresh-token으로 자동 갱신하고, 새 토큰을 `.env`와 `kakao_code.json`에 동기화합니다.
+- 카카오 액세스 토큰 만료 시 `refresh_kakao_access_token_sync()`로 중앙 갱신하고, `.env`와 `kakao_code.json`에 동기화합니다.
+- HTTP refresh 성공 시 **카카오톡 갱신 성공 알림**을 발송합니다(`KAKAO_ONCE_PER_DAY` 한도와 별도).
+- **일일 상태 리포트**(`AI_STATUS_REPORT_MINUTES=1440`)에 **당일(KST) 매수·매도 내역**(`virtual_trades.jsonl`)을 포함합니다.
+- **`KakaoNotifier`는 Stateless** — `self`에 토큰을 보관하지 않고, 전송·갱신 시마다 정본에서 실시간 조회합니다 (Stale Token·Replay Attack 방지).
 - refresh-token까지 만료되면 터미널에 인가 URL을 표시하고 새 인가 코드를 입력받아 즉시 세션을 복구합니다.
 - 실행 시작 시 `btc_live_trading`, `btc_day_strategy` 핵심 모듈이 정상 로드되는지 표 형태로 폴더 연결성 체크를 수행합니다.
 - **USDT→KRW**는 CoinGecko `tether` 대비 `krw` 시세를 주기적으로 조회합니다(`btc_live_trading/fx_rates.py`). 수동 `KRW_PER_USDT` 설정은 제거되었습니다.
@@ -34,23 +37,18 @@
 
 ## 설치
 
-프로젝트 루트로 이동합니다.
-
-```powershell
-Set-Location "c:\Users\1226t\Desktop\Coin"
-```
-
-필요한 Python 패키지를 설치합니다.
+저장소 루트(`Coin/`)에서:
 
 ```powershell
 py -3 -m pip install -r btc_live_trading\requirements.txt
+py -3 -m pip install -r ai_trading\requirements.txt
 py -3 -m pip install -r btc_day_strategy\requirements.txt
 ```
 
-OpenAI 관련 패키지가 별도로 필요하면 현재 환경에 설치합니다.
+OpenAI 관련 패키지가 별도로 필요하면:
 
 ```powershell
-py -3 -m pip install openai requests
+py -3 -m pip install openai requests python-dotenv
 ```
 
 ## 환경변수 설정
@@ -58,58 +56,43 @@ py -3 -m pip install openai requests
 운영 환경변수는 기본적으로 `btc_live_trading\.env`를 사용합니다. 파일이 없다면 같은 경로에 새로 만듭니다.
 
 ```env
-# ==========================================
-# 4. 시스템 운영 설정
-# ==========================================
+# === 매매 모드 ===
+AI_DRY_RUN=false                 # true=가상, false=실전
 
-# 9번 라인 모델명 (따옴표, 공백, 주석 절대 금지)
+# === AI / OpenAI ===
 OPENAI_MODEL=gpt-4o
-# 거래 모드 (scalping = 단타)
-TRADING_MODE=scalping
-# 실전 매매 승인 (YES로 설정해야 작동)
-SCALPING_LIVE_CONFIRMED=YES
-# AI 판단 사용 여부
-USE_AI_CONFIRM=true
-# 테스트 모드 (true면 가상 매매; 실전은 false)
-AI_DRY_RUN=false
-# 손절폭 배수 (1.5~2.0 권장)
+OPENAI_ENTRY_MODEL=gpt-4o
+OPENAI_MONITOR_MODEL=gpt-4o-mini
+
+# === 루프·리포트 ===
+AI_LOOP_SECONDS=300              # 5분마다 시장 감시
+AI_TIMEFRAME=15m
+AI_STATUS_REPORT_MINUTES=1440     # 1440=하루 1회(KST) 상태 리포트(당일 매매 내역 포함)
+KAKAO_ONCE_PER_DAY=true           # true=일일 리포트 1회(토큰 갱신 성공 알림은 별도)
+AI_RUN_ONCE=false
+
+# === 가상 자산 (Dry-run·원장 기준) ===
+AI_VIRTUAL_INITIAL_KRW=500000
+AI_VIRTUAL_INITIAL_USDT=362
+AI_PAPER_HOLD_MINUTES=60
+
+# === 진입 게이트 ===
+AI_VOLUME_MIN_RATIO=1.5
+AI_VOLUME_GATE_ENABLED=true
+AI_ATR_MIN_ENTRY_PCT=0.15
+AI_TRADE_ON_WEEKENDS=false
+
+# === 리스크 ===
 AI_ATR_STOP_MULTIPLIER=1.2
-# 월 목표 수익금 (원 단위)
 MONTHLY_TARGET_KRW=100000
 
-# ==========================================
-# 5. 가상 자산 및 루프 엔진 설정
-# ==========================================
-
-# 초기 가상 자산 설정 (50만 원)
-AI_VIRTUAL_INITIAL_KRW=500000
-# 초기 가상 달러 설정 (약 362 USDT)
-AI_VIRTUAL_INITIAL_USDT=362
-
-# 루프 주기 (300초 = 5분마다 시장 감시)
-AI_LOOP_SECONDS=300
-# 가상 포지션 최대 보유 시간 (15분 후 자동 청산)
-AI_PAPER_HOLD_MINUTES=15
-# 카카오톡 상태 보고 주기 (60분마다 현재 수익률 보고)
-AI_STATUS_REPORT_MINUTES=60
-# 1회 실행 후 종료 여부 (무한 루프를 위해 false 설정)
-AI_RUN_ONCE=false
-# 학습 로그(ai_learning_logs.csv) 적재 상한(꼬리 N행만 유지, mtime 캐시와 함께 부하 완화)
-AI_LEARNING_LOG_MAX_ROWS=5000
-
-# ==========================================
-# 6. 운영 비용 및 수익 최적화 설정
-# ==========================================
-
-# 예상 일일 서버 비용 (원 단위, 예: 500원)
+# === 비용 집계 ===
 AI_EST_DAILY_SERVER_COST_KRW=500
-
-# 월간 총 구독료 (커서 $20 + 넷플릭스 + 제미나이 등 합산 원화)
 AI_MONTHLY_SUBSCRIPTION_COST_KRW=80000
 
-# 모델 분기 운영 (기본 mini 사용, 진입 시에만 gpt-4o 호출 권장)
-AI_MONITOR_MODEL=gpt-4o-mini
-AI_ENTRY_MODEL=gpt-4o
+# === 카카오 ===
+KAKAO_ALERTS_ENABLED=true
+AI_LEARNING_LOG_MAX_ROWS=5000
 ```
 
 ### 카카오 인증 값
@@ -126,14 +109,13 @@ AI_ENTRY_MODEL=gpt-4o
 무한 루프 운영:
 
 ```powershell
-Set-Location "c:\Users\1226t\Desktop\Coin"
+# 저장소 루트(Coin/)에서
 py -3 ai_trading\main_ai.py
 ```
 
-단발 점검 실행:
+단발 점검:
 
 ```powershell
-Set-Location "c:\Users\1226t\Desktop\Coin"
 $env:AI_RUN_ONCE="true"
 py -3 ai_trading\main_ai.py
 ```
@@ -198,7 +180,18 @@ py -3 ai_trading\main_ai.py
 - 포지션이 있으면 `open_position`의 코인 수량·진입가·`opened_at_kst`(KST `HH:MM`)를 한 줄에 강조합니다.
 - 포맷 함수: `main_ai._format_cycle_dashboard` (루프 출력은 `run_forever` / `AI_RUN_ONCE` 경로).
 
-## 카카오 401 처리
+## 카카오 OAuth (Stateless + Thread-safe)
+
+| 항목 | 구현 |
+|------|------|
+| **토큰 정본** | `btc_live_trading/kakao_code.json` + `.env` + `os.environ` |
+| **알림 모듈** | `KakaoNotifier` — 인스턴스에 토큰 **미보관**, 매 호출 `get_access_token()` |
+| **중앙 갱신** | `refresh_kakao_access_token_sync()` — Double-checked locking |
+| **401 처리** | 중앙 갱신 → 1회 재전송 |
+| **환경 제한** | `kakao_api_allowed()` — `example1` + `/home/bot2/Coin`만 허용 |
+| **Safety First** | Heartbeat 실패 시 해당 사이클 매매 차단 (`_kakao_auth_ready`) |
+
+### 카카오 401 / 재인증
 
 카카오 401 또는 `expired_or_invalid_refresh_token`이 발생하면 refresh-token까지 만료된 상태입니다.
 
@@ -256,7 +249,7 @@ KOE205가 발생하면 `KAKAO_REDIRECT_URI`와 카카오 개발자 콘솔 Redire
 - `scripts/emergency_exit.py`: `.env` 로드 후 **모든 심볼**의 미결 USDT-M 포지션을 `close_all_usdm_positions`로 시장가 청산합니다. 운영 PC에서 바로 실행할 수 있습니다.
 
 ```powershell
-Set-Location "c:\Users\1226t\Desktop\Coin"
+# 저장소 루트(Coin/)에서
 py -3 scripts\emergency_exit.py
 ```
 
@@ -289,12 +282,11 @@ py -3 scripts\emergency_exit.py
 | 학습 로그 | `_load_learning_rows` mtime 캐시 + `_prune_learning_log` 디스크 트림 + append 후 캐시 무효화 |
 | 거래 로그 회전 | `virtual_trades.jsonl`은 `AI_TRADE_LOG_MAX_LINES`(기본 2000) 초과 시 오래된 라인 자동 삭제 |
 | 단일 실행 | `.coinbot.lock` + `fcntl`/`msvcrt` |
-| 환경 화이트리스트 | `kakao_api_allowed()` — `example1` + `/home/bot2/Coin` 하드코딩 |
+| 환경 화이트리스트 | `kakao_api_allowed()` — `example1` + `/home/bot2/Coin`, 로컬·WSL 차단 |
+| Stateless Kakao | `KakaoNotifier` — self 토큰 제거, 정본 실시간 조회 |
 | Thread-safe Refresh | `refresh_kakao_access_token_sync()` Double-checked locking |
 | 루프 중복 방지 | `_CYCLE_LOCK`, `_wait_for_next_cycle_slot`, 캔들 단위 AI 1회 |
-| 대화형 인증 | `scripts/auth_kakao.py` — URL 출력 + URL/코드 스마트 파싱 |
-| Windows 카카오 | 로컬·WSL·백업 폴더에서 카카오 API 전면 차단 |
-| 레거시 제거 | `btc_live_trading`의 `main_live`·스캘핑·`order_executor` 등 미사용 실전 엔진 일체 삭제, `ai_decisions.log`·`live_trading.log` 제거 |
-| 문서 | 저장소 루트 `README.md` 추가, 본 파일에 구조·실전 기준 정리 |
+| 대화형 인증 | `scripts/auth_kakao.py` — URL/코드 스마트 파싱 |
+| 레거시 제거 | `main_live`·스캘핑·`order_executor` 등 미사용 엔진 삭제 |
 
 **실전 주문 경로**: `AI_DRY_RUN=false`일 때 진입 `futures_market_open_position`, 청산·종료 `market_close_symbol` / `close_all_usdm_positions`, 잔고 `fetch_futures_usdt_balance_from_env`. 가상 원장(`virtual_balance_*`)은 통계·손익 추적용으로 갱신되며, **체결은 위 API만 사용**합니다.

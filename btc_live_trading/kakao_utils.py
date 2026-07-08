@@ -14,13 +14,30 @@ import socket
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 _KAKAO_REFRESH_LOCK = threading.Lock()
+_KAKAO_REFRESH_LISTENER: Callable[[], None] | None = None
+
+
+def register_kakao_token_refresh_listener(callback: Callable[[], None] | None) -> None:
+    """HTTP refresh 성공 시 호출할 콜백 등록(알림 등). None이면 해제."""
+    global _KAKAO_REFRESH_LISTENER
+    _KAKAO_REFRESH_LISTENER = callback
+
+
+def _notify_kakao_token_http_refreshed() -> None:
+    cb = _KAKAO_REFRESH_LISTENER
+    if cb is None:
+        return
+    try:
+        cb()
+    except Exception:
+        logger.debug("카카오 refresh 리스너 실행 실패", exc_info=True)
 
 # 작업 디렉터리(CWD)와 무관하게 항상 같은 파일을 읽고 쓰도록 절대경로로 고정한다.
 _MODULE_DIR = Path(os.path.abspath(os.path.dirname(__file__)))
@@ -550,6 +567,7 @@ def refresh_kakao_access_token_sync(client_id: str, refresh_token: str = "") -> 
         new_access = apply_token_response(token_data)
         if new_access:
             logger.info("카카오 액세스 토큰 자동 갱신 완료 (thread-safe)")
+            _notify_kakao_token_http_refreshed()
         return new_access or ""
 
 

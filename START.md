@@ -91,11 +91,13 @@ sed -i 's/\r$//' /home/bot2/Coin/scripts/coinbot_watch.sh
 | `bot2 is not in the sudoers` | 재시작은 **root**에서 `systemctl restart` |
 | `$'\r': command not found` | §3 `sed` 실행 |
 | `main_ai.py`가 여러 개 실행됨 | `pgrep -af main_ai.py` → `systemctl stop coinbot.service` → 재시작 |
-| 로컬/WSL에서 카카오 인증 시도 | **불가** — Vultr `example1` + `/home/bot2/Coin` 에서만 허용 |
+| 카톡이 **1시간마다** 옴 | 서버 `.env` 확인: `grep AI_STATUS_REPORT_MINUTES /home/bot2/Coin/btc_live_trading/.env` → `1440` 으로 변경, `KAKAO_ONCE_PER_DAY=true` 추가 후 재시작 |
+| 토큰 갱신 알림이 **6시간마다** 옴 | 정상 (`🔑 카카오 토큰 갱신 성공`). 일일 리포트(1회)와 별개 |
 
 ---
 
 ## 5. 더 보기
 
 - 최초 서버 세팅(systemd, venv, `.env`): [VULTR_DEPLOY.md](btc_live_trading/VULTR_DEPLOY.md)
-- 카카오 토큰·Safety First 상세: [README.md](README.md)
+- 엔진·환경변수·카카오 상세: [ai_trading/README.md](ai_trading/README.md)
+- 시스템 개요·아키텍처: [README.md](README.md)

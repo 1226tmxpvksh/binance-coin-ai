@@ -4,15 +4,14 @@
 
 ## 📂 프로젝트 구조
 
-이 프로젝트는 두 개의 분리된 폴더로 구성됩니다:
+| 폴더 | 역할 |
+|------|------|
+| **`btc_day_strategy/`** | 백테스트 전용 (이 폴더) |
+| **`ai_trading/`** | 실전 AI 매매 엔진 (`main_ai.py`) |
+| **`btc_live_trading/`** | 공용 `.env`, 카카오, 환율, 전략 모듈 |
 
-- **btc_day_strategy/** - 백테스트 전용 (이 폴더)
-- **btc_live_trading/** - 실전 매매 전용
-
-> ⚠️ **이 폴더는 백테스트 전용입니다!**
-> 
-> 실전 매매는 `btc_live_trading` 폴더에서 수행하세요.
-> 전략 모듈은 두 폴더가 공유합니다.
+> ⚠️ **이 폴더는 백테스트 전용입니다.**  
+> 실전 매매는 **`ai_trading/main_ai.py`** 를 사용하세요. (`../ai_trading/README.md` 참고)
 
 ## 📋 전략 개요
 
@@ -62,11 +61,10 @@ btc_day_strategy/              # 백테스트 전용 (이 폴더)
 ├── risk_manager.py            # 리스크 관리 (공유)
 ├── data_loader.py             # 데이터 로드 (공유)
 ├── .env.example               # 환경 변수 예제
-├── README.md                  # 이 문서
-└── README_COMPARISON.md       # 비교 상세 가이드
+└── README.md                  # 이 문서
 
-../ai_trading/                 # 실전 AI 매매 엔진 (main_ai.py)
-../btc_live_trading/           # 공용 .env·카카오·환율·전략 모듈
+../ai_trading/                 # 실전 AI 매매 (main_ai.py)
+../btc_live_trading/           # 공용 .env·카카오·환율·strategy/
 ```
 
 ## 🚀 빠른 시작
@@ -216,21 +214,62 @@ MIN_POSITION_SIZE_USDT = 20  # 바이낸스 최소
 - 단일 포지션만 허용
 - 하루 1회 진입 제한
 
+## 📊 전략 비교 상세 (`compare_strategies.py`)
+
+원본 설정(RISK 2%)과 실전 설정(RISK 1%)을 나란히 백테스트합니다.
+
+### 실행
+
+```bash
+cd btc_day_strategy
+python compare_strategies.py
+# Windows: run_comparison.bat
+```
+
+### 출력
+
+| 위치 | 내용 |
+|------|------|
+| 콘솔 | 수익률·승률·낙폭·거래 횟수 비교 테이블 |
+| `output/original/` | 원본 전략(RISK 2%) 그래프 |
+| `output/live_settings/` | 실전 설정(RISK 1%) 그래프 |
+| `output/comparison/` | 자본 곡선·리스크 비교 차트 |
+| `strategy_comparison.log` | 실행 로그 |
+
+### 해석 가이드
+
+| 상황 | 권장 |
+|------|------|
+| 수익률 우선 | 원본(RISK 2%) — 낙폭 감수 필요 |
+| 안정성 우선 | 실전(RISK 1%) — 샤프·낙폭 유리 |
+| 실전 적용 전 | `compare_strategies.py` → `AI_DRY_RUN=true` 1주일+ |
+
+### 트러블슈팅
+
+- **데이터 로드 실패** → `.env` API 키·인터넷·바이낸스 API 상태 확인
+- **한글 폰트 오류** → Windows는 자동. Mac/Linux는 `NanumGothic` 등 설치 후 `visualization.py` 수정
+- **메모리 부족** → `config.py`의 `START_DATE`/`END_DATE` 기간 축소
+
+커스텀 설정 비교: `config_live_settings.py`를 복사해 수정 후 `compare_strategies.py`에서 import.
+
+---
+
 ## 📚 관련 문서
 
-- `README_COMPARISON.md` - 전략 비교 상세 가이드
-- `../ai_trading/README.md` - 실전 AI 매매 가이드
+- `../README.md` — 시스템 개요·아키텍처
+- `../ai_trading/README.md` — 실전 AI 매매 가이드
+- `../START.md` — Vultr 서버 운영
 
 ## ❓ 자주 묻는 질문
 
 ### Q1: 실전 매매는 어디서 하나요?
-→ 저장소 루트에서 `py ai_trading\main_ai.py` 실행 (`ai_trading/README.md` 참고)
+→ **`ai_trading/main_ai.py`** (저장소 루트에서 `py -3 ai_trading\main_ai.py`)
 
 ### Q2: 실전 설정으로 백테스트하려면?
 → `python compare_strategies.py` 실행
 
 ### Q3: 백테스트와 실전 전략이 같나요?
-→ 네! 전략 모듈(indicators, strategy_entry, strategy_exit 등)을 공유합니다.
+→ **부분 공유.** `btc_live_trading/strategy/` 모듈을 `main_ai`가 참조합니다. AI 15m 엔진과 일봉 백테스트 전략은 별개입니다.
 
 ### Q4: config.py와 config_live_settings.py 차이는?
 → `config.py`: 원본 공격적 설정 (RISK 2%)

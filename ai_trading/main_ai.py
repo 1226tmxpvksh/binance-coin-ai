@@ -97,6 +97,7 @@ except Exception as exc:
 
 try:
     from btc_live_trading.kakao_notifier import KakaoNotifier
+    from btc_live_trading.async_notifier import AsyncNotifier
     from btc_live_trading.kakao_utils import (
         LOCALHOST_REDIRECT_URI,
         apply_token_response as _apply_kakao_token_response,
@@ -111,10 +112,12 @@ try:
         open_kakao_auth_url as _open_kakao_auth_url,
         refresh_kakao_access_token_sync as _refresh_kakao_access_token_sync,
         refresh_access_token_request as _refresh_kakao_access_token_request,
+        register_kakao_token_refresh_listener as _register_kakao_token_refresh_listener,
         validate_access_token as _validate_kakao_access_token_util,
     )
 except Exception:
     KakaoNotifier = None
+    AsyncNotifier = None
     _apply_kakao_token_response = None  # type: ignore
     _capture_kakao_auth_localhost = None  # type: ignore
     _clear_kakao_auth_code = None  # type: ignore
@@ -126,6 +129,7 @@ except Exception:
     _open_kakao_auth_url = None  # type: ignore
     _refresh_kakao_access_token_sync = None  # type: ignore
     _refresh_kakao_access_token_request = None  # type: ignore
+    _register_kakao_token_refresh_listener = None  # type: ignore
     _validate_kakao_access_token_util = None  # type: ignore
     get_access_token = None  # type: ignore
 
@@ -136,6 +140,7 @@ SINGLE_INSTANCE_LOCK_PATH = ROOT_DIR / ".coinbot.lock"
 _SINGLE_INSTANCE_LOCK_HANDLE: Any | None = None
 ENV_LINE_MAP: Dict[str, int] = {}
 KAKAO_AUTH_LINK_LOGGED = False
+KAKAO_REPORT_SETTINGS_LOGGED = False
 KAKAO_MANUAL_RECOVERY_ATTEMPTED = False
 KAKAO_AUTH_EXHAUSTED = False
 KAKAO_ENV_CODE_TRIED = False
@@ -157,6 +162,8 @@ _ORPHAN_POSITION_ALERT_SENT = False
 _SIGNAL_HANDLERS_INSTALLED = False
 _LEARNING_ROWS_CACHE_MTIME: float | None = None
 _LEARNING_ROWS_CACHE_ROWS: List[Dict[str, str]] = []
+_ASYNC_KAKAO: Any | None = None
+_KAKAO_NOTIFIER_CORE: Any | None = None
 
 LEARNING_FIELDNAMES = [
     "logged_at_kst",
@@ -240,6 +247,7 @@ def _check_project_connectivity() -> bool:
             "연결 확인: btc_live_trading 모듈 로드 완료",
             [
                 "btc_live_trading.kakao_notifier",
+                "btc_live_trading.async_notifier",
                 "btc_live_trading.kakao_utils",
                 "btc_live_trading.strategy.risk_manager",
             ],
@@ -1377,28 +1385,149 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
     return ""
 
 
-def _notify_kakao(title: str, body: str) -> bool:
-    """카카오 알림 전송. 실패해도 매매 루프에는 영향 없음(다음 사이클 재시도)."""
+def _build_kakao_notifier_core():
+    if KakaoNotifier is None:
+        return None
+    rest = _env_str("KAKAO_REST_API_KEY", "")
+    if not rest:
+        return None
+    return KakaoNotifier(enabled=True, rest_api_key=rest)
+
+
+def _ensure_async_kakao_started() -> None:
+    """AsyncNotifier 워커 기동(프로세스당 1회)."""
+    global _ASYNC_KAKAO, _KAKAO_NOTIFIER_CORE
+    if AsyncNotifier is None or KakaoNotifier is None or _hydrate_kakao_tokens is None:
+        return
+    if not _kakao_alerts_enabled():
+        return
+    if _ASYNC_KAKAO is not None and _ASYNC_KAKAO.is_running:
+        return
+    _hydrate_kakao_tokens()
+    core = _build_kakao_notifier_core()
+    if core is None:
+        return
+    _KAKAO_NOTIFIER_CORE = core
+    _ASYNC_KAKAO = AsyncNotifier(core)
+    _ASYNC_KAKAO.start()
+
+
+def _shutdown_async_kakao(*, drain_timeout: float = 5.0) -> None:
+    global _ASYNC_KAKAO, _KAKAO_NOTIFIER_CORE
+    if _ASYNC_KAKAO is not None:
+        _ASYNC_KAKAO.stop(drain_timeout=drain_timeout)
+        _ASYNC_KAKAO = None
+    _KAKAO_NOTIFIER_CORE = None
+
+
+def _kakao_once_per_day_enabled() -> bool:
+    return _env_bool("KAKAO_ONCE_PER_DAY", True)
+
+
+def _resolve_status_report_minutes() -> int:
+    """일일 1회 모드면 최소 1440분(하루 1회)으로 보정 — 서버 .env에 60이 남아 있어도 시간마다 발송 방지."""
+    raw = _env_int("AI_STATUS_REPORT_MINUTES", 1440)
+    if _kakao_once_per_day_enabled() and raw < 1440:
+        logger.warning(
+            "KAKAO_ONCE_PER_DAY=true 인데 AI_STATUS_REPORT_MINUTES=%s — 1440(하루 1회 KST)으로 보정합니다. "
+            "서버 btc_live_trading/.env 에 AI_STATUS_REPORT_MINUTES=1440 을 설정하세요.",
+            raw,
+        )
+        return 1440
+    return raw
+
+
+def _log_kakao_report_settings_once() -> None:
+    global KAKAO_REPORT_SETTINGS_LOGGED
+    if KAKAO_REPORT_SETTINGS_LOGGED:
+        return
+    KAKAO_REPORT_SETTINGS_LOGGED = True
+    logger.info(
+        "카카오 리포트 설정: KAKAO_ONCE_PER_DAY=%s, AI_STATUS_REPORT_MINUTES=%s (적용=%s분)",
+        _kakao_once_per_day_enabled(),
+        _env_str("AI_STATUS_REPORT_MINUTES", "(미설정→1440)"),
+        _resolve_status_report_minutes(),
+    )
+
+
+def _load_stats_for_kakao_gate() -> Dict[str, Any]:
+    krw_per_usdt = _krw_per_usdt()
+    initial_krw, initial_usdt = _initial_balances(krw_per_usdt)
+    return load_trading_stats(
+        initial_balance_krw=initial_krw,
+        initial_balance_usdt=initial_usdt,
+    )
+
+
+def _kakao_already_sent_today(now_kst: datetime | None = None) -> bool:
+    now = now_kst or datetime.now(KST)
+    stats = _load_stats_for_kakao_gate()
+    return str(stats.get("last_kakao_sent_date_kst", "")).strip() == now.date().isoformat()
+
+
+def _mark_kakao_sent_today(now_kst: datetime | None = None) -> None:
+    now = now_kst or datetime.now(KST)
+    stats = _load_stats_for_kakao_gate()
+    stats["last_kakao_sent_date_kst"] = now.date().isoformat()
+    save_trading_stats(stats)
+
+
+def _notify_kakao_token_refresh_success() -> None:
+    """액세스 토큰 HTTP 갱신 성공 시 카카오 알림(일일 리포트 한도와 별도)."""
+    now = datetime.now(KST)
+    body = "\n".join(
+        [
+            "━━━━━━━━━━━━━━━━━━━━",
+            "🔑 카카오 토큰 갱신 완료",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"시각: {now.strftime('%Y-%m-%d %H:%M:%S KST')}",
+            "액세스 토큰이 정상적으로 갱신되었습니다.",
+            "일일 리포트·알림 발송에 사용할 수 있습니다.",
+        ]
+    )
+    _notify_kakao("🔑 카카오 토큰 갱신 성공", body, exempt_daily_limit=True)
+
+
+def _notify_kakao(title: str, body: str, *, sync: bool = False, daily_digest: bool = False, exempt_daily_limit: bool = False) -> bool:
+    """카카오 알림 — 기본 비동기(매매 블로킹 방지), sync=True는 종료·긴급용."""
     try:
-        if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
+        if KakaoNotifier is None or _hydrate_kakao_tokens is None:
             return False
         if not _kakao_alerts_enabled():
             return False
-        _hydrate_kakao_tokens()
-        rest = _env_str("KAKAO_REST_API_KEY", "")
-        if not rest:
+        if not _env_str("KAKAO_REST_API_KEY", ""):
             return False
-        refresh = _get_kakao_refresh_token().strip() if _get_kakao_refresh_token else ""
-        notifier = KakaoNotifier(
-            access_token=get_access_token().strip(),
-            enabled=True,
-            rest_api_key=rest,
-            refresh_token=refresh,
-            prompt_on_refresh_failure=False,
-        )
-        ok = notifier.send_message(title, body)
-        if not ok:
-            logger.warning("카카오 알림 전송 실패(다음 사이클 재시도): %s", title[:60])
+
+        if _kakao_once_per_day_enabled() and not daily_digest and not exempt_daily_limit:
+            logger.debug("카카오 일일 1회 제한 — 상태 리포트 외 알림 생략: %s", title[:60])
+            return False
+
+        if daily_digest and _kakao_once_per_day_enabled() and _kakao_already_sent_today():
+            logger.debug("카카오 일일 1회 제한 — 오늘(KST) 이미 발송함: %s", title[:60])
+            return False
+
+        ok = False
+        if sync:
+            core = _KAKAO_NOTIFIER_CORE or _build_kakao_notifier_core()
+            if core is None:
+                return False
+            ok = bool(core.send_message(title, body))
+            if not ok:
+                logger.warning("카카오 동기 알림 실패: %s", title[:60])
+        else:
+            _ensure_async_kakao_started()
+            if _ASYNC_KAKAO is not None:
+                ok = bool(_ASYNC_KAKAO.send_message(title, body))
+                if not ok:
+                    logger.warning("카카오 알림 큐 적재 실패: %s", title[:60])
+            else:
+                core = _build_kakao_notifier_core()
+                if core is None:
+                    return False
+                ok = bool(core.send_message(title, body))
+
+        if ok and daily_digest and _kakao_once_per_day_enabled():
+            _mark_kakao_sent_today()
         return ok
     except Exception as exc:
         logger.error("카카오 알림 전송 중 예외 발생(매매에는 영향 없음): %s", type(exc).__name__)
@@ -2208,16 +2337,120 @@ def _open_position(
 
 
 def _should_send_periodic_report(stats: Dict[str, Any], now_kst: datetime, interval_minutes: int) -> bool:
+    """주기 리포트 발송 여부. interval>=1440 이면 KST 날짜 기준 하루 1회."""
     if interval_minutes <= 0:
+        return True
+    today = now_kst.date().isoformat()
+    if interval_minutes >= 1440:
+        if str(stats.get("last_kakao_sent_date_kst", "")).strip() == today:
+            return False
+        raw = str(stats.get("last_report_at_kst", "")).strip()
+        if raw:
+            try:
+                last_report = datetime.fromisoformat(raw)
+                if last_report.tzinfo is None:
+                    last_report = last_report.replace(tzinfo=KST)
+                else:
+                    last_report = last_report.astimezone(KST)
+                if last_report.date() == now_kst.date():
+                    return False
+            except ValueError:
+                pass
         return True
     raw = str(stats.get("last_report_at_kst", "")).strip()
     if not raw:
         return True
     try:
         last_report = datetime.fromisoformat(raw)
+        if last_report.tzinfo is None:
+            last_report = last_report.replace(tzinfo=KST)
+        else:
+            last_report = last_report.astimezone(KST)
     except ValueError:
         return True
     return now_kst - last_report >= timedelta(minutes=interval_minutes)
+
+
+def _parse_kst_datetime(raw: Any) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        else:
+            dt = dt.astimezone(KST)
+        return dt
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_today_trade_events(now_kst: datetime) -> List[Dict[str, Any]]:
+    """virtual_trades.jsonl 에서 오늘(KST) 진입·청산 이벤트만 시간순 반환."""
+    if not TRADE_LOG_PATH.exists():
+        return []
+    today = now_kst.date()
+    events: List[Tuple[datetime, Dict[str, Any]]] = []
+    try:
+        with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                kind = str(ev.get("event", "")).lower()
+                if kind == "open":
+                    dt = _parse_kst_datetime(ev.get("logged_at_kst", ""))
+                elif kind == "close":
+                    dt = _parse_kst_datetime(ev.get("exit_at_kst") or ev.get("logged_at_kst", ""))
+                else:
+                    continue
+                if dt is None or dt.date() != today:
+                    continue
+                events.append((dt, ev))
+    except OSError:
+        return []
+    events.sort(key=lambda x: x[0])
+    return [ev for _, ev in events]
+
+
+def _format_daily_trade_summary(now_kst: datetime) -> str:
+    """일일 카카오 리포트용 — 오늘(KST) 매수·매도(진입·청산) 내역."""
+    events = _load_today_trade_events(now_kst)
+    if not events:
+        return "오늘 매매 내역 없음"
+    lines: List[str] = []
+    for ev in events:
+        kind = str(ev.get("event", "")).lower()
+        symbol = str(ev.get("symbol", "BTCUSDT"))
+        side = str(ev.get("side", "")).upper()
+        side_label = "매수" if side == "BUY" else "매도" if side == "SELL" else side or "—"
+        if kind == "open":
+            t = _format_opened_at_kst(ev.get("logged_at_kst", ""))
+            price = _format_price(ev.get("entry_price", 0.0))
+            mode = str(ev.get("order_mode", "")).lower()
+            mode_tag = " · 가상" if mode == "paper" else ""
+            lines.append(f"· {t} {side_label} 진입 {symbol} @ {price}{mode_tag}")
+        elif kind == "close":
+            t = _format_opened_at_kst(ev.get("exit_at_kst") or ev.get("logged_at_kst", ""))
+            price = _format_price(ev.get("exit_price", 0.0))
+            pnl_krw = _safe_float(ev.get("pnl_krw", 0.0))
+            sign = "+" if pnl_krw >= 0 else ""
+            line = (
+                f"· {t} {side_label} 청산 {symbol} @ {price} "
+                f"({sign}{pnl_krw:,.0f}원 / {_safe_float(ev.get('pnl_usdt', 0.0)):+.4f} USDT)"
+            )
+            reason = str(ev.get("exit_reason", "")).strip()
+            if reason:
+                line += f" — {reason}"
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def _build_kakao_message(
@@ -2230,7 +2463,9 @@ def _build_kakao_message(
     dry_run: bool,
     live_futures_usdt: float | None,
     krw_per_usdt: float,
+    now_kst: datetime | None = None,
 ) -> str:
+    now = now_kst or datetime.now(KST)
     ledger = summarize_ledger(stats)
     rb_krw, rb_usdt, rb_pct = resolve_report_balances(
         stats,
@@ -2274,6 +2509,9 @@ def _build_kakao_message(
         f"최근 개선점: {_report_text(ledger.last_reflection_summary, '아직 기록된 반성 없음')}",
         f"유사 실패 경고: {_report_text(learning_summary, '현재 유사한 실패 사례 없음')}",
         f"오늘 판단/진입: {total_count}회 / {attempt_count}회",
+        "",
+        "📅 [오늘 매매 내역 (KST)]",
+        _format_daily_trade_summary(now),
         "",
         "📊 [원장]",
         f"{bal_label}: {rb_krw:,.0f}원 ({sign}{rb_pct:.2f}%) / {rb_usdt:,.2f} USDT",
@@ -2471,6 +2709,7 @@ def _graceful_shutdown_work(trigger: Any) -> None:
         _notify_kakao(
             "⚠️ 긴급 청산 실패",
             f"{symbol}: 청산 유틸리티를 불러올 수 없습니다. `scripts/emergency_exit.py`를 실행하세요. 트리거: {trigger}",
+            sync=True,
         )
     elif need_exchange_close:
         ok, msg = _market_close_symbol(client, symbol)
@@ -2479,6 +2718,7 @@ def _graceful_shutdown_work(trigger: Any) -> None:
             _notify_kakao(
                 "프로그램 종료로 인해 포지션을 긴급 청산했습니다.",
                 f"{symbol} 청산 완료 ({msg}). 트리거: {trigger}",
+                sync=True,
             )
             stats["open_position"] = None
             save_trading_stats(stats)
@@ -2488,6 +2728,7 @@ def _graceful_shutdown_work(trigger: Any) -> None:
                 "⚠️ 긴급 청산 실패",
                 f"{symbol} 시장가 청산에 실패했습니다({msg}). "
                 f"`scripts/emergency_exit.py` 실행 또는 바이낸스에서 수동 확인하세요. 트리거: {trigger}",
+                sync=True,
             )
     elif dry_run and had_ledger:
         stats["open_position"] = None
@@ -2496,11 +2737,13 @@ def _graceful_shutdown_work(trigger: Any) -> None:
         _notify_kakao(
             "프로그램 종료로 인해 포지션을 긴급 청산했습니다.",
             f"가상 매매 원장의 오픈 포지션을 종료 처리했습니다. 트리거: {trigger}",
+            sync=True,
         )
     elif had_ledger and abs(ex_amt) < 1e-12:
         stats["open_position"] = None
         save_trading_stats(stats)
         logger.info("종료 정리(%s): 원장만 정리(거래소 무포지션)", trigger)
+    _shutdown_async_kakao()
 
 
 def _shutdown_signal_handler(signum: int, frame: Any) -> None:
@@ -2603,9 +2846,15 @@ def _run_weekend_monitor_cycle(
             f"{symbol} ({interval}) 포지션 청산: {close_info.get('close_event', {}).get('exit_reason', '')}",
         )
     elif open_position and _should_send_periodic_report(stats, now_kst, status_report_minutes):
+        trade_summary = _format_daily_trade_summary(now_kst)
         _notify_kakao(
             f"📊 {_report_bracket_title(dry_run)} 주말 감시",
-            f"{weekend_reason}\n보유: {open_position.get('side', '')} @ {_format_price(open_position.get('entry_price', 0.0))}",
+            (
+                f"{weekend_reason}\n"
+                f"보유: {open_position.get('side', '')} @ {_format_price(open_position.get('entry_price', 0.0))}\n\n"
+                f"📅 [오늘 매매 내역 (KST)]\n{trade_summary}"
+            ),
+            daily_digest=True,
         )
         stats["last_report_at_kst"] = now_kst.isoformat()
         save_trading_stats(stats)
@@ -2645,7 +2894,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
     monitor_model = _env_str("OPENAI_MONITOR_MODEL", _env_str("AI_MONITOR_MODEL", "gpt-4o-mini"))
     krw_per_usdt = _krw_per_usdt()
     hold_minutes = _env_int("AI_PAPER_HOLD_MINUTES", 60)
-    status_report_minutes = _env_int("AI_STATUS_REPORT_MINUTES", 60)
+    status_report_minutes = _resolve_status_report_minutes()
     initial_krw, initial_usdt = _initial_balances(krw_per_usdt)
     stats = load_trading_stats(
         initial_balance_krw=initial_krw,
@@ -2886,7 +3135,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
         now_kst=now_kst,
     )
 
-    send_report = bool(opened_position or close_info or _should_send_periodic_report(stats, now_kst, status_report_minutes))
+    send_report = _should_send_periodic_report(stats, now_kst, status_report_minutes)
     if send_report:
         monitor_summary = get_market_monitor_summary(snapshot, model=monitor_model)
         stats["ai_monitor_calls"] = _safe_int(stats.get("ai_monitor_calls", 0)) + 1
@@ -2900,8 +3149,9 @@ def _run_cycle_impl() -> Dict[str, Any]:
             dry_run=dry_run,
             live_futures_usdt=live_wallet_usdt,
             krw_per_usdt=krw_per_usdt,
+            now_kst=now_kst,
         )
-        _notify_kakao(f"📊 {_report_bracket_title(dry_run)} AI Self-Learning Engine", msg)
+        _notify_kakao(f"📊 {_report_bracket_title(dry_run)} AI Self-Learning Engine", msg, daily_digest=True)
         stats["last_report_at_kst"] = now_kst.isoformat()
         save_trading_stats(stats)
     return report
@@ -2921,11 +3171,18 @@ def _initialize_trading_loop_once(*, send_startup_report: bool = True) -> None:
         return
 
     _load_env()
+    _log_kakao_report_settings_once()
     install_shutdown_handlers()
     prune_stats_history()
     _prune_trade_log()
     _prune_learning_log()
     _check_project_connectivity()
+    try:
+        _ensure_async_kakao_started()
+    except Exception as exc:
+        logger.error("카카오 비동기 알림 워커 기동 실패: %s", type(exc).__name__)
+    if _register_kakao_token_refresh_listener is not None:
+        _register_kakao_token_refresh_listener(_notify_kakao_token_refresh_success)
     try:
         _bootstrap_kakao_tokens()
     except Exception as exc:
