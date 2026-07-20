@@ -143,6 +143,9 @@ KAKAO_AUTH_LINK_LOGGED = False
 KAKAO_REPORT_SETTINGS_LOGGED = False
 KAKAO_MANUAL_RECOVERY_ATTEMPTED = False
 KAKAO_AUTH_EXHAUSTED = False
+# 인증 대기 모드: exhausted 시각(monotonic)과 차단 로그 최근 출력 시각
+KAKAO_AUTH_EXHAUSTED_AT_MONO = 0.0
+KAKAO_AUTH_BLOCKED_LOG_AT_MONO = 0.0
 KAKAO_ENV_CODE_TRIED = False
 KAKAO_LOCAL_OAUTH_TRIED = False
 _KAKAO_ENV_WARNED = False
@@ -923,8 +926,13 @@ def _log_kakao_manual_auth_link(reason: str) -> None:
 
 
 def _mark_kakao_auth_exhausted(reason: str) -> None:
-    """리프레시 만료 등 재인증 전까지 카카오 API 재시도·로그 스팸 방지."""
-    global KAKAO_AUTH_EXHAUSTED
+    """리프레시 만료 등 재인증 전까지 카카오 API 재시도·로그 스팸 방지.
+
+    영구 차단이 아니라 '인증 대기 모드' 진입: KAKAO_AUTH_RETRY_MINUTES(기본 30분)
+    간격으로 자동 복구를 재시도한다 (`_ensure_kakao_access_token` 참조).
+    """
+    global KAKAO_AUTH_EXHAUSTED, KAKAO_AUTH_EXHAUSTED_AT_MONO
+    KAKAO_AUTH_EXHAUSTED_AT_MONO = time.monotonic()
     if KAKAO_AUTH_EXHAUSTED:
         return
     KAKAO_AUTH_EXHAUSTED = True
@@ -934,11 +942,31 @@ def _mark_kakao_auth_exhausted(reason: str) -> None:
 def _clear_kakao_auth_exhausted() -> None:
     global KAKAO_AUTH_EXHAUSTED, KAKAO_AUTH_LINK_LOGGED, KAKAO_MANUAL_RECOVERY_ATTEMPTED
     global KAKAO_ENV_CODE_TRIED, KAKAO_LOCAL_OAUTH_TRIED
+    global KAKAO_AUTH_EXHAUSTED_AT_MONO, KAKAO_AUTH_BLOCKED_LOG_AT_MONO
     KAKAO_AUTH_EXHAUSTED = False
     KAKAO_AUTH_LINK_LOGGED = False
     KAKAO_MANUAL_RECOVERY_ATTEMPTED = False
     KAKAO_ENV_CODE_TRIED = False
     KAKAO_LOCAL_OAUTH_TRIED = False
+    KAKAO_AUTH_EXHAUSTED_AT_MONO = 0.0
+    KAKAO_AUTH_BLOCKED_LOG_AT_MONO = 0.0
+
+
+def _kakao_auth_retry_interval_seconds() -> int:
+    return max(1, _env_int("KAKAO_AUTH_RETRY_MINUTES", 30)) * 60
+
+
+def _kakao_auth_recovery_due() -> bool:
+    """인증 대기 모드에서 자동 복구를 다시 시도할 때가 됐는지."""
+    if KAKAO_AUTH_EXHAUSTED_AT_MONO <= 0:
+        return True
+    return time.monotonic() - KAKAO_AUTH_EXHAUSTED_AT_MONO >= _kakao_auth_retry_interval_seconds()
+
+
+def _touch_kakao_auth_exhausted() -> None:
+    """복구 재시도 실패 시 다음 재시도 시각을 갱신(재시도 폭주 방지)."""
+    global KAKAO_AUTH_EXHAUSTED_AT_MONO
+    KAKAO_AUTH_EXHAUSTED_AT_MONO = time.monotonic()
 
 
 def _kakao_redirect_supports_localhost(redirect_uri: str) -> bool:
@@ -1298,32 +1326,88 @@ def _validate_kakao_access_token(access_token: str) -> bool:
         return False
 
 
+def _is_kakao_invalid_grant(error_code: str, error_description: str) -> bool:
+    return error_code in {"expired_or_invalid_refresh_token", "invalid_grant"} or (
+        "expired_or_invalid_refresh_token" in (error_description or "")
+        or "invalid_grant" in (error_description or "").lower()
+    )
+
+
 def _refresh_kakao_access_token(
     refresh_token: str,
     rest_api_key: str,
     *,
     mark_exhausted_on_expire: bool = True,
+    max_attempts: int = 3,
 ) -> str:
+    """refresh_token으로 액세스 토큰 갱신. 최대 max_attempts회 재시도.
+
+    재시도 사이에 kakao_code.json 정본을 다시 읽는다 — 봇이 도는 동안 운영자가
+    coinbot_watch.sh / auth_kakao.py 로 재인증하면 새 마스터 열쇠를 즉시 집어 쓴다.
+    같은 토큰으로 invalid_grant 가 반복되면 조기 중단(무의미한 HTTP 방지).
+    """
     if not refresh_token or not rest_api_key or _refresh_kakao_access_token_sync is None:
+        logger.error(
+            "카카오 refresh 호출 불가: refresh_token=%s rest_api_key=%s sync_fn=%s",
+            "있음" if refresh_token else "없음",
+            "있음" if rest_api_key else "없음",
+            "있음" if _refresh_kakao_access_token_sync is not None else "없음",
+        )
         return ""
-    try:
-        access_token = _refresh_kakao_access_token_sync(rest_api_key, refresh_token).strip()
-        if access_token:
-            _clear_kakao_auth_exhausted()
-        return access_token
-    except Exception as exc:
-        error_code, error_description = _extract_kakao_error(exc)
-        if error_code in {"expired_or_invalid_refresh_token", "invalid_grant"}:
-            if mark_exhausted_on_expire:
-                _mark_kakao_auth_exhausted("리프레시 토큰이 만료되었거나 유효하지 않습니다.")
-            else:
-                logger.info("카카오 리프레시 토큰 만료 — 브라우저 재인증을 진행합니다.")
-        elif not KAKAO_AUTH_LINK_LOGGED:
-            if error_code:
-                logger.warning("카카오 리프레시 토큰 갱신 실패: %s (%s)", error_code, error_description or type(exc).__name__)
-            else:
-                logger.warning("카카오 리프레시 토큰 갱신 실패: %s", type(exc).__name__)
-        return ""
+
+    current_rt = refresh_token
+    invalid_grant_seen = False
+    for attempt in range(1, max_attempts + 1):
+        try:
+            access_token = _refresh_kakao_access_token_sync(rest_api_key, current_rt).strip()
+            if access_token:
+                _clear_kakao_auth_exhausted()
+                if attempt > 1:
+                    logger.info("카카오 토큰 갱신 성공 (재시도 %s/%s회 만에 복구)", attempt, max_attempts)
+                return access_token
+            logger.error(
+                "카카오 refresh HTTP는 예외 없이 끝났으나 access_token이 비어 있습니다 (시도 %s/%s). "
+                "화이트리스트 차단·빈 refresh·카카오 응답 이상을 확인하세요.",
+                attempt,
+                max_attempts,
+            )
+        except Exception as exc:
+            error_code, error_description = _extract_kakao_error(exc)
+            # 원인 추적용 — invalid_grant 포함 모든 refresh 실패를 ERROR로 남긴다.
+            logger.error(
+                "카카오 리프레시 토큰 갱신 실패 (시도 %s/%s): code=%s desc=%s exc=%s",
+                attempt,
+                max_attempts,
+                error_code or "(없음)",
+                error_description or "(없음)",
+                type(exc).__name__,
+            )
+            invalid_grant_seen = _is_kakao_invalid_grant(error_code, error_description)
+
+        if attempt >= max_attempts:
+            break
+
+        # 재시도 전 정본 재동기화 — 외부 재인증으로 새 refresh_token이 저장됐을 수 있다.
+        if _hydrate_kakao_tokens is not None:
+            _hydrate_kakao_tokens()
+        newest_rt = _get_kakao_refresh_token().strip() if _get_kakao_refresh_token is not None else ""
+        if newest_rt and newest_rt != current_rt:
+            logger.info("정본에서 새 refresh_token 감지 — 새 마스터 열쇠로 즉시 재시도합니다.")
+            current_rt = newest_rt
+            invalid_grant_seen = False
+            continue
+        if invalid_grant_seen:
+            # 같은 토큰으로 invalid_grant 재시도는 결과가 같으므로 중단
+            logger.warning("동일 refresh_token 의 invalid_grant — 추가 재시도를 중단합니다.")
+            break
+        time.sleep(min(3 * attempt, 10))
+
+    if invalid_grant_seen:
+        if mark_exhausted_on_expire:
+            _mark_kakao_auth_exhausted("리프레시 토큰이 만료되었거나 유효하지 않습니다.")
+        else:
+            logger.info("카카오 리프레시 토큰 만료 — 브라우저 재인증을 진행합니다.")
+    return ""
 
 
 def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
@@ -1339,7 +1423,17 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
         return ""
 
     if KAKAO_AUTH_EXHAUSTED:
-        return ""
+        # 인증 대기 모드: 재시도 주기 전에는 조용히 차단만 유지(로그 스팸 방지)
+        if not _kakao_auth_recovery_due():
+            return ""
+        # 주기 도래 — 자동 복구 시도. 운영자가 봇 실행 중에 coinbot_watch.sh 로
+        # 재인증해 kakao_code.json 이 갱신됐다면 여기서 재시작 없이 살아난다.
+        logger.info(
+            "카카오 인증 대기 모드 — 자동 복구를 재시도합니다 (주기 %s분, KAKAO_AUTH_RETRY_MINUTES)",
+            _kakao_auth_retry_interval_seconds() // 60,
+        )
+        _clear_kakao_auth_exhausted()
+        # 아래 일반 경로로 진행: 정본 재검증 → 실패 시 다시 exhausted 마킹(다음 주기 대기)
 
     _hydrate_kakao_tokens()
     rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
@@ -1349,12 +1443,16 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
         return from_env
 
     # 검증 우선: 기존 액세스 토큰이 아직 유효하면 그대로 사용한다.
-    # (매 알림마다 refresh를 호출하면 마스터 열쇠 회전이 과도하게 일어나 위험하다.
-    #  따라서 회전은 액세스 토큰이 실제로 만료된 6시간 주기에만 발생하도록 한다.)
     access_token = get_access_token().strip()
     if access_token and _validate_kakao_access_token(access_token):
         _clear_kakao_auth_exhausted()
         return access_token
+
+    logger.warning(
+        "카카오 액세스 토큰 만료/무효 — refresh_token으로 갱신을 시도합니다 (access_len=%s refresh_len=%s)",
+        len(access_token),
+        len(_get_kakao_refresh_token().strip() if _get_kakao_refresh_token else ""),
+    )
 
     # 액세스 토큰이 만료/무효일 때만 refresh_token으로 갱신(여기서만 회전 발생).
     refresh_token = _get_kakao_refresh_token().strip()
@@ -1383,6 +1481,25 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
     if not refresh_token and not KAKAO_AUTH_EXHAUSTED:
         _mark_kakao_auth_exhausted("사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
     return ""
+
+
+def _log_kakao_auth_blocked_throttled() -> None:
+    """매매 차단 안내 로그 — 처음 1회는 ERROR, 이후 KAKAO_BLOCKED_LOG_MINUTES(기본 60분)마다 1회.
+
+    그 사이 사이클은 DEBUG로만 남겨 journalctl 스팸을 방지한다 (인증 대기 모드).
+    """
+    global KAKAO_AUTH_BLOCKED_LOG_AT_MONO
+    msg = (
+        "카카오 인증 실패 — 매매 로직을 실행하지 않습니다 (인증 대기 모드, %s분마다 자동 복구 재시도). "
+        "즉시 복구: SSH에서 bash ~/Coin/scripts/coinbot_watch.sh 실행 (봇 재시작 불필요)."
+    ) % (_kakao_auth_retry_interval_seconds() // 60)
+    throttle_seconds = max(1, _env_int("KAKAO_BLOCKED_LOG_MINUTES", 60)) * 60
+    now = time.monotonic()
+    if KAKAO_AUTH_BLOCKED_LOG_AT_MONO <= 0 or now - KAKAO_AUTH_BLOCKED_LOG_AT_MONO >= throttle_seconds:
+        KAKAO_AUTH_BLOCKED_LOG_AT_MONO = now
+        logger.error(msg)
+    else:
+        logger.debug(msg)
 
 
 def _build_kakao_notifier_core():
@@ -3205,10 +3322,7 @@ def run_forever() -> None:
             # Safety First:
             # 매매 로직(차트 분석·주문)을 통째로 건너뛴다.
             if not _kakao_auth_ready():
-                logger.error(
-                    "카카오 인증 실패 — 매매 로직을 실행하지 않습니다. "
-                    "SSH에서 bash ~/Coin/scripts/coinbot_watch.sh 를 실행하면 URL+입력 후 로그를 볼 수 있습니다."
-                )
+                _log_kakao_auth_blocked_throttled()
             else:
                 result = run_cycle()
                 if not result.get("cycle_skipped"):

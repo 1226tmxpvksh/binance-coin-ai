@@ -590,7 +590,14 @@ def refresh_access_token_request(client_id: str, refresh_token: str) -> Dict[str
             err = response.json()
             desc = str(err.get("error_description") or err.get("error") or "")
             if "expired_or_invalid_refresh_token" in desc or err.get("error") == "invalid_grant":
-                logger.debug("Kakao refresh token expired: %s", desc or err)
+                # INFO 기본 레벨에서도 원인이 보이도록 ERROR로 남긴다.
+                # (과거 DEBUG만 남겨 journalctl에서 원인 추적이 불가능했음)
+                logger.error(
+                    "Kakao refresh token 폐기/만료(invalid_grant): %s — "
+                    "재인증 필요(coinbot_watch.sh). 흔한 원인: .env 덮어쓰기로 옛 refresh_token 복원, "
+                    "다른 환경에서 동일 앱 재인증(패밀리 폐기), refresh_token 수명 만료.",
+                    desc or err,
+                )
             else:
                 logger.error("Kakao token refresh failed: %s", err.get("error_description", err))
         except Exception:

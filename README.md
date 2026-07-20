@@ -51,6 +51,8 @@ KakaoNotifier.send_message()
 | **환경 화이트리스트** | `kakao_api_allowed()` — 정품 서버·경로에서만 API 허용 (로컬/WSL 차단) |
 | **Safety First** | 카카오 Heartbeat 실패 시 해당 사이클 매매 차단, 프로세스는 유지·재시도 |
 | **토큰 갱신 알림** | HTTP refresh 성공 시 카카오 통보 (`register_kakao_token_refresh_listener`) |
+| **갱신 3회 재시도** | refresh 실패 시 정본 재동기화 후 최대 3회 재시도 — 실행 중 재인증한 새 토큰 즉시 반영 |
+| **인증 대기 모드** | 인증 만료 시 영구 차단 대신 `KAKAO_AUTH_RETRY_MINUTES`(기본 30분)마다 자동 복구 재시도 — **재시작 불필요** |
 
 액세스 토큰은 약 **6시간**마다 만료되며, 유효 토큰이 있으면 불필요한 refresh를 하지 않아 **마스터 열쇠 회전 빈도를 최소화**합니다.
 
@@ -60,7 +62,8 @@ KakaoNotifier.send_message()
 |------|------|
 | **단일 프로세스** | `.coinbot.lock` + `fcntl`/`msvcrt` — 중복 `main_ai.py` 실행 차단 |
 | **루프 중복 방지** | `_CYCLE_LOCK` + `AI_LOOP_SECONDS` 간격 가드 + 동일 15m 캔들 AI 1회 |
-| **네트워크 복원력** | 카카오 401 → 중앙 갱신 후 1회 재전송; 일시적 갱신 실패는 exhausted 처리 없이 다음 사이클 재시도 |
+| **네트워크 복원력** | 카카오 401 → 중앙 갱신 후 1회 재전송; refresh 실패는 3회 재시도, `invalid_grant` 원인은 ERROR 로그로 기록 |
+| **로그 스팸 방지** | 인증 차단 ERROR는 `KAKAO_BLOCKED_LOG_MINUTES`(기본 60분)마다 1회만 — 5분마다 반복되던 에러 제거 |
 | **진입 게이트** | ATR 최소 변동성, 7일 평균 대비 거래량 급증(`AI_VOLUME_MIN_RATIO`), 주말 신규 진입 차단 |
 | **매매 모드** | `AI_DRY_RUN=true` 가상 매매 / `false` 실전 매매 — 동일 코드 경로 |
 | **원금 복구 리포팅** | 잔고 < 초기 원금 시 「원금 복구 중」 표기, 착시 수익 방지 |

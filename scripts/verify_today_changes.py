@@ -199,6 +199,94 @@ def test_build_kakao_message_has_trade_section() -> None:
     ok("build_kakao_message includes daily trade section")
 
 
+def test_auth_wait_mode_state_machine() -> None:
+    import time as _time
+
+    import main_ai as m
+
+    m._clear_kakao_auth_exhausted()
+    m._mark_kakao_auth_exhausted("test")
+    if not m.KAKAO_AUTH_EXHAUSTED or m.KAKAO_AUTH_EXHAUSTED_AT_MONO <= 0:
+        fail("auth_wait_mode", "mark did not set exhausted + timestamp")
+        return
+    if m._kakao_auth_recovery_due():
+        fail("auth_wait_mode", "recovery should NOT be due immediately")
+        return
+    m.KAKAO_AUTH_EXHAUSTED_AT_MONO = _time.monotonic() - 10 * 24 * 3600
+    if not m._kakao_auth_recovery_due():
+        fail("auth_wait_mode", "recovery should be due after interval")
+        return
+    m._clear_kakao_auth_exhausted()
+    if m.KAKAO_AUTH_EXHAUSTED or m.KAKAO_AUTH_EXHAUSTED_AT_MONO != 0.0:
+        fail("auth_wait_mode", "clear did not reset state")
+        return
+    ok("auth wait mode: mark -> not due -> due -> clear")
+
+
+def test_refresh_retry_uses_new_token_from_store() -> None:
+    import main_ai as m
+
+    calls: list[str] = []
+
+    def fake_sync(rest: str, rt: str) -> str:
+        calls.append(rt)
+        if rt == "NEW":
+            return "fresh-access"
+        raise RuntimeError("boom")
+
+    with patch.object(m, "_refresh_kakao_access_token_sync", fake_sync), patch.object(
+        m, "_hydrate_kakao_tokens", lambda: None
+    ), patch.object(m, "_get_kakao_refresh_token", lambda: "NEW"), patch.object(
+        m, "_clear_kakao_auth_exhausted", lambda: None
+    ), patch.object(m.time, "sleep", lambda s: None):
+        result = m._refresh_kakao_access_token("OLD", "key")
+
+    if result != "fresh-access":
+        fail("refresh_retry", f"expected fresh-access, got {result!r}")
+        return
+    if calls != ["OLD", "NEW"]:
+        fail("refresh_retry", f"expected OLD then NEW, got {calls}")
+        return
+    ok("refresh retry picks up externally re-authed token")
+
+
+def test_refresh_retry_stops_on_repeated_invalid_grant() -> None:
+    import main_ai as m
+
+    calls: list[str] = []
+
+    class FakeResp:
+        def json(self):
+            return {"error": "invalid_grant", "error_description": "expired_or_invalid_refresh_token"}
+
+        text = "invalid_grant"
+
+    def fake_sync(rest: str, rt: str) -> str:
+        calls.append(rt)
+        exc = RuntimeError("invalid")
+        exc.response = FakeResp()
+        raise exc
+
+    marked: list[str] = []
+    with patch.object(m, "_refresh_kakao_access_token_sync", fake_sync), patch.object(
+        m, "_hydrate_kakao_tokens", lambda: None
+    ), patch.object(m, "_get_kakao_refresh_token", lambda: "SAME"), patch.object(
+        m, "_mark_kakao_auth_exhausted", lambda r: marked.append(r)
+    ), patch.object(m.time, "sleep", lambda s: None):
+        result = m._refresh_kakao_access_token("SAME", "key")
+
+    if result != "":
+        fail("invalid_grant_stop", f"expected empty, got {result!r}")
+        return
+    if len(calls) != 1:
+        fail("invalid_grant_stop", f"expected 1 HTTP attempt for same-token invalid_grant, got {len(calls)}")
+        return
+    if not marked:
+        fail("invalid_grant_stop", "exhausted was not marked")
+        return
+    ok("refresh retry early-stops on repeated invalid_grant and marks exhausted")
+
+
 def main() -> int:
     print("=== verify_today_changes ===")
     test_daily_trade_summary()
@@ -206,6 +294,9 @@ def main() -> int:
     test_notify_kakao_gating()
     test_refresh_listener()
     test_build_kakao_message_has_trade_section()
+    test_auth_wait_mode_state_machine()
+    test_refresh_retry_uses_new_token_from_store()
+    test_refresh_retry_stops_on_repeated_invalid_grant()
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")

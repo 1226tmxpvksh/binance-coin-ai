@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -29,6 +30,8 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 1000
 REQUEST_TIMEOUT_SECONDS = 10
 MAX_REFRESH_RETRY_COUNT = 1
+TOKEN_REFRESH_MAX_ATTEMPTS = 3
+TOKEN_REFRESH_RETRY_DELAY_SECONDS = 3
 KAKAO_MEMO_API_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
 
 
@@ -137,6 +140,11 @@ class KakaoNotifier:
             return False
 
     def _refresh_access_token(self) -> bool:
+        """중앙 갱신 경로로 액세스 토큰 재발급. 최대 3회 재시도 후 포기.
+
+        재시도 사이에 정본(kakao_code.json)을 다시 읽어, 외부 재인증으로
+        새 토큰이 저장된 경우 즉시 사용한다.
+        """
         client_id = self._rest_api_key()
         if not client_id:
             logger.error("카카오 토큰 갱신 실패: REST API 키가 없습니다.")
@@ -147,19 +155,39 @@ class KakaoNotifier:
             logger.error("카카오 토큰 갱신 실패: 리프레시 토큰이 없습니다.")
             return False
 
-        try:
-            new_access = refresh_kakao_access_token_sync(client_id, "").strip()
-        except Exception as exc:
-            logger.error("카카오 토큰 갱신 요청 실패: %s", exc)
-            return False
+        last_error: Exception | None = None
+        for attempt in range(1, TOKEN_REFRESH_MAX_ATTEMPTS + 1):
+            try:
+                new_access = refresh_kakao_access_token_sync(client_id, "").strip()
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "카카오 토큰 갱신 요청 실패 (시도 %s/%s): %s",
+                    attempt,
+                    TOKEN_REFRESH_MAX_ATTEMPTS,
+                    exc,
+                )
+                new_access = ""
 
-        if not new_access:
-            logger.error("카카오 토큰 갱신 실패: 새 액세스 토큰을 받지 못했습니다.")
-            return False
+            if new_access:
+                self._sync_tokens_from_store()
+                if attempt > 1:
+                    logger.info("카카오 액세스 토큰 자동 갱신 완료 (재시도 %s회 만에 성공)", attempt)
+                else:
+                    logger.info("카카오 액세스 토큰 자동 갱신 완료")
+                return True
 
-        self._sync_tokens_from_store()
-        logger.info("카카오 액세스 토큰 자동 갱신 완료")
-        return True
+            if attempt < TOKEN_REFRESH_MAX_ATTEMPTS:
+                time.sleep(TOKEN_REFRESH_RETRY_DELAY_SECONDS)
+                self._sync_tokens_from_store()
+
+        logger.error(
+            "카카오 토큰 갱신 실패: %s회 재시도 후 포기 (마지막 오류: %s). "
+            "리프레시 토큰 만료 시 서버에서 coinbot_watch.sh 로 재인증하세요.",
+            TOKEN_REFRESH_MAX_ATTEMPTS,
+            last_error or "새 액세스 토큰 없음",
+        )
+        return False
 
     def notify_start(self):
         return self.send_message(

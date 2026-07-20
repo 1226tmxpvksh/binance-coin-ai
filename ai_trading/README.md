@@ -92,6 +92,8 @@ AI_MONTHLY_SUBSCRIPTION_COST_KRW=80000
 
 # === 카카오 ===
 KAKAO_ALERTS_ENABLED=true
+KAKAO_AUTH_RETRY_MINUTES=30      # 인증 대기 모드에서 자동 복구 재시도 주기(분)
+KAKAO_BLOCKED_LOG_MINUTES=60     # 인증 차단 ERROR 로그 최소 간격(분) — 그 사이는 DEBUG
 AI_LEARNING_LOG_MAX_ROWS=5000
 ```
 
@@ -190,6 +192,8 @@ py -3 ai_trading\main_ai.py
 | **401 처리** | 중앙 갱신 → 1회 재전송 |
 | **환경 제한** | `kakao_api_allowed()` — `example1` + `/home/bot2/Coin`만 허용 |
 | **Safety First** | Heartbeat 실패 시 해당 사이클 매매 차단 (`_kakao_auth_ready`) |
+| **갱신 재시도** | refresh 실패 시 최대 3회 — 시도 사이 `kakao_code.json` 재동기화로 외부 재인증 토큰 즉시 사용 |
+| **인증 대기 모드** | 만료 시 `KAKAO_AUTH_RETRY_MINUTES`(기본 30분)마다 자동 복구 재시도, 차단 ERROR 로그는 `KAKAO_BLOCKED_LOG_MINUTES`(기본 60분)당 1회 |
 
 ### 카카오 401 / 재인증
 
@@ -205,7 +209,7 @@ python ~/Coin/scripts/auth_kakao.py
 
 1. 터미널에 카카오 로그인 URL이 출력됩니다.
 2. 브라우저에서 로그인 후 리다이렉트 URL **전체** 또는 `code=` 값을 붙여넣습니다.
-3. `✅ 저장 완료` 확인 후 `systemctl restart coinbot.service` (root).
+3. `✅ 저장 완료` 확인. **재시작은 선택** — 봇이 실행 중이면 인증 대기 모드가 최대 `KAKAO_AUTH_RETRY_MINUTES`(기본 30분) 안에 새 토큰을 자동으로 집어 씁니다. 즉시 반영하려면 `systemctl restart coinbot.service` (root).
 
 `auth_kakao.py`는 전체 URL·순수 코드 모두 자동 파싱합니다. 토큰은 `btc_live_trading/.env`와 `kakao_code.json`에 원자적으로 저장됩니다.
 
