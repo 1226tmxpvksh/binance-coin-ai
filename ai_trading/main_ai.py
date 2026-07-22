@@ -146,6 +146,8 @@ KAKAO_AUTH_EXHAUSTED = False
 # 인증 대기 모드: exhausted 시각(monotonic)과 차단 로그 최근 출력 시각
 KAKAO_AUTH_EXHAUSTED_AT_MONO = 0.0
 KAKAO_AUTH_BLOCKED_LOG_AT_MONO = 0.0
+# 토큰 하트비트: INFO 생존 로그 최근 출력 시각(monotonic)
+KAKAO_HEARTBEAT_LOG_AT_MONO = 0.0
 KAKAO_ENV_CODE_TRIED = False
 KAKAO_LOCAL_OAUTH_TRIED = False
 _KAKAO_ENV_WARNED = False
@@ -1502,6 +1504,38 @@ def _log_kakao_auth_blocked_throttled() -> None:
         logger.debug(msg)
 
 
+def _log_kakao_token_heartbeat() -> None:
+    """토큰 검증 루프 생존 로그.
+
+    - 매 사이클 DEBUG: "토큰 갱신 스레드 작동 중... 다음 주기 대기"
+    - KAKAO_HEARTBEAT_LOG_MINUTES(기본 60분)마다 1회 INFO: journalctl(INFO 레벨)에서도
+      토큰 검증 루프가 살아 있음을 확인할 수 있게 한다. 워커 스레드 상태도 함께 남긴다.
+    """
+    global KAKAO_HEARTBEAT_LOG_AT_MONO
+    logger.debug("토큰 갱신 스레드 작동 중... 다음 주기 대기")
+    interval = max(1, _env_int("KAKAO_HEARTBEAT_LOG_MINUTES", 60)) * 60
+    now = time.monotonic()
+    if KAKAO_HEARTBEAT_LOG_AT_MONO > 0 and now - KAKAO_HEARTBEAT_LOG_AT_MONO < interval:
+        return
+    KAKAO_HEARTBEAT_LOG_AT_MONO = now
+    worker_state = "미기동"
+    if _ASYNC_KAKAO is not None:
+        try:
+            alive = _ASYNC_KAKAO.is_alive() if hasattr(_ASYNC_KAKAO, "is_alive") else _ASYNC_KAKAO.is_running
+            stats = _ASYNC_KAKAO.get_stats()
+            worker_state = "정상(성공=%s 실패=%s 큐=%s)" % (
+                stats.get("success_count"),
+                stats.get("failed_count"),
+                stats.get("queue_size"),
+            ) if alive else "죽음(다음 알림 시 재기동)"
+        except Exception:
+            worker_state = "상태 확인 실패"
+    logger.info(
+        "카카오 토큰 하트비트 — 인증 검증 루프 정상 작동 중 (매 사이클 토큰 확인, 만료 시 자동 갱신) / 알림 워커: %s",
+        worker_state,
+    )
+
+
 def _build_kakao_notifier_core():
     if KakaoNotifier is None:
         return None
@@ -1518,8 +1552,17 @@ def _ensure_async_kakao_started() -> None:
         return
     if not _kakao_alerts_enabled():
         return
-    if _ASYNC_KAKAO is not None and _ASYNC_KAKAO.is_running:
-        return
+    if _ASYNC_KAKAO is not None:
+        alive = _ASYNC_KAKAO.is_alive() if hasattr(_ASYNC_KAKAO, "is_alive") else _ASYNC_KAKAO.is_running
+        if alive:
+            return
+        # 워커 스레드가 죽어 있으면(비정상 종료) 새로 만들어 재기동한다 — 알림 증발 방지.
+        logger.error("카카오 비동기 알림 워커가 죽어 있어 재기동합니다.")
+        try:
+            _ASYNC_KAKAO.stop(drain_timeout=0.1)
+        except Exception:
+            pass
+        _ASYNC_KAKAO = None
     _hydrate_kakao_tokens()
     core = _build_kakao_notifier_core()
     if core is None:
@@ -3324,6 +3367,7 @@ def run_forever() -> None:
             if not _kakao_auth_ready():
                 _log_kakao_auth_blocked_throttled()
             else:
+                _log_kakao_token_heartbeat()
                 result = run_cycle()
                 if not result.get("cycle_skipped"):
                     print(_format_cycle_dashboard(result))

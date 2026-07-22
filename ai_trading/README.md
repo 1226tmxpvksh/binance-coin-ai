@@ -94,6 +94,7 @@ AI_MONTHLY_SUBSCRIPTION_COST_KRW=80000
 KAKAO_ALERTS_ENABLED=true
 KAKAO_AUTH_RETRY_MINUTES=30      # 인증 대기 모드에서 자동 복구 재시도 주기(분)
 KAKAO_BLOCKED_LOG_MINUTES=60     # 인증 차단 ERROR 로그 최소 간격(분) — 그 사이는 DEBUG
+KAKAO_HEARTBEAT_LOG_MINUTES=60   # 토큰 검증 루프 생존 INFO 하트비트 간격(분) — 매 사이클 DEBUG는 항상
 AI_LEARNING_LOG_MAX_ROWS=5000
 ```
 
@@ -194,6 +195,18 @@ py -3 ai_trading\main_ai.py
 | **Safety First** | Heartbeat 실패 시 해당 사이클 매매 차단 (`_kakao_auth_ready`) |
 | **갱신 재시도** | refresh 실패 시 최대 3회 — 시도 사이 `kakao_code.json` 재동기화로 외부 재인증 토큰 즉시 사용 |
 | **인증 대기 모드** | 만료 시 `KAKAO_AUTH_RETRY_MINUTES`(기본 30분)마다 자동 복구 재시도, 차단 ERROR 로그는 `KAKAO_BLOCKED_LOG_MINUTES`(기본 60분)당 1회 |
+| **데드락 방지** | 갱신 성공 알림 리스너는 `_KAKAO_REFRESH_LOCK` **해제 후** 호출 — 알림 경로에서 같은 스레드가 재갱신에 진입해도 락에 걸리지 않음 |
+| **워커 자가 복구** | 비동기 알림 워커 스레드가 비정상 종료돼도 다음 알림 시 자동 재기동 (`is_alive()` 실체크) |
+| **생존 하트비트** | 인증 정상 사이클마다 DEBUG, `KAKAO_HEARTBEAT_LOG_MINUTES`(기본 60분)마다 INFO 하트비트 — 토큰 검증 루프·워커 생존을 journalctl에서 확인 가능 |
+
+**토큰 검증 루프:** 별도 백그라운드 갱신 스레드는 없습니다. `run_forever` → `_kakao_auth_ready()` → `_ensure_kakao_access_token()`이 **매 5분 사이클**에서 인라인으로 토큰을 확인하고, 만료/401일 때만 `refresh_kakao_access_token_sync()`를 호출합니다. 갱신 성공 알림은 `_KAKAO_REFRESH_LOCK`을 잡은 상태가 아니라 **락 해제 후**에만 호출되어, 알림 경로의 재진입 데드락을 막습니다.
+
+생존 로그 예시:
+
+```bash
+journalctl -u coinbot.service --since "1 hour ago" --no-pager | grep -E "카카오 토큰 하트비트|자동 갱신 완료|알림 워커"
+# [INFO] 카카오 토큰 하트비트 — 인증 검증 루프 정상 작동 중 ... / 알림 워커: 정상(...)
+```
 
 ### 카카오 401 / 재인증
 
@@ -289,6 +302,9 @@ py -3 scripts\emergency_exit.py
 | 환경 화이트리스트 | `kakao_api_allowed()` — `example1` + `/home/bot2/Coin`, 로컬·WSL 차단 |
 | Stateless Kakao | `KakaoNotifier` — self 토큰 제거, 정본 실시간 조회 |
 | Thread-safe Refresh | `refresh_kakao_access_token_sync()` Double-checked locking |
+| 갱신 알림 데드락 방지 | 성공 리스너는 락 **해제 후** 호출 (`kakao_utils.refresh_kakao_access_token_sync`) |
+| 알림 워커 자가 복구 | `AsyncNotifier.is_alive()` + 사망 시 자동 재기동 (`main_ai._ensure_async_kakao_started`) |
+| 인증 대기·하트비트 | `KAKAO_AUTH_RETRY_MINUTES` / `KAKAO_BLOCKED_LOG_MINUTES` / `KAKAO_HEARTBEAT_LOG_MINUTES` |
 | 루프 중복 방지 | `_CYCLE_LOCK`, `_wait_for_next_cycle_slot`, 캔들 단위 AI 1회 |
 | 대화형 인증 | `scripts/auth_kakao.py` — URL/코드 스마트 파싱 |
 | 레거시 제거 | `main_live`·스캘핑·`order_executor` 등 미사용 엔진 삭제 |

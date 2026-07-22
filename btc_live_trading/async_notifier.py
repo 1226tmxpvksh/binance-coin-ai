@@ -26,10 +26,20 @@ class AsyncNotifier:
         self.failed_count = 0
         self.success_count = 0
 
+    def is_alive(self) -> bool:
+        """워커 스레드가 실제로 살아 있는지 확인 (is_running 플래그만 믿지 않는다)."""
+        return (
+            self.is_running
+            and self.worker_thread is not None
+            and self.worker_thread.is_alive()
+        )
+
     def start(self):
-        if self.is_running:
+        if self.is_alive():
             logger.warning("알림 워커가 이미 실행 중입니다")
             return
+        if self.is_running and not self.is_alive():
+            logger.error("알림 워커 스레드가 비정상 종료된 상태 — 재기동합니다")
         self.is_running = True
         self.worker_thread = threading.Thread(target=self._worker, daemon=True)
         self.worker_thread.start()
@@ -42,27 +52,34 @@ class AsyncNotifier:
             self.worker_thread.join(timeout=drain_timeout)
 
     def _worker(self):
-        while self.is_running or not self.notification_queue.empty():
-            try:
-                method_name, args = self.notification_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
+        try:
+            while self.is_running or not self.notification_queue.empty():
+                try:
+                    method_name, args = self.notification_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
 
-            try:
-                method = getattr(self.notifier, method_name)
-                result = method(*args)
-                if result is False:
+                try:
+                    method = getattr(self.notifier, method_name)
+                    result = method(*args)
+                    if result is False:
+                        self.failed_count += 1
+                    else:
+                        self.success_count += 1
+                except Exception as exc:
                     self.failed_count += 1
-                else:
-                    self.success_count += 1
-            except Exception as exc:
-                self.failed_count += 1
-                logger.error("비동기 알림 처리 실패: %s", exc)
-            finally:
-                self.notification_queue.task_done()
+                    logger.error("비동기 알림 처리 실패: %s", exc)
+                finally:
+                    self.notification_queue.task_done()
+        except BaseException:
+            # 워커가 소리 없이 죽어 메시지가 증발하는 것을 방지:
+            # 플래그를 내려 enqueue가 False를 반환하게 하고(호출측 동기 폴백 유도) 원인을 남긴다.
+            logger.exception("비동기 알림 워커 스레드 비정상 종료 — 다음 알림 시 재기동됩니다")
+            self.is_running = False
+            raise
 
     def _enqueue_notification(self, method_name: str, *args: Any) -> bool:
-        if not self.is_running:
+        if not self.is_alive():
             return False
         try:
             self.notification_queue.put_nowait((method_name, args))

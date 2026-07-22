@@ -50,11 +50,13 @@ KakaoNotifier.send_message()
 | **회전 처리** | refresh_token 회전 시 `.env` + `kakao_code.json` + `os.environ` 3곳 동기화 |
 | **환경 화이트리스트** | `kakao_api_allowed()` — 정품 서버·경로에서만 API 허용 (로컬/WSL 차단) |
 | **Safety First** | 카카오 Heartbeat 실패 시 해당 사이클 매매 차단, 프로세스는 유지·재시도 |
-| **토큰 갱신 알림** | HTTP refresh 성공 시 카카오 통보 (`register_kakao_token_refresh_listener`) |
+| **토큰 갱신 알림** | HTTP refresh 성공 시 카카오 통보 (`register_kakao_token_refresh_listener`) — **락 해제 후** 발송(데드락 방지) |
 | **갱신 3회 재시도** | refresh 실패 시 정본 재동기화 후 최대 3회 재시도 — 실행 중 재인증한 새 토큰 즉시 반영 |
 | **인증 대기 모드** | 인증 만료 시 영구 차단 대신 `KAKAO_AUTH_RETRY_MINUTES`(기본 30분)마다 자동 복구 재시도 — **재시작 불필요** |
+| **알림 워커 자가 복구** | `AsyncNotifier` 스레드가 죽어도 다음 알림 시 `is_alive()` 검사 후 자동 재기동 |
+| **생존 하트비트** | 매 사이클 DEBUG + `KAKAO_HEARTBEAT_LOG_MINUTES`(기본 60분)마다 INFO — journalctl에서 루프·워커 생존 확인 |
 
-액세스 토큰은 약 **6시간**마다 만료되며, 유효 토큰이 있으면 불필요한 refresh를 하지 않아 **마스터 열쇠 회전 빈도를 최소화**합니다.
+별도의 “6시간 갱신 스레드”는 없습니다. **5분 매매 사이클마다** 토큰을 검증하고, 액세스 토큰이 만료됐을 때만(카카오 TTL 약 6시간) refresh합니다. 유효 토큰이 있으면 refresh를 하지 않아 **마스터 열쇠 회전 빈도를 최소화**합니다.
 
 ### 3. 다층 방어 기제
 
@@ -64,6 +66,7 @@ KakaoNotifier.send_message()
 | **루프 중복 방지** | `_CYCLE_LOCK` + `AI_LOOP_SECONDS` 간격 가드 + 동일 15m 캔들 AI 1회 |
 | **네트워크 복원력** | 카카오 401 → 중앙 갱신 후 1회 재전송; refresh 실패는 3회 재시도, `invalid_grant` 원인은 ERROR 로그로 기록 |
 | **로그 스팸 방지** | 인증 차단 ERROR는 `KAKAO_BLOCKED_LOG_MINUTES`(기본 60분)마다 1회만 — 5분마다 반복되던 에러 제거 |
+| **알림 경로 생존 보장** | 갱신 성공 알림은 락 해제 후 발송(데드락 방지), 알림 워커 사망 시 자동 재기동, `KAKAO_HEARTBEAT_LOG_MINUTES`(기본 60분)마다 생존 INFO 하트비트 |
 | **진입 게이트** | ATR 최소 변동성, 7일 평균 대비 거래량 급증(`AI_VOLUME_MIN_RATIO`), 주말 신규 진입 차단 |
 | **매매 모드** | `AI_DRY_RUN=true` 가상 매매 / `false` 실전 매매 — 동일 코드 경로 |
 | **원금 복구 리포팅** | 잔고 < 초기 원금 시 「원금 복구 중」 표기, 착시 수익 방지 |
@@ -164,6 +167,9 @@ AI_STATUS_REPORT_MINUTES=1440     # 상태 리포트: 1440=하루 1회(KST)
 KAKAO_ONCE_PER_DAY=true           # true=일일 상태 리포트 1회(토큰 갱신 알림은 제외)
 AI_VOLUME_MIN_RATIO=1.5          # 7일 평균 대비 거래량 급증 기준
 KAKAO_ALERTS_ENABLED=true        # false 시 알림·게이트 우회
+KAKAO_AUTH_RETRY_MINUTES=30      # 인증 대기 모드 자동 복구 주기
+KAKAO_BLOCKED_LOG_MINUTES=60     # 인증 차단 ERROR 로그 최소 간격
+KAKAO_HEARTBEAT_LOG_MINUTES=60   # 토큰 검증 루프 생존 INFO 하트비트 간격
 ```
 
 전체 목록은 [`ai_trading/README.md`](ai_trading/README.md) 참고.

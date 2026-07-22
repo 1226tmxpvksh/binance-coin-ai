@@ -287,6 +287,124 @@ def test_refresh_retry_stops_on_repeated_invalid_grant() -> None:
     ok("refresh retry early-stops on repeated invalid_grant and marks exhausted")
 
 
+def test_refresh_listener_called_outside_lock() -> None:
+    """갱신 성공 리스너가 _KAKAO_REFRESH_LOCK 해제 후 호출되는지 (데드락 방지)."""
+    import kakao_utils as ku
+
+    lock_free_when_listener_ran: list[bool] = []
+
+    def listener() -> None:
+        acquired = ku._KAKAO_REFRESH_LOCK.acquire(blocking=False)
+        lock_free_when_listener_ran.append(acquired)
+        if acquired:
+            ku._KAKAO_REFRESH_LOCK.release()
+
+    ku.register_kakao_token_refresh_listener(listener)
+    try:
+        with patch.object(ku, "kakao_api_allowed", return_value=True), patch.object(
+            ku, "hydrate_tokens_from_json", lambda: None
+        ), patch.object(ku, "get_access_token", return_value=""), patch.object(
+            ku, "validate_access_token", return_value=False
+        ), patch.object(ku, "get_refresh_token", return_value="rt"), patch.object(
+            ku, "refresh_access_token_request", return_value={"access_token": "new"}
+        ), patch.object(ku, "apply_token_response", return_value="new"):
+            result = ku.refresh_kakao_access_token_sync("key")
+    finally:
+        ku.register_kakao_token_refresh_listener(None)
+
+    if result != "new":
+        fail("listener_outside_lock", f"expected 'new', got {result!r}")
+        return
+    if lock_free_when_listener_ran != [True]:
+        fail(
+            "listener_outside_lock",
+            f"listener ran while lock held (deadlock risk): {lock_free_when_listener_ran}",
+        )
+        return
+    ok("refresh success listener runs AFTER lock release (no deadlock)")
+
+
+def test_async_notifier_dead_worker_recovery() -> None:
+    """워커 스레드가 죽으면 enqueue가 False를 반환하고 start()로 재기동되는지."""
+    import time as _time
+
+    from async_notifier import AsyncNotifier
+
+    class DummyNotifier:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def send_message(self, title: str, body: str) -> bool:
+            self.sent.append(title)
+            return True
+
+    dummy = DummyNotifier()
+    an = AsyncNotifier(dummy)
+
+    # 죽은 워커 시뮬레이션: is_running=True인데 스레드가 없음(비정상 종료 상태)
+    an.is_running = True
+    an.worker_thread = None
+    if an.is_alive():
+        fail("async_worker_recovery", "is_alive should be False when thread is gone")
+        return
+    if an.send_message("t", "b") is not False:
+        fail("async_worker_recovery", "enqueue should fail when worker is dead")
+        return
+
+    an.start()  # 재기동
+    if not an.is_alive():
+        fail("async_worker_recovery", "start() did not revive worker")
+        return
+    if not an.send_message("t2", "b2"):
+        fail("async_worker_recovery", "enqueue should succeed after restart")
+        return
+    deadline = _time.time() + 3
+    while _time.time() < deadline and not dummy.sent:
+        _time.sleep(0.05)
+    an.stop()
+    if dummy.sent != ["t2"]:
+        fail("async_worker_recovery", f"expected ['t2'], got {dummy.sent}")
+        return
+    ok("AsyncNotifier dead worker -> enqueue False -> start() revives")
+
+
+def test_token_heartbeat_throttle() -> None:
+    """하트비트: 매 호출 DEBUG, INFO는 KAKAO_HEARTBEAT_LOG_MINUTES마다 1회."""
+    import logging
+
+    import main_ai as m
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.DEBUG)
+    m.logger.addHandler(handler)
+    old_level = m.logger.level
+    m.logger.setLevel(logging.DEBUG)
+    try:
+        m.KAKAO_HEARTBEAT_LOG_AT_MONO = 0.0
+        with patch.object(m, "_ASYNC_KAKAO", None):
+            m._log_kakao_token_heartbeat()
+            m._log_kakao_token_heartbeat()
+    finally:
+        m.logger.removeHandler(handler)
+        m.logger.setLevel(old_level)
+        m.KAKAO_HEARTBEAT_LOG_AT_MONO = 0.0
+
+    debugs = [r for r in records if r.levelno == logging.DEBUG and "토큰 갱신 스레드 작동 중" in r.getMessage()]
+    infos = [r for r in records if r.levelno == logging.INFO and "카카오 토큰 하트비트" in r.getMessage()]
+    if len(debugs) != 2:
+        fail("heartbeat", f"expected 2 DEBUG heartbeats, got {len(debugs)}")
+        return
+    if len(infos) != 1:
+        fail("heartbeat", f"expected 1 INFO heartbeat (throttled), got {len(infos)}")
+        return
+    ok("token heartbeat: DEBUG every call, INFO throttled to once per interval")
+
+
 def main() -> int:
     print("=== verify_today_changes ===")
     test_daily_trade_summary()
@@ -297,6 +415,9 @@ def main() -> int:
     test_auth_wait_mode_state_machine()
     test_refresh_retry_uses_new_token_from_store()
     test_refresh_retry_stops_on_repeated_invalid_grant()
+    test_refresh_listener_called_outside_lock()
+    test_async_notifier_dead_worker_recovery()
+    test_token_heartbeat_throttle()
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")

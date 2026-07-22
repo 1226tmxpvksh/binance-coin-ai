@@ -556,6 +556,8 @@ def refresh_kakao_access_token_sync(client_id: str, refresh_token: str = "") -> 
     if not client_id or not rt:
         return access
 
+    new_access = ""
+    refreshed_now = False
     with _KAKAO_REFRESH_LOCK:
         hydrate_tokens_from_json()
         access = get_access_token().strip()
@@ -567,8 +569,17 @@ def refresh_kakao_access_token_sync(client_id: str, refresh_token: str = "") -> 
         new_access = apply_token_response(token_data)
         if new_access:
             logger.info("카카오 액세스 토큰 자동 갱신 완료 (thread-safe)")
+            refreshed_now = True
+
+    # 데드락 방지: 리스너(알림 발송)는 반드시 락 해제 후 호출한다.
+    # 리스너 → 메시지 전송 → 401 → 재갱신 경로가 같은 스레드에서 이 함수로
+    # 재진입해도 non-reentrant Lock 에 걸리지 않는다.
+    if refreshed_now:
+        try:
             _notify_kakao_token_http_refreshed()
-        return new_access or ""
+        except Exception:
+            logger.exception("카카오 갱신 성공 알림 처리 중 예외(토큰 갱신 자체는 성공)")
+    return new_access or ""
 
 
 def refresh_access_token_request(client_id: str, refresh_token: str) -> Dict[str, Any]:
