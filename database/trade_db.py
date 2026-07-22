@@ -130,7 +130,12 @@ class TradeDatabase:
                     symbol,
                     order.get("side"),
                     order.get("type") or order.get("orderType"),
-                    _safe_float(order.get("price") or order.get("avgPrice") or order.get("stopPrice")),
+                    _safe_float(
+                        order.get("price")
+                        or order.get("avgPrice")
+                        or order.get("triggerPrice")
+                        or order.get("stopPrice")
+                    ),
                     _safe_float(order.get("executedQty") or order.get("origQty") or order.get("quantity")),
                     order.get("status") or order.get("algoStatus"),
                     json.dumps(order, ensure_ascii=False, default=str),

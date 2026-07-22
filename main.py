@@ -12,8 +12,6 @@ from execution.engine import LiveTradingEngine
 from monitor.safety import SafetyManager
 from monitor.state_store import StateStore
 from notification.kakao_notifier import KakaoNotifier, SilentNotifier
-from notification.router import NotificationRouter
-from notification.telegram_notifier import TelegramNotifier
 from scheduler import Scheduler
 
 
@@ -40,34 +38,18 @@ def setup_logging() -> None:
 
 
 def build_notifier():
-    notifiers = []
     if not settings.KAKAO_ENABLED:
-        pass
-    elif not settings.KAKAO_ACCESS_TOKEN and not settings.KAKAO_REFRESH_TOKEN:
-        logging.getLogger(__name__).warning("카카오 토큰이 없어 알림을 비활성화합니다.")
-    else:
-        notifiers.append(
-            KakaoNotifier(
-                access_token=settings.KAKAO_ACCESS_TOKEN,
-                enabled=True,
-                rest_api_key=settings.KAKAO_REST_API_KEY,
-                refresh_token=settings.KAKAO_REFRESH_TOKEN,
-                env_path=settings.ENV_FILE_PATH,
-            )
-        )
-
-    if settings.TELEGRAM_ENABLED:
-        notifiers.append(
-            TelegramNotifier(
-                bot_token=settings.TELEGRAM_BOT_TOKEN,
-                chat_id=settings.TELEGRAM_CHAT_ID,
-                enabled=True,
-            )
-        )
-
-    if not notifiers:
         return SilentNotifier()
-    return NotificationRouter(notifiers)
+    if not settings.KAKAO_ACCESS_TOKEN and not settings.KAKAO_REFRESH_TOKEN:
+        logging.getLogger(__name__).warning("카카오 토큰이 없어 알림을 비활성화합니다.")
+        return SilentNotifier()
+    return KakaoNotifier(
+        access_token=settings.KAKAO_ACCESS_TOKEN,
+        enabled=True,
+        rest_api_key=settings.KAKAO_REST_API_KEY,
+        refresh_token=settings.KAKAO_REFRESH_TOKEN,
+        env_path=settings.ENV_FILE_PATH,
+    )
 
 
 def initialize_engine() -> LiveTradingEngine:
@@ -106,7 +88,7 @@ def main() -> None:
 
     engine = initialize_engine()
     engine.start()
-    Scheduler(engine, poll_seconds=settings.POLL_SECONDS).run_forever()
+    Scheduler(engine).run_forever()
 
 
 if __name__ == "__main__":

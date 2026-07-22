@@ -52,7 +52,7 @@ Binance Futures
 
 ## Notification
 
-Telegram Bot API
+Kakao Message API
 
 ---
 
@@ -216,7 +216,7 @@ pivot_length: 5
 
 ---
 
-telegram:
+kakao:
 
 enabled: true
 
@@ -424,7 +424,7 @@ DB 저장
 
 ↓
 
-Telegram 전송
+Kakao 전송
 
 ---
 
@@ -584,7 +584,7 @@ system.log
 
 # Notification
 
-Telegram
+Kakao
 
 ---
 
@@ -808,7 +808,7 @@ Database
 
 STEP 8
 
-Telegram
+Kakao
 
 ---
 
@@ -844,7 +844,7 @@ Docker + VPS 배포
 
 ---
 
-Telegram 정상 동작
+Kakao 정상 동작
 
 ---
 

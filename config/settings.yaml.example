@@ -21,6 +21,3 @@ strategy:
 kakao:
   enabled: true
 
-telegram:
-  enabled: false
-

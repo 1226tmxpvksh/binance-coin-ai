@@ -52,12 +52,6 @@ KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY", "")
 KAKAO_ACCESS_TOKEN = os.getenv("KAKAO_ACCESS_TOKEN", "")
 KAKAO_REFRESH_TOKEN = os.getenv("KAKAO_REFRESH_TOKEN", "")
 
-TELEGRAM_ENABLED = (
-    str(_yaml_get(YAML_SETTINGS, "telegram.enabled", os.getenv("TELEGRAM_ENABLED", "false"))).lower() == "true"
-)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
 SYMBOL = str(_yaml_get(YAML_SETTINGS, "exchange.symbol", "BTCUSDT"))
 INTERVAL = str(_yaml_get(YAML_SETTINGS, "exchange.timeframe", "4h"))
 LEVERAGE = int(_yaml_get(YAML_SETTINGS, "exchange.leverage", os.getenv("LEVERAGE", "1")))
@@ -84,13 +78,12 @@ COOLDOWN_HOURS_AFTER_LOSS_STREAK = int(os.getenv("COOLDOWN_HOURS_AFTER_LOSS_STRE
 
 ENTRY_STOP_LIMIT_BUFFER_RATIO = float(os.getenv("ENTRY_STOP_LIMIT_BUFFER_RATIO", "0.0002"))
 ENTRY_ORDER_EXPIRY_HOURS = float(os.getenv("ENTRY_ORDER_EXPIRY_HOURS", "4"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))
 LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "260"))
 API_RETRY_COUNT = int(os.getenv("API_RETRY_COUNT", "3"))
 API_RETRY_SLEEP_SECONDS = float(os.getenv("API_RETRY_SLEEP_SECONDS", "1.0"))
 MAX_CANDLE_GAP_MULTIPLIER = float(os.getenv("MAX_CANDLE_GAP_MULTIPLIER", "1.2"))
 
-DRY_RUN = MODE != "LIVE" and os.getenv("DRY_RUN", "true").lower() != "false"
+DRY_RUN = MODE != "LIVE" or os.getenv("DRY_RUN", "true").lower() != "false"
 LIVE_TRADING_CONFIRMED = os.getenv("LIVE_TRADING_CONFIRMED", "")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

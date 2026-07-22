@@ -42,7 +42,7 @@ class LiveTradingEngine:
         self.notifier.notify_start(self.config.DRY_RUN)
         self.database.record_event("engine_start", {"dry_run": self.config.DRY_RUN})
 
-    def run_once(self) -> None:
+    def run_once(self, allow_entry: bool = True) -> None:
         try:
             raw_data = self.exchange.fetch_klines(self.config.INTERVAL, self.config.LOOKBACK_BARS)
             if len(raw_data) < self.config.EMA_FILTER_PERIOD:
@@ -62,8 +62,10 @@ class LiveTradingEngine:
             self._sync_external_position()
             if self.state.position.has_position:
                 self._manage_position(data)
-            else:
+            elif allow_entry:
                 self._check_entry(data, balance)
+            else:
+                logger.info("시작 직후에는 포지션 동기화만 수행하고 신규 진입은 기다립니다.")
             self.state_store.save(self.state)
         except Exception as exc:
             logger.exception("엔진 실행 오류")
@@ -112,6 +114,7 @@ class LiveTradingEngine:
                     },
                 )
                 self.notifier.notify_close(exit_price, pnl, "exchange_position_closed")
+                self.exchange.cancel_all_algo_orders()
                 self.state.position.has_position = False
                 self.state.position.entry_time = None
                 self.state.position.entry_price = 0.0
@@ -120,12 +123,121 @@ class LiveTradingEngine:
                 self.state.position.stop_order_id = None
             return
 
+        if live_position["amount"] < 0:
+            raise RuntimeError("롱 전용 프로그램이 거래소의 숏 포지션을 감지했습니다.")
+
         if live_position["amount"] > 0 and not self.state.position.has_position:
             self.state.position.has_position = True
             self.state.position.entry_time = datetime.now().isoformat()
             self.state.position.entry_price = live_position["entry_price"]
             self.state.position.quantity = abs(live_position["amount"])
             logger.warning("거래소 기존 롱 포지션을 로컬 상태로 동기화했습니다.")
+        elif live_position["amount"] > 0:
+            self.state.position.entry_price = live_position["entry_price"]
+            self.state.position.quantity = abs(live_position["amount"])
+
+        self._reconcile_protective_stops()
+
+    @staticmethod
+    def _algo_id(order: dict) -> str | None:
+        value = order.get("algoId") or order.get("orderId")
+        return str(value) if value is not None else None
+
+    @staticmethod
+    def _stop_price(order: dict) -> float:
+        value = order.get("triggerPrice") or order.get("stopPrice") or 0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _reconcile_protective_stops(self) -> None:
+        if self.config.DRY_RUN:
+            return
+
+        orders = self.exchange.get_protective_stop_orders()
+        if not orders:
+            self.state.position.stop_price = 0.0
+            self.state.position.stop_order_id = None
+            logger.error("거래소 롱 포지션에 활성 보호 손절 주문이 없습니다.")
+            return
+
+        current_price = self.exchange.get_current_price()
+        valid_orders = [order for order in orders if 0 < self._stop_price(order) < current_price]
+        if not valid_orders:
+            raise RuntimeError("현재가 아래에 있는 유효한 보호 손절 주문을 찾지 못했습니다.")
+
+        active_order = max(valid_orders, key=self._stop_price)
+        active_id = self._algo_id(active_order)
+        if active_id is None:
+            raise RuntimeError("보호 손절 주문에 algoId가 없습니다.")
+
+        stale_orders = [order for order in orders if self._algo_id(order) != active_id]
+        for order in stale_orders:
+            stale_id = self._algo_id(order)
+            if stale_id is not None:
+                self.exchange.cancel_algo_order(stale_id)
+
+        remaining = self.exchange.get_protective_stop_orders()
+        remaining_ids = {self._algo_id(order) for order in remaining}
+        if remaining_ids != {active_id}:
+            raise RuntimeError(f"보호 손절 정리 검증 실패: 활성 주문 수={len(remaining)}")
+
+        if stale_orders:
+            logger.warning(
+                "중복 보호 손절 %s개를 취소하고 algoId=%s만 유지했습니다.",
+                len(stale_orders),
+                active_id,
+            )
+        self.state.position.stop_price = self._stop_price(active_order)
+        self.state.position.stop_order_id = active_id
+        self.state_store.save(self.state)
+
+    def _replace_protective_stop(self, stop_price: float) -> dict:
+        current_price = self.exchange.get_current_price()
+        if stop_price <= 0 or stop_price >= current_price:
+            raise ValueError(
+                f"보호 손절가는 0보다 크고 현재가보다 낮아야 합니다: "
+                f"stop={stop_price}, current={current_price}"
+            )
+
+        previous_orders = self.exchange.get_protective_stop_orders()
+        new_order = self.exchange.place_stop_market(
+            "SELL",
+            self.state.position.quantity,
+            stop_price,
+        )
+        self.database.record_order(self.config.SYMBOL, new_order)
+        new_id = self._algo_id(new_order)
+        if new_id is None:
+            raise RuntimeError("신규 보호 손절 응답에 algoId가 없습니다.")
+
+        if not self.config.DRY_RUN:
+            verified = False
+            for _ in range(3):
+                open_orders = self.exchange.get_protective_stop_orders()
+                if any(self._algo_id(order) == new_id for order in open_orders):
+                    verified = True
+                    break
+            if not verified:
+                raise RuntimeError(f"신규 보호 손절 주문 확인 실패: algoId={new_id}")
+
+        actual_stop_price = self._stop_price(new_order) or stop_price
+        self.state.position.stop_price = actual_stop_price
+        self.state.position.stop_order_id = new_id
+        self.state_store.save(self.state)
+
+        for order in previous_orders:
+            previous_id = self._algo_id(order)
+            if previous_id is not None and previous_id != new_id:
+                self.exchange.cancel_algo_order(previous_id)
+
+        if not self.config.DRY_RUN:
+            remaining = self.exchange.get_protective_stop_orders()
+            remaining_ids = {self._algo_id(order) for order in remaining}
+            if remaining_ids != {new_id}:
+                raise RuntimeError(f"손절 교체 검증 실패: 활성 주문 수={len(remaining)}")
+        return new_order
 
     def _check_entry(self, data: pd.DataFrame, balance: float) -> None:
         can_trade, reason = self.safety.can_open_new_trade(self.state.safety, balance)
@@ -169,19 +281,25 @@ class LiveTradingEngine:
         self.notifier.notify_signal(signal.target_price, stop_price, quantity, signal.reason)
         entry_order = self.exchange.place_market_order("BUY", quantity, reduce_only=False)
         self.database.record_order(self.config.SYMBOL, entry_order)
-        executed_qty = float(entry_order.get("executedQty") or entry_order.get("origQty") or quantity)
-        avg_price = float(entry_order.get("avgPrice") or current_price)
-        stop_order = self.exchange.place_stop_market("SELL", executed_qty, stop_price)
-        self.database.record_order(self.config.SYMBOL, stop_order)
+        executed_qty = float(entry_order.get("executedQty") or 0)
+        avg_price = float(entry_order.get("avgPrice") or 0)
+        if executed_qty <= 0 or avg_price <= 0:
+            live_position = self.exchange.get_position()
+            if live_position is None or live_position["amount"] <= 0:
+                raise RuntimeError("시장가 진입 후 실제 롱 포지션을 확인하지 못했습니다.")
+            executed_qty = abs(live_position["amount"])
+            avg_price = live_position["entry_price"]
 
         self.state.position.has_position = True
         self.state.position.entry_time = datetime.now().isoformat()
         self.state.position.entry_price = avg_price
         self.state.position.quantity = executed_qty
-        self.state.position.stop_price = stop_price
-        self.state.position.stop_order_id = str(stop_order.get("orderId"))
+        self.state.position.stop_price = 0.0
+        self.state.position.stop_order_id = None
         self.state.position.last_signal_time = signal_time
         self.state_store.save(self.state)
+
+        stop_order = self._replace_protective_stop(stop_price)
 
         self.database.record_event(
             "entry",
@@ -208,6 +326,19 @@ class LiveTradingEngine:
     def _manage_position(self, data: pd.DataFrame) -> None:
         position = self.state.position
         current_price = self.exchange.get_current_price()
+        if position.stop_price <= 0:
+            latest_atr = float(data.iloc[-1]["atr"])
+            recovery_stop = position.entry_price - (
+                latest_atr * self.config.ATR_STOP_MULTIPLIER
+            )
+            if recovery_stop <= 0 or recovery_stop >= current_price:
+                raise RuntimeError(
+                    "보호 손절이 없고 안전한 복구 손절가도 계산할 수 없습니다: "
+                    f"entry={position.entry_price}, atr={latest_atr}, current={current_price}"
+                )
+            logger.warning("보호 손절이 없어 ATR 기준 %.2f에 즉시 복구합니다.", recovery_stop)
+            self._replace_protective_stop(recovery_stop)
+
         if current_price <= position.stop_price:
             self._close_position(current_price, "local_stop_reached")
             return
@@ -219,11 +350,14 @@ class LiveTradingEngine:
             return
         if pivot_low > position.stop_price:
             old_stop = position.stop_price
-            self.exchange.cancel_all_orders()
-            stop_order = self.exchange.place_stop_market("SELL", position.quantity, pivot_low)
-            self.database.record_order(self.config.SYMBOL, stop_order)
-            position.stop_price = pivot_low
-            position.stop_order_id = str(stop_order.get("orderId"))
+            if pivot_low >= current_price:
+                logger.warning(
+                    "현재가 이상인 Pivot 손절 후보를 무시합니다: pivot=%.2f current=%.2f",
+                    pivot_low,
+                    current_price,
+                )
+                return
+            self._replace_protective_stop(pivot_low)
             position.last_pivot_low = pivot_low
             position.last_pivot_low_time = str(pivot_time)
             self.database.record_event(

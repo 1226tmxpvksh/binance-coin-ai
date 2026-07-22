@@ -40,13 +40,16 @@ copy config\settings.yaml.example config\settings.yaml
 
 기본 모드는 `MODE=PAPER`이며 실제 주문이 나가지 않습니다. 기존 안전 플래그인 `DRY_RUN=true`도 함께 유지됩니다.
 
-Telegram을 쓰려면 `.env`에 `TELEGRAM_ENABLED=true`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`를 입력합니다. 카카오 알림도 계속 지원합니다.
-
 ## 실행
 
 ```bash
 python main.py
 ```
+
+- Binance 4시간봉은 UTC 경계 기준으로 종료 1분 후 점검합니다.
+- 한국 시간 기준 점검 시각은 `01:01`, `05:01`, `09:01`, `13:01`, `17:01`, `21:01`입니다.
+- 프로그램 시작 직후에는 기존 포지션과 보호 손절만 동기화하고 신규 진입하지 않습니다.
+- 전략 계산에서는 Binance `close_time`이 지난 완료봉만 사용합니다.
 
 ## 실전 전환
 
@@ -86,6 +89,9 @@ docker compose up -d --build
 - 최대 연속 손실 `5회`
 - 연속 손실 초과 시 `24시간` 쿨다운
 - API 오류는 기본 `3회` 재시도
+- 시장가 진입은 `RESULT` 응답으로 실제 체결 수량과 가격을 확인
+- 보호 손절은 Binance Futures Algo API로 생성·조회·취소
+- 재시작 시 중복 보호 손절을 정리하고 현재가 아래의 가장 높은 손절 하나만 유지
 - OHLCV 데이터 오류나 비정상 캔들 간격 감지 시 거래 금지
 - 실전 모드는 `LIVE_TRADING_CONFIRMED=YES` 없이는 실행 불가
 
