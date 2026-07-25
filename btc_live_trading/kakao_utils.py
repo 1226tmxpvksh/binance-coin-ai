@@ -13,6 +13,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -22,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 _KAKAO_REFRESH_LOCK = threading.Lock()
 _KAKAO_REFRESH_LISTENER: Callable[[], None] | None = None
+
+# 로컬 만료 판정: 만료 이 초 전부터 '만료 임박'으로 간주하고 갱신을 허용한다.
+ACCESS_TOKEN_EXPIRY_MARGIN_SECONDS = 300
+# refresh_token(마스터 열쇠) 만료 임박 경고 기준(일)
+REFRESH_TOKEN_WARN_DAYS = 7
+_REFRESH_EXPIRY_WARNED = False
 
 
 def register_kakao_token_refresh_listener(callback: Callable[[], None] | None) -> None:
@@ -165,18 +172,49 @@ def get_redirect_uri() -> str:
     return (os.getenv("KAKAO_REDIRECT_URI") or DEFAULT_REDIRECT_URI).strip()
 
 
-def _read_json_tokens() -> tuple[str, str]:
+def _read_json_payload() -> Dict[str, Any]:
     if not KAKAO_CODE_JSON.exists():
-        return "", ""
+        return {}
     try:
         data = json.loads(KAKAO_CODE_JSON.read_text(encoding="utf-8-sig"))
-        return (
-            str(data.get("access_token") or "").strip(),
-            str(data.get("refresh_token") or "").strip(),
-        )
+        return data if isinstance(data, dict) else {}
     except Exception as exc:
         logger.warning("Could not read %s: %s", KAKAO_CODE_JSON, exc)
-        return "", ""
+        return {}
+
+
+def _read_json_tokens() -> tuple[str, str]:
+    data = _read_json_payload()
+    return (
+        str(data.get("access_token") or "").strip(),
+        str(data.get("refresh_token") or "").strip(),
+    )
+
+
+def get_access_expires_at() -> float:
+    """kakao_code.json 의 access 만료 시각(unix). 없으면 0."""
+    data = _read_json_payload()
+    raw = data.get("expires_at") or data.get("access_expires_at") or 0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def is_access_token_locally_fresh(*, margin_seconds: int | None = None) -> bool:
+    """HTTP 없이 로컬 expires_at 으로 액세스 토큰 유효 여부 판정.
+
+    카톡 자동로그인처럼 '만료 전이면 그대로 사용, 만료면 갱신' 정책의 핵심.
+    expires_at 이 없으면 False(갱신/로그인 경로로 유도).
+    """
+    access = get_access_token().strip()
+    if not access:
+        return False
+    expires_at = get_access_expires_at()
+    if expires_at <= 0:
+        return False
+    margin = ACCESS_TOKEN_EXPIRY_MARGIN_SECONDS if margin_seconds is None else max(0, int(margin_seconds))
+    return time.time() < (expires_at - margin)
 
 
 def hydrate_tokens_from_json() -> None:
@@ -214,20 +252,55 @@ def get_refresh_token() -> str:
     return jr or ""
 
 
-def _write_kakao_code_json(access_token: str, refresh_token: str) -> bool:
-    """kakao_code.json 갱신. 기존 파일 값과 병합해 어떤 토큰도 유실되지 않도록 한다.
+def _read_env_key_values(keys: list[str]) -> Dict[str, str]:
+    """`.env`에서 지정 키 값을 다시 읽는다(저장 검증용)."""
+    env_path = _env_file_path()
+    found = {k: "" for k in keys}
+    if not env_path.exists():
+        return found
+    try:
+        raw = env_path.read_text(encoding="utf-8-sig")
+    except Exception as exc:
+        logger.error(".env 재읽기 실패(%s): %s", env_path, exc)
+        return found
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        for key in keys:
+            if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
+                found[key] = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+    return found
 
-    반환값: 저장 성공 여부. 쓰기 실패는 다음 갱신을 영구 차단하므로 명확히 로깅한다.
-    """
-    existing_access, existing_refresh = _read_json_tokens()
+
+def _write_kakao_code_json(
+    access_token: str,
+    refresh_token: str,
+    *,
+    expires_at: float | None = None,
+) -> bool:
+    """kakao_code.json 갱신. 기존 파일 값과 병합해 어떤 토큰도 유실되지 않도록 한다."""
+    existing = _read_json_payload()
+    existing_access = str(existing.get("access_token") or "").strip()
+    existing_refresh = str(existing.get("refresh_token") or "").strip()
     eff_access = (access_token or existing_access or "").strip()
     eff_refresh = (refresh_token or existing_refresh or "").strip()
 
-    payload: Dict[str, str] = {}
+    payload: Dict[str, Any] = {}
     if eff_access:
         payload["access_token"] = eff_access
     if eff_refresh:
         payload["refresh_token"] = eff_refresh
+    if expires_at is not None and expires_at > 0:
+        payload["expires_at"] = float(expires_at)
+    else:
+        prev_exp = existing.get("expires_at") or existing.get("access_expires_at")
+        try:
+            prev_f = float(prev_exp or 0)
+        except (TypeError, ValueError):
+            prev_f = 0.0
+        if prev_f > 0 and eff_access == existing_access:
+            payload["expires_at"] = prev_f
     if not payload:
         return False
 
@@ -240,23 +313,35 @@ def _write_kakao_code_json(access_token: str, refresh_token: str) -> bool:
         return True
     except Exception as exc:
         logger.error(
-            "kakao_code.json 저장 실패(%s): %s — 다음 토큰 갱신 시 문제가 될 수 있으니 권한/디스크를 확인하세요.",
+            "[ERROR] 토큰 파일 덮어쓰기 실패! kakao_code.json 저장 실패(%s): %s — "
+            "권한/디스크/용량을 확인하세요. 원인=%s",
             KAKAO_CODE_JSON,
+            type(exc).__name__,
             exc,
         )
         return False
 
 
-def _merge_env_file(updates: Dict[str, str]) -> None:
+def _merge_env_file(updates: Dict[str, str]) -> bool:
+    """`.env` 키를 원자적으로 갱신. 성공 시 True."""
     env_path = _env_file_path()
     if not env_path.exists():
-        logger.debug(".env not found at %s — skipping file update", env_path)
-        return
+        logger.error(
+            "[ERROR] 토큰 파일 덮어쓰기 실패! .env 파일이 없습니다: %s — "
+            "카카오 토큰을 디스크에 저장할 수 없습니다.",
+            env_path,
+        )
+        return False
     try:
         raw = env_path.read_text(encoding="utf-8-sig")
     except Exception as exc:
-        logger.error("Failed to read .env: %s", exc)
-        return
+        logger.error(
+            "[ERROR] 토큰 파일 덮어쓰기 실패! .env 읽기 실패(%s): %s — 원인=%s",
+            env_path,
+            type(exc).__name__,
+            exc,
+        )
+        return False
 
     lines = raw.splitlines(keepends=True)
     keys_done: set[str] = set()
@@ -285,28 +370,38 @@ def _merge_env_file(updates: Dict[str, str]) -> None:
     try:
         _atomic_write_text(env_path, "".join(out))
         logger.info(".env 토큰 키 갱신 완료: %s", env_path)
+        return True
     except Exception as exc:
-        logger.error(".env 저장 실패(%s): %s", env_path, exc)
+        logger.error(
+            "[ERROR] 토큰 파일 덮어쓰기 실패! .env 저장 실패(%s): %s — 원인=%s",
+            env_path,
+            type(exc).__name__,
+            exc,
+        )
+        return False
 
 
-def persist_kakao_tokens(access_token: str, refresh_token: Optional[str] = None) -> bool:
+def persist_kakao_tokens(
+    access_token: str,
+    refresh_token: Optional[str] = None,
+    *,
+    expires_in: int | None = None,
+    expires_at: float | None = None,
+) -> bool:
     """access/refresh 토큰을 os.environ, kakao_code.json, .env 세 곳에 동기화 저장.
 
     refresh_token(마스터 열쇠) 처리 규칙:
       * None 또는 빈 문자열  → 회전 없음. 기존 env/json의 refresh_token을 절대 유실하지 않고 유지.
       * 비어있지 않은 값      → 회전 발급. 무조건 새 값으로 기존 값을 대체 저장.
 
-    저장 후 kakao_code.json을 다시 읽어 refresh_token이 의도대로 기록되었는지 검증한다.
-    반환값: refresh_token 저장·검증 성공 여부(다음 갱신을 보장하는 핵심 지표).
+    저장 직후 json/.env를 다시 읽어 access·refresh가 100% 일치하는지 검증한다.
+    불일치 시 `[ERROR] 토큰 파일 덮어쓰기 실패!` 를 남기고 False.
     """
     if not kakao_api_allowed():
         _log_kakao_env_block_once("토큰 저장")
         return False
     ja, jr_file = _read_json_tokens()
     prev_refresh = (os.getenv("KAKAO_REFRESH_TOKEN", "").strip() or jr_file).strip()
-
-    if access_token:
-        os.environ["KAKAO_ACCESS_TOKEN"] = access_token
 
     # --- 마스터 열쇠(refresh_token) 회전 분기 ---
     new_refresh = (refresh_token or "").strip() if refresh_token is not None else ""
@@ -321,53 +416,90 @@ def persist_kakao_tokens(access_token: str, refresh_token: Optional[str] = None)
             logger.info("카카오 refresh_token 재발급(기존과 동일 값) 확인: %s", _mask_token(new_refresh))
         eff_refresh = new_refresh
     else:
-        # 회전 없음 → 기존 유효 refresh_token을 반드시 유지
         eff_refresh = prev_refresh
         if eff_refresh:
             logger.debug("카카오 응답에 refresh_token 없음 → 기존 마스터 열쇠 유지: %s", _mask_token(eff_refresh))
 
-    if eff_refresh:
-        os.environ["KAKAO_REFRESH_TOKEN"] = eff_refresh
-    # eff_refresh가 비어 있으면 기존 env 값을 굳이 지우지 않는다(유실 방지).
+    eff_access = (access_token or "").strip() or os.getenv("KAKAO_ACCESS_TOKEN", "").strip() or ja
+    if not eff_access:
+        logger.error("[ERROR] 토큰 파일 덮어쓰기 실패! 저장할 access_token이 비어 있습니다.")
+        return False
 
-    eff_access = access_token or os.getenv("KAKAO_ACCESS_TOKEN", "").strip() or ja
+    eff_expires_at = 0.0
+    if expires_at is not None and float(expires_at) > 0:
+        eff_expires_at = float(expires_at)
+    elif expires_in is not None:
+        try:
+            ei = int(expires_in)
+        except (TypeError, ValueError):
+            ei = 0
+        if ei > 0:
+            eff_expires_at = time.time() + ei
 
-    json_ok = _write_kakao_code_json(eff_access, eff_refresh)
+    json_ok = _write_kakao_code_json(
+        eff_access,
+        eff_refresh,
+        expires_at=eff_expires_at if eff_expires_at > 0 else None,
+    )
 
-    file_updates: Dict[str, str] = {}
-    if eff_access:
-        file_updates["KAKAO_ACCESS_TOKEN"] = eff_access
+    file_updates: Dict[str, str] = {"KAKAO_ACCESS_TOKEN": eff_access}
     if eff_refresh:
         file_updates["KAKAO_REFRESH_TOKEN"] = eff_refresh
-    if file_updates:
-        _merge_env_file(file_updates)
+    env_ok = _merge_env_file(file_updates)
 
-    # --- 저장 검증: 파일에 실제로 의도한 refresh_token이 기록됐는지 재확인 ---
-    refresh_ok = True
-    if eff_refresh:
-        _, saved_refresh = _read_json_tokens()
-        refresh_ok = (saved_refresh == eff_refresh)
-        if refresh_ok:
-            logger.info("✅ refresh_token 저장 검증 통과: %s (kakao_code.json)", _mask_token(eff_refresh))
-        else:
-            logger.error(
-                "❌ refresh_token 저장 검증 실패! 파일=%s, 의도=%s — 다음 갱신이 실패할 수 있습니다.",
-                _mask_token(saved_refresh),
-                _mask_token(eff_refresh),
-            )
+    # --- 저장 검증: 파일을 다시 읽어 100% 일치 확인 ---
+    saved_access, saved_refresh = _read_json_tokens()
+    json_access_ok = saved_access == eff_access
+    json_refresh_ok = (not eff_refresh) or (saved_refresh == eff_refresh)
 
-    # --- os.environ 즉시 동기화: 파일 정본 → 메모리 (내부 Replay 방지) ---
-    saved_access, saved_refresh_final = _read_json_tokens()
-    if saved_access:
+    env_values = _read_env_key_values(["KAKAO_ACCESS_TOKEN", "KAKAO_REFRESH_TOKEN"])
+    env_access_ok = env_values.get("KAKAO_ACCESS_TOKEN", "") == eff_access
+    env_refresh_ok = (not eff_refresh) or (env_values.get("KAKAO_REFRESH_TOKEN", "") == eff_refresh)
+
+    ok = bool(json_ok and env_ok and json_access_ok and json_refresh_ok and env_access_ok and env_refresh_ok)
+    if ok:
+        logger.info(
+            "✅ 토큰 파일 저장 검증 통과: access=%s refresh=%s (kakao_code.json + .env)",
+            _mask_token(eff_access),
+            _mask_token(eff_refresh),
+        )
+        # 파일 정본 → 메모리 (디스크와 불일치한 메모리만 남지 않게)
         os.environ["KAKAO_ACCESS_TOKEN"] = saved_access
-    elif eff_access:
-        os.environ["KAKAO_ACCESS_TOKEN"] = eff_access
-    if saved_refresh_final:
-        os.environ["KAKAO_REFRESH_TOKEN"] = saved_refresh_final
-    elif eff_refresh:
-        os.environ["KAKAO_REFRESH_TOKEN"] = eff_refresh
+        if saved_refresh:
+            os.environ["KAKAO_REFRESH_TOKEN"] = saved_refresh
+        return True
 
-    return json_ok and refresh_ok
+    reasons: list[str] = []
+    if not json_ok:
+        reasons.append("kakao_code.json 쓰기 실패")
+    if not env_ok:
+        reasons.append(".env 쓰기 실패")
+    if not json_access_ok:
+        reasons.append(
+            f"json access 불일치(의도={_mask_token(eff_access)} 파일={_mask_token(saved_access)})"
+        )
+    if not json_refresh_ok:
+        reasons.append(
+            f"json refresh 불일치(의도={_mask_token(eff_refresh)} 파일={_mask_token(saved_refresh)})"
+        )
+    if not env_access_ok:
+        reasons.append(
+            f".env access 불일치(의도={_mask_token(eff_access)} 파일={_mask_token(env_values.get('KAKAO_ACCESS_TOKEN', ''))})"
+        )
+    if not env_refresh_ok:
+        reasons.append(
+            f".env refresh 불일치(의도={_mask_token(eff_refresh)} 파일={_mask_token(env_values.get('KAKAO_REFRESH_TOKEN', ''))})"
+        )
+    logger.error(
+        "[ERROR] 토큰 파일 덮어쓰기 실패! 원인: %s — "
+        "카카오 서버는 새 refresh를 발급했을 수 있으나 디스크에 없음. "
+        "즉시 권한/디스크를 확인하고 coinbot_watch.sh 로 재인증하세요.",
+        "; ".join(reasons) or "알 수 없음",
+    )
+    # 디스크 검증 실패 시 메모리에만 새 토큰을 남기지 않는다(재시작 시 invalid_grant 악화 방지).
+    # 단, 파일이 옛값이라도 hydrate로 파일 정본을 메모리에 맞춘다.
+    hydrate_tokens_from_json()
+    return False
 
 
 def clear_env_key(key: str) -> None:
@@ -381,29 +513,44 @@ def clear_kakao_auth_code() -> None:
 
 
 def apply_token_response(token_data: Dict[str, Any]) -> str:
-    """OAuth/refresh 응답 JSON에서 토큰을 꺼내 저장하고 access_token 문자열을 반환.
+    """OAuth/refresh 응답 JSON에서 토큰을 꺼내 **디스크에 저장·검증**한 뒤 access를 반환.
 
+    저장/검증 실패 시 빈 문자열을 반환한다(메모리만 성공으로 착각하지 않음).
     카카오 갱신 응답의 refresh_token 필드 유무를 명확히 분기한다.
       * 필드가 있고 값이 비어있지 않으면 → 회전으로 간주, 새 값으로 대체 저장.
       * 필드가 없거나 빈 값이면        → 회전 없음, 기존 refresh_token 유지.
     """
     access = str(token_data.get("access_token") or "").strip()
+    if not access:
+        logger.error(
+            "카카오 토큰 응답에 access_token이 없습니다. keys=%s",
+            sorted(str(k) for k in token_data.keys()),
+        )
+        return ""
+
     raw_refresh = token_data.get("refresh_token")
     has_new_refresh = raw_refresh is not None and str(raw_refresh).strip() != ""
+    expires_in_raw = token_data.get("expires_in")
+    try:
+        expires_in = int(expires_in_raw) if expires_in_raw is not None else None
+    except (TypeError, ValueError):
+        expires_in = None
 
     if has_new_refresh:
         rotated = str(raw_refresh).strip()
         logger.info("카카오 갱신 응답에 refresh_token 포함 → 마스터 열쇠 회전 처리 시작")
-        ok = persist_kakao_tokens(access, rotated)
+        ok = persist_kakao_tokens(access, rotated, expires_in=expires_in)
         logger.info("카카오 마스터 열쇠 회전 저장 결과: %s", "성공" if ok else "실패")
     else:
         logger.debug("카카오 갱신 응답에 refresh_token 없음 → 기존 마스터 열쇠 유지 처리")
-        ok = persist_kakao_tokens(access, None)
+        ok = persist_kakao_tokens(access, None, expires_in=expires_in)
     if not ok:
         logger.error(
-            "카카오 토큰 저장/검증 실패 — 다음 갱신 시 invalid_grant가 날 수 있습니다. "
+            "[ERROR] 토큰 파일 덮어쓰기 실패! apply_token_response — "
+            "액세스 토큰을 메모리 성공으로 취급하지 않습니다. "
             "kakao_code.json/.env 권한·디스크를 확인하세요."
         )
+        return ""
     return access
 
 
@@ -522,7 +669,11 @@ def capture_authorization_code_via_localhost(
 
 
 def validate_access_token(access_token: str) -> bool:
-    """카카오 access_token 유효성(HTTP 200) 확인."""
+    """카카오 access_token 유효성(HTTP 200) 확인.
+
+    평시 매 사이클에서 호출하지 말 것 — 알림 전송/기동 복구 등
+    '로그인 시도' 경로에서만 사용한다(카카오 API 부하·정책 회피).
+    """
     token = (access_token or "").strip()
     if not token or not kakao_api_allowed():
         return False
@@ -532,16 +683,54 @@ def validate_access_token(access_token: str) -> bool:
             headers={"Authorization": f"Bearer {token}"},
             timeout=8,
         )
-        return response.status_code == 200
-    except requests.RequestException:
+        if response.status_code == 200:
+            return True
+        logger.warning(
+            "카카오 access_token 검증 실패: HTTP %s body=%s",
+            response.status_code,
+            (response.text or "")[:200],
+        )
+        return False
+    except requests.RequestException as exc:
+        logger.warning("카카오 access_token 검증 네트워크 오류: %s", type(exc).__name__)
         return False
 
 
-def refresh_kakao_access_token_sync(client_id: str, refresh_token: str = "") -> str:
+def ensure_access_token_for_login(client_id: str, refresh_token: str = "") -> str:
+    """카톡 자동로그인 스타일: 만료됐을 때만 refresh.
+
+    - 로컬 expires_at 이 유효하면 HTTP 없이 기존 access 반환
+    - 만료/없음이면 refresh_kakao_access_token_sync 로 갱신(+디스크 저장 검증)
+    """
+    if not kakao_api_allowed():
+        _log_kakao_env_block_once("자동 로그인")
+        return ""
+    hydrate_tokens_from_json()
+    access = get_access_token().strip()
+    if access and is_access_token_locally_fresh():
+        return access
+    if access:
+        logger.info(
+            "카카오 액세스 토큰 만료/만료임박 — 로그인(알림) 시점에만 자동 갱신합니다 "
+            "(expires_at=%s)",
+            int(get_access_expires_at()) or "(없음)",
+        )
+    else:
+        logger.info("카카오 액세스 토큰 없음 — 로그인(알림) 시점에 refresh로 자동 로그인합니다.")
+    return refresh_kakao_access_token_sync(client_id, refresh_token, force=True)
+
+
+def refresh_kakao_access_token_sync(
+    client_id: str,
+    refresh_token: str = "",
+    *,
+    force: bool = False,
+) -> str:
     """Thread-safe 카카오 access_token 갱신(Double-checked locking).
 
-    여러 스레드/코루틴이 동시에 만료를 감지해도 Refresh HTTP 호출은 1회만 수행하고,
-    대기 스레드는 락 해제 후 이미 저장된 access_token을 재사용한다.
+    - force=False(기본): 로컬 expires_at 이 유효하면 HTTP refresh를 하지 않는다.
+    - force=True: 401 등 실무효가 확인된 '로그인 시도'에서만 강제 갱신.
+    - 성공 시 apply_token_response → persist 검증까지 통과한 access만 반환.
     """
     if not kakao_api_allowed():
         _log_kakao_env_block_once("토큰 갱신")
@@ -549,36 +738,57 @@ def refresh_kakao_access_token_sync(client_id: str, refresh_token: str = "") -> 
 
     hydrate_tokens_from_json()
     access = get_access_token().strip()
-    if access and validate_access_token(access):
+    if access and not force and is_access_token_locally_fresh():
         return access
 
     rt = (refresh_token or get_refresh_token()).strip()
-    if not client_id or not rt:
-        return access
+    if not client_id:
+        logger.error("카카오 토큰 갱신 실패: REST API 키(client_id)가 비어 있습니다.")
+        return ""
+    if not rt:
+        logger.error(
+            "카카오 토큰 갱신 실패: refresh_token이 비어 있습니다. "
+            "kakao_code.json / .env 를 확인하거나 coinbot_watch.sh 로 재인증하세요."
+        )
+        return access if (access and not force) else ""
 
     new_access = ""
     refreshed_now = False
+    last_error = ""
     with _KAKAO_REFRESH_LOCK:
         hydrate_tokens_from_json()
         access = get_access_token().strip()
-        if access and validate_access_token(access):
+        if access and not force and is_access_token_locally_fresh():
             logger.debug("카카오 refresh 대기 — 다른 스레드가 갱신한 access_token 사용")
             return access
 
-        token_data = refresh_access_token_request(client_id, rt)
-        new_access = apply_token_response(token_data)
-        if new_access:
-            logger.info("카카오 액세스 토큰 자동 갱신 완료 (thread-safe)")
-            refreshed_now = True
+        try:
+            token_data = refresh_access_token_request(client_id, rt)
+            new_access = apply_token_response(token_data)
+            if new_access:
+                logger.info(
+                    "카카오 액세스 토큰 자동 갱신 완료 (thread-safe, 디스크 저장·검증 통과)"
+                )
+                refreshed_now = True
+            else:
+                last_error = (
+                    "refresh HTTP는 성공했으나 토큰 파일 저장/검증 실패 "
+                    "(kakao_code.json / .env 권한·디스크 확인)"
+                )
+                logger.error("[ERROR] %s", last_error)
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            logger.error("카카오 토큰 갱신 예외: %s", last_error)
+            raise
 
     # 데드락 방지: 리스너(알림 발송)는 반드시 락 해제 후 호출한다.
-    # 리스너 → 메시지 전송 → 401 → 재갱신 경로가 같은 스레드에서 이 함수로
-    # 재진입해도 non-reentrant Lock 에 걸리지 않는다.
     if refreshed_now:
         try:
             _notify_kakao_token_http_refreshed()
         except Exception:
-            logger.exception("카카오 갱신 성공 알림 처리 중 예외(토큰 갱신 자체는 성공)")
+            logger.exception("카카오 갱신 성공 알림 처리 중 예외(토큰 갱신·저장 자체는 성공)")
+    elif last_error:
+        logger.error("카카오 토큰 갱신 최종 실패 원인: %s", last_error)
     return new_access or ""
 
 
@@ -595,23 +805,44 @@ def refresh_access_token_request(client_id: str, refresh_token: str) -> Dict[str
         "client_id": client_id,
         "refresh_token": refresh_token.strip(),
     }
-    response = requests.post(token_url, data=data, timeout=15)
+    try:
+        response = requests.post(token_url, data=data, timeout=15)
+    except requests.RequestException as exc:
+        logger.error(
+            "카카오 토큰 갱신 네트워크 실패: %s — 원인=%s",
+            type(exc).__name__,
+            exc,
+        )
+        raise
+
     if response.status_code != 200:
+        err: Dict[str, Any] = {}
+        desc = ""
         try:
             err = response.json()
             desc = str(err.get("error_description") or err.get("error") or "")
-            if "expired_or_invalid_refresh_token" in desc or err.get("error") == "invalid_grant":
-                # INFO 기본 레벨에서도 원인이 보이도록 ERROR로 남긴다.
-                # (과거 DEBUG만 남겨 journalctl에서 원인 추적이 불가능했음)
-                logger.error(
-                    "Kakao refresh token 폐기/만료(invalid_grant): %s — "
-                    "재인증 필요(coinbot_watch.sh). 흔한 원인: .env 덮어쓰기로 옛 refresh_token 복원, "
-                    "다른 환경에서 동일 앱 재인증(패밀리 폐기), refresh_token 수명 만료.",
-                    desc or err,
-                )
-            else:
-                logger.error("Kakao token refresh failed: %s", err.get("error_description", err))
         except Exception:
-            logger.error("Kakao token refresh failed: HTTP %s", response.status_code)
+            desc = (response.text or "")[:300]
+        error_code = str(err.get("error") or "")
+        if "expired_or_invalid_refresh_token" in desc or error_code == "invalid_grant":
+            logger.error(
+                "Kakao refresh token 폐기/만료(invalid_grant): code=%s desc=%s HTTP=%s — "
+                "재인증 필요(coinbot_watch.sh). 흔한 원인: "
+                "1) 갱신 성공 후 .env/json 저장 실패로 옛 refresh 재사용 "
+                "2) WinSCP로 낡은 .env 덮어쓰기 "
+                "3) 다른 환경에서 동일 앱 재인증(패밀리 폐기) "
+                "4) refresh_token 수명 만료",
+                error_code or "(없음)",
+                desc or "(없음)",
+                response.status_code,
+            )
+        else:
+            logger.error(
+                "Kakao token refresh failed: HTTP=%s code=%s desc=%s body=%s",
+                response.status_code,
+                error_code or "(없음)",
+                desc or "(없음)",
+                (response.text or "")[:300],
+            )
         response.raise_for_status()
     return response.json()

@@ -70,12 +70,12 @@ journalctl -u coinbot.service -f
 
 > `journalctl -f` 만 쓰면 인증 입력 칸이 안 나옵니다. 인증은 반드시 `coinbot_watch.sh`.
 
-인증 한 번 잘 되면, 이후 **5분 사이클마다 토큰 검증**하고 만료 시에만 자동 갱신(액세스 TTL 약 6시간)합니다. 평소엔 §1만 하면 됩니다.
+인증 한 번 잘 되면, 이후 **카톡 자동로그인처럼** 동작합니다 — 평시에는 갱신 HTTP를 치지 않고, **알림을 보낼 때 토큰이 만료됐을 때만** refresh한 뒤 `.env`/`kakao_code.json`에 저장합니다. 평소엔 §1만 하면 됩니다.
 
-생존 확인(배포 후 1시간 안에 보이면 정상):
+생존·저장 실패 확인:
 
 ```bash
-journalctl -u coinbot.service --since "1 hour ago" --no-pager | grep -E "카카오 토큰 하트비트|자동 갱신 완료|알림 워커"
+journalctl -u coinbot.service --since "1 hour ago" --no-pager | grep -E "카카오 토큰 하트비트|자동 갱신 완료|토큰 파일 덮어쓰기|invalid_grant|알림 워커"
 ```
 
 ---
@@ -100,7 +100,8 @@ sed -i 's/\r$//' /home/bot2/Coin/scripts/coinbot_watch.sh
 | `$'\r': command not found` | §3 `sed` 실행 |
 | `main_ai.py`가 여러 개 실행됨 | `pgrep -af main_ai.py` → `systemctl stop coinbot.service` → 재시작 |
 | 카톡이 **1시간마다** 옴 | 서버 `.env` 확인: `grep AI_STATUS_REPORT_MINUTES /home/bot2/Coin/btc_live_trading/.env` → `1440` 으로 변경, `KAKAO_ONCE_PER_DAY=true` 추가 후 재시작 |
-| 토큰 갱신 알림이 **만료 시(~6시간)** 옴 | 정상 (`🔑 카카오 토큰 갱신 성공`). 고정 스케줄이 아니라 액세스 만료 때만. 일일 리포트(1회)와 별개 |
+| 토큰 갱신 알림이 **만료 후 알림 보낼 때** 옴 | 정상 (`🔑 카카오 토큰 갱신 성공`). 고정 6시간 스케줄 아님. 일일 리포트(1회)와 별개 |
+| 재시작 후 `invalid_grant` | 예전엔 갱신값이 메모리만 남는 경우 있음 — 최신 코드는 디스크 저장 검증 필수. `journalctl \| grep "토큰 파일 덮어쓰기"` 확인 |
 | 갱신 성공 후 카톡이 끊김 | 예전 데드락/워커 사망 경로 — 최신 코드는 락 해제 후 알림·워커 자가 복구. `journalctl \| grep "하트비트\|알림 워커"` 로 생존 확인 |
 | `카카오 인증 실패` 로그 | 인증 대기 모드 — 30분마다 자동 복구 시도. `coinbot_watch.sh` 재인증만 하면 재시작 없이 살아남. 원인은 `journalctl \| grep "리프레시 토큰 갱신 실패"` 의 `code=` 확인 |
 

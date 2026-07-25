@@ -18,9 +18,11 @@ from typing import Optional
 import requests
 
 from kakao_utils import (
+    ensure_access_token_for_login,
     get_access_token,
     get_refresh_token,
     hydrate_tokens_from_json,
+    is_access_token_locally_fresh,
     kakao_api_allowed,
     refresh_kakao_access_token_sync,
 )
@@ -86,10 +88,19 @@ class KakaoNotifier:
 
         self._sync_tokens_from_store()
 
-        if not self.access_token:
-            logger.warning("카카오 액세스 토큰이 없습니다. 자동 갱신을 시도합니다.")
-            if not self._refresh_access_token():
-                logger.error("카카오 액세스 토큰이 없고 자동 갱신에도 실패했습니다.")
+        # 카톡 자동로그인처럼: 만료됐을 때만(또는 토큰 없을 때만) 로그인 시점에 갱신
+        if (not self.access_token) or (not is_access_token_locally_fresh()):
+            logger.info(
+                "카카오 자동 로그인 — 알림 전송 직전 토큰 확보 (access=%s fresh=%s)",
+                "있음" if self.access_token else "없음",
+                is_access_token_locally_fresh(),
+            )
+            if not self._refresh_access_token(force=bool(self.access_token)):
+                logger.error(
+                    "카카오 자동 로그인 실패 — 액세스 토큰을 확보하지 못해 알림을 보내지 않습니다. "
+                    "원인: refresh 실패 또는 토큰 파일 저장 실패. journalctl에서 "
+                    "'토큰 파일 덮어쓰기 실패' / 'invalid_grant' 를 확인하세요."
+                )
                 return False
             self._sync_tokens_from_store()
 
@@ -123,25 +134,37 @@ class KakaoNotifier:
                 return True
 
             if response.status_code == 401 and retry_count < MAX_REFRESH_RETRY_COUNT:
-                logger.warning("카카오 액세스 토큰 만료 또는 무효 상태입니다. 자동 갱신을 시도합니다.")
-                if self._refresh_access_token():
+                logger.warning(
+                    "카카오 액세스 토큰 만료/무효(HTTP 401). 로그인 재시도로 강제 갱신합니다. body=%s",
+                    (response.text or "")[:200],
+                )
+                if self._refresh_access_token(force=True):
                     logger.info("카카오 액세스 토큰 갱신 성공. 메시지 전송을 재시도합니다.")
                     return self.send_message(title, description, retry_count + 1)
-                logger.error("카카오 액세스 토큰 갱신 실패로 메시지 전송을 중단합니다.")
+                logger.error(
+                    "카카오 액세스 토큰 갱신 실패로 메시지 전송을 중단합니다. "
+                    "원인: invalid_grant 또는 토큰 파일 저장 실패 가능."
+                )
                 return False
 
-            logger.error("카카오 알림 전송 실패: status=%s body=%s", response.status_code, response.text)
+            logger.error(
+                "카카오 알림 전송 실패: status=%s body=%s",
+                response.status_code,
+                (response.text or "")[:300],
+            )
             return False
         except requests.RequestException as exc:
-            logger.error("카카오 알림 전송 중 네트워크 오류: %s", exc)
+            logger.error("카카오 알림 전송 중 네트워크 오류: %s — 원인=%s", type(exc).__name__, exc)
             return False
         except Exception as exc:
-            logger.error("카카오 알림 전송 중 오류: %s", exc)
+            logger.error("카카오 알림 전송 중 오류: %s — 원인=%s", type(exc).__name__, exc)
             return False
 
-    def _refresh_access_token(self) -> bool:
+    def _refresh_access_token(self, *, force: bool = False) -> bool:
         """중앙 갱신 경로로 액세스 토큰 재발급. 최대 3회 재시도 후 포기.
 
+        force=False: 로컬 만료일 때만 refresh (ensure_access_token_for_login)
+        force=True: 401 등 실무효 확인 후 강제 refresh
         재시도 사이에 정본(kakao_code.json)을 다시 읽어, 외부 재인증으로
         새 토큰이 저장된 경우 즉시 사용한다.
         """
@@ -152,19 +175,28 @@ class KakaoNotifier:
 
         self._sync_tokens_from_store()
         if not self.refresh_token:
-            logger.error("카카오 토큰 갱신 실패: 리프레시 토큰이 없습니다.")
+            logger.error(
+                "카카오 토큰 갱신 실패: 리프레시 토큰이 없습니다. "
+                "kakao_code.json / .env 의 KAKAO_REFRESH_TOKEN 을 확인하세요."
+            )
             return False
 
-        last_error: Exception | None = None
+        last_error: Exception | str | None = None
         for attempt in range(1, TOKEN_REFRESH_MAX_ATTEMPTS + 1):
             try:
-                new_access = refresh_kakao_access_token_sync(client_id, "").strip()
+                if force:
+                    new_access = refresh_kakao_access_token_sync(
+                        client_id, "", force=True
+                    ).strip()
+                else:
+                    new_access = ensure_access_token_for_login(client_id, "").strip()
             except Exception as exc:
                 last_error = exc
-                logger.warning(
-                    "카카오 토큰 갱신 요청 실패 (시도 %s/%s): %s",
+                logger.error(
+                    "카카오 토큰 갱신 요청 실패 (시도 %s/%s): %s — 원인=%s",
                     attempt,
                     TOKEN_REFRESH_MAX_ATTEMPTS,
+                    type(exc).__name__,
                     exc,
                 )
                 new_access = ""
@@ -180,12 +212,15 @@ class KakaoNotifier:
             if attempt < TOKEN_REFRESH_MAX_ATTEMPTS:
                 time.sleep(TOKEN_REFRESH_RETRY_DELAY_SECONDS)
                 self._sync_tokens_from_store()
+                # 외부 재인증으로 새 refresh가 들어왔으면 다음 시도에서 사용
+                if self.access_token and is_access_token_locally_fresh() and not force:
+                    return True
 
         logger.error(
             "카카오 토큰 갱신 실패: %s회 재시도 후 포기 (마지막 오류: %s). "
-            "리프레시 토큰 만료 시 서버에서 coinbot_watch.sh 로 재인증하세요.",
+            "리프레시 토큰 만료·파일 저장 실패 시 서버에서 coinbot_watch.sh 로 재인증하세요.",
             TOKEN_REFRESH_MAX_ATTEMPTS,
-            last_error or "새 액세스 토큰 없음",
+            last_error or "새 액세스 토큰 없음/저장 검증 실패",
         )
         return False
 

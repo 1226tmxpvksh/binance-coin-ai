@@ -108,6 +108,7 @@ try:
         get_redirect_uri as _get_kakao_redirect_uri,
         get_refresh_token as _get_kakao_refresh_token,
         hydrate_tokens_from_json as _hydrate_kakao_tokens,
+        is_access_token_locally_fresh as _is_kakao_access_locally_fresh,
         kakao_api_allowed as _kakao_api_allowed,
         open_kakao_auth_url as _open_kakao_auth_url,
         refresh_kakao_access_token_sync as _refresh_kakao_access_token_sync,
@@ -125,6 +126,7 @@ except Exception:
     _get_kakao_redirect_uri = None  # type: ignore
     _get_kakao_refresh_token = None  # type: ignore
     _hydrate_kakao_tokens = None  # type: ignore
+    _is_kakao_access_locally_fresh = None  # type: ignore
     _kakao_api_allowed = None  # type: ignore
     _open_kakao_auth_url = None  # type: ignore
     _refresh_kakao_access_token_sync = None  # type: ignore
@@ -1275,10 +1277,14 @@ def _bootstrap_kakao_tokens() -> None:
     if _try_kakao_auth_code_from_env(rest_api_key):
         return
 
-    # 3) 기존 액세스 토큰이 유효하면 그대로 가동
+    # 3) 로컬 만료시각이 유효하면 HTTP 없이 그대로 가동(카카오 API 부하 회피)
     existing = get_access_token().strip() if get_access_token is not None else ""
+    if existing and _is_kakao_access_locally_fresh is not None and _is_kakao_access_locally_fresh():
+        logger.info("카카오 액세스 토큰 로컬 유효(만료 전) — 재인증/갱신 불필요")
+        return
+    # expires_at 없는 구형 파일: 기동 1회만 HTTP 검증
     if existing and _validate_kakao_access_token(existing):
-        logger.info("카카오 액세스 토큰 유효 — 재인증 불필요")
+        logger.info("카카오 액세스 토큰 HTTP 검증 통과 — 재인증 불필요")
         return
 
     interactive = _stdin_is_interactive()
@@ -1288,7 +1294,7 @@ def _bootstrap_kakao_tokens() -> None:
         if _try_kakao_local_oauth_auto(rest_api_key):
             return
 
-    # 4) 리프레시 토큰으로 자동 갱신(회전 시 원자적 저장+검증은 kakao_utils가 보장)
+    # 4) 리프레시 토큰으로 자동 갱신(기동 시 1회 — 이후엔 알림 로그인 시점에만)
     refresh_token = _get_kakao_refresh_token().strip() if _get_kakao_refresh_token else ""
     if refresh_token:
         if _refresh_kakao_access_token(refresh_token, rest_api_key, mark_exhausted_on_expire=not interactive):
@@ -1361,15 +1367,19 @@ def _refresh_kakao_access_token(
     invalid_grant_seen = False
     for attempt in range(1, max_attempts + 1):
         try:
-            access_token = _refresh_kakao_access_token_sync(rest_api_key, current_rt).strip()
+            # force=True: 이미 만료/기동 복구 경로이므로 로컬 fresh 스킵하고 강제 갱신
+            access_token = _refresh_kakao_access_token_sync(
+                rest_api_key, current_rt, force=True
+            ).strip()
             if access_token:
                 _clear_kakao_auth_exhausted()
                 if attempt > 1:
                     logger.info("카카오 토큰 갱신 성공 (재시도 %s/%s회 만에 복구)", attempt, max_attempts)
                 return access_token
             logger.error(
-                "카카오 refresh HTTP는 예외 없이 끝났으나 access_token이 비어 있습니다 (시도 %s/%s). "
-                "화이트리스트 차단·빈 refresh·카카오 응답 이상을 확인하세요.",
+                "카카오 refresh 후 access_token이 비어 있습니다 (시도 %s/%s). "
+                "원인 후보: 토큰 파일 덮어쓰기 실패 / 화이트리스트 차단 / 빈 refresh / 카카오 응답 이상. "
+                "journalctl에서 '[ERROR] 토큰 파일 덮어쓰기 실패' 를 확인하세요.",
                 attempt,
                 max_attempts,
             )
@@ -1377,12 +1387,13 @@ def _refresh_kakao_access_token(
             error_code, error_description = _extract_kakao_error(exc)
             # 원인 추적용 — invalid_grant 포함 모든 refresh 실패를 ERROR로 남긴다.
             logger.error(
-                "카카오 리프레시 토큰 갱신 실패 (시도 %s/%s): code=%s desc=%s exc=%s",
+                "카카오 리프레시 토큰 갱신 실패 (시도 %s/%s): code=%s desc=%s exc=%s cause=%s",
                 attempt,
                 max_attempts,
                 error_code or "(없음)",
                 error_description or "(없음)",
                 type(exc).__name__,
+                exc,
             )
             invalid_grant_seen = _is_kakao_invalid_grant(error_code, error_description)
 
@@ -1412,7 +1423,21 @@ def _refresh_kakao_access_token(
     return ""
 
 
-def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
+def _ensure_kakao_access_token(
+    *,
+    show_auth_link: bool = True,
+    for_login: bool = False,
+) -> str:
+    """카카오 토큰 확보.
+
+    for_login=False (매매 게이트/평시):
+      - HTTP validate / refresh 를 하지 않는다 (카카오 API 정책·부하 회피).
+      - 디스크에 access+refresh 가 있고 exhausted 가 아니면 통과.
+      - 실제 갱신은 알림 전송(로그인 시도) 시 KakaoNotifier 가 수행한다.
+
+    for_login=True (알림·기동 복구):
+      - 로컬 만료면 refresh, 401/무효면 강제 refresh + 디스크 저장 검증.
+    """
     if (
         KakaoNotifier is None
         or _hydrate_kakao_tokens is None
@@ -1435,7 +1460,6 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
             _kakao_auth_retry_interval_seconds() // 60,
         )
         _clear_kakao_auth_exhausted()
-        # 아래 일반 경로로 진행: 정본 재검증 → 실패 시 다시 exhausted 마킹(다음 주기 대기)
 
     _hydrate_kakao_tokens()
     rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
@@ -1444,20 +1468,35 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
     if from_env:
         return from_env
 
-    # 검증 우선: 기존 액세스 토큰이 아직 유효하면 그대로 사용한다.
     access_token = get_access_token().strip()
-    if access_token and _validate_kakao_access_token(access_token):
+    refresh_token = _get_kakao_refresh_token().strip()
+
+    # --- 평시 게이트: 디스크 자격증명만 확인 (HTTP 없음) ---
+    if not for_login:
+        if access_token and refresh_token:
+            _clear_kakao_auth_exhausted()
+            return access_token
+        if show_auth_link and not refresh_token and not KAKAO_AUTH_EXHAUSTED:
+            recovered = _manual_kakao_authorization_recovery(
+                rest_api_key, "사용 가능한 액세스 토큰/리프레시 토큰이 없습니다."
+            )
+            if recovered:
+                return recovered
+        if not refresh_token and not KAKAO_AUTH_EXHAUSTED:
+            _mark_kakao_auth_exhausted("사용 가능한 액세스 토큰/리프레시 토큰이 없습니다.")
+        return ""
+
+    # --- 로그인(알림) 경로: 만료 시에만 갱신 ---
+    if access_token and _is_kakao_access_locally_fresh is not None and _is_kakao_access_locally_fresh():
         _clear_kakao_auth_exhausted()
         return access_token
 
-    logger.warning(
-        "카카오 액세스 토큰 만료/무효 — refresh_token으로 갱신을 시도합니다 (access_len=%s refresh_len=%s)",
+    logger.info(
+        "카카오 자동 로그인 — 만료/부재 토큰 갱신 시도 (access_len=%s refresh_len=%s)",
         len(access_token),
-        len(_get_kakao_refresh_token().strip() if _get_kakao_refresh_token else ""),
+        len(refresh_token),
     )
 
-    # 액세스 토큰이 만료/무효일 때만 refresh_token으로 갱신(여기서만 회전 발생).
-    refresh_token = _get_kakao_refresh_token().strip()
     if refresh_token and rest_api_key:
         refreshed = _refresh_kakao_access_token(refresh_token, rest_api_key)
         if refreshed:
@@ -1470,8 +1509,7 @@ def _ensure_kakao_access_token(*, show_auth_link: bool = True) -> str:
                 if recovered:
                     return recovered
             return ""
-        # 네트워크 등 일시적 갱신 실패 — exhausted 로 표시하지 않고 다음 사이클 재시도
-        logger.warning("카카오 토큰 갱신 일시 실패 — 다음 사이클에서 재시도합니다.")
+        logger.warning("카카오 토큰 갱신 일시 실패 — 다음 로그인(알림) 시도에서 재시도합니다.")
         return ""
 
     if show_auth_link:
@@ -1505,14 +1543,14 @@ def _log_kakao_auth_blocked_throttled() -> None:
 
 
 def _log_kakao_token_heartbeat() -> None:
-    """토큰 검증 루프 생존 로그.
+    """토큰/알림 루프 생존 로그.
 
-    - 매 사이클 DEBUG: "토큰 갱신 스레드 작동 중... 다음 주기 대기"
-    - KAKAO_HEARTBEAT_LOG_MINUTES(기본 60분)마다 1회 INFO: journalctl(INFO 레벨)에서도
-      토큰 검증 루프가 살아 있음을 확인할 수 있게 한다. 워커 스레드 상태도 함께 남긴다.
+    - 매 사이클 DEBUG
+    - KAKAO_HEARTBEAT_LOG_MINUTES(기본 60분)마다 1회 INFO
+    평시에는 HTTP 갱신하지 않음 — 알림(로그인) 시 만료 토큰만 갱신.
     """
     global KAKAO_HEARTBEAT_LOG_AT_MONO
-    logger.debug("토큰 갱신 스레드 작동 중... 다음 주기 대기")
+    logger.debug("카카오 자격증명 게이트 정상 — 다음 주기 대기(갱신은 알림 로그인 시에만)")
     interval = max(1, _env_int("KAKAO_HEARTBEAT_LOG_MINUTES", 60)) * 60
     now = time.monotonic()
     if KAKAO_HEARTBEAT_LOG_AT_MONO > 0 and now - KAKAO_HEARTBEAT_LOG_AT_MONO < interval:
@@ -1530,8 +1568,16 @@ def _log_kakao_token_heartbeat() -> None:
             ) if alive else "죽음(다음 알림 시 재기동)"
         except Exception:
             worker_state = "상태 확인 실패"
+    local_fresh = False
+    try:
+        if _is_kakao_access_locally_fresh is not None:
+            local_fresh = bool(_is_kakao_access_locally_fresh())
+    except Exception:
+        local_fresh = False
     logger.info(
-        "카카오 토큰 하트비트 — 인증 검증 루프 정상 작동 중 (매 사이클 토큰 확인, 만료 시 자동 갱신) / 알림 워커: %s",
+        "카카오 토큰 하트비트 — 게이트 정상(로컬 fresh=%s). "
+        "갱신은 알림 전송(자동 로그인) 시 만료된 경우만 / 알림 워커: %s",
+        local_fresh,
         worker_state,
     )
 
@@ -1699,7 +1745,8 @@ def _kakao_auth_ready() -> bool:
 
     카카오 알림은 시스템 생존 신호(Heartbeat)이므로 매매 엔진의 '전제 조건'이다.
     - KAKAO_ALERTS_ENABLED=false 이면 운영자가 알림을 의도적으로 끈 것이므로 통과시킨다.
-    - 그 외에는 유효한 카카오 액세스 토큰을 확보하지 못하면 False(매매 차단)를 반환한다.
+    - 평시에는 디스크 자격증명만 확인(HTTP validate/refresh 없음).
+    - 실제 토큰 갱신은 알림 전송(자동 로그인) 시 만료됐을 때만 수행한다.
     - 점검 중 예외가 나도 호출자에게 전파하지 않고 False(안전 측)로 처리한다.
     """
     if not _kakao_alerts_enabled():
@@ -1708,9 +1755,13 @@ def _kakao_auth_ready() -> bool:
         logger.error("카카오 모듈 로드 실패 — 인증 확인 불가로 매매를 차단합니다.")
         return False
     try:
-        access = _ensure_kakao_access_token(show_auth_link=True)
+        access = _ensure_kakao_access_token(show_auth_link=True, for_login=False)
     except Exception as exc:
-        logger.error("카카오 인증 확인 중 예외 — 매매를 차단합니다: %s", type(exc).__name__)
+        logger.error(
+            "카카오 인증 확인 중 예외 — 매매를 차단합니다: %s — 원인=%s",
+            type(exc).__name__,
+            exc,
+        )
         return False
     return bool(access)
 

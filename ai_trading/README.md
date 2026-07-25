@@ -196,16 +196,21 @@ py -3 ai_trading\main_ai.py
 | **갱신 재시도** | refresh 실패 시 최대 3회 — 시도 사이 `kakao_code.json` 재동기화로 외부 재인증 토큰 즉시 사용 |
 | **인증 대기 모드** | 만료 시 `KAKAO_AUTH_RETRY_MINUTES`(기본 30분)마다 자동 복구 재시도, 차단 ERROR 로그는 `KAKAO_BLOCKED_LOG_MINUTES`(기본 60분)당 1회 |
 | **데드락 방지** | 갱신 성공 알림 리스너는 `_KAKAO_REFRESH_LOCK` **해제 후** 호출 — 알림 경로에서 같은 스레드가 재갱신에 진입해도 락에 걸리지 않음 |
+| **디스크 강제 저장** | `persist_kakao_tokens` — `.env` + `kakao_code.json` 원자 쓰기 후 재읽기 검증. 불일치 시 `[ERROR] 토큰 파일 덮어쓰기 실패!` 및 갱신 실패 처리 |
+| **자동 로그인** | `KakaoNotifier.send_message` / `ensure_access_token_for_login` — 로컬 `expires_at` 만료일 때만 refresh (평시 HTTP 없음) |
 | **워커 자가 복구** | 비동기 알림 워커 스레드가 비정상 종료돼도 다음 알림 시 자동 재기동 (`is_alive()` 실체크) |
-| **생존 하트비트** | 인증 정상 사이클마다 DEBUG, `KAKAO_HEARTBEAT_LOG_MINUTES`(기본 60분)마다 INFO 하트비트 — 토큰 검증 루프·워커 생존을 journalctl에서 확인 가능 |
+| **생존 하트비트** | 인증 정상 사이클마다 DEBUG, `KAKAO_HEARTBEAT_LOG_MINUTES`(기본 60분)마다 INFO 하트비트 |
 
-**토큰 검증 루프:** 별도 백그라운드 갱신 스레드는 없습니다. `run_forever` → `_kakao_auth_ready()` → `_ensure_kakao_access_token()`이 **매 5분 사이클**에서 인라인으로 토큰을 확인하고, 만료/401일 때만 `refresh_kakao_access_token_sync()`를 호출합니다. 갱신 성공 알림은 `_KAKAO_REFRESH_LOCK`을 잡은 상태가 아니라 **락 해제 후**에만 호출되어, 알림 경로의 재진입 데드락을 막습니다.
+**토큰 정책 (카톡 자동로그인 스타일):**
+1. 매매 사이클 게이트(`_kakao_auth_ready`)는 **디스크에 access+refresh가 있는지만** 확인 — HTTP validate/refresh 없음.
+2. **알림을 보낼 때(로그인 시도)** 로컬 `expires_at`이 만료됐거나 401이면 `refresh_kakao_access_token_sync(force=True)`.
+3. 갱신 HTTP 성공 후 `apply_token_response` → `persist_kakao_tokens`가 `.env`/`kakao_code.json`에 쓰고 **재읽기 100% 일치**를 확인. 저장 실패면 access를 성공으로 반환하지 않음(재시작 후 `invalid_grant` 예방).
+4. 별도 “6시간 스케줄 갱신 스레드” 없음.
 
-생존 로그 예시:
+생존·실패 원인 확인:
 
 ```bash
-journalctl -u coinbot.service --since "1 hour ago" --no-pager | grep -E "카카오 토큰 하트비트|자동 갱신 완료|알림 워커"
-# [INFO] 카카오 토큰 하트비트 — 인증 검증 루프 정상 작동 중 ... / 알림 워커: 정상(...)
+journalctl -u coinbot.service --since "1 hour ago" --no-pager | grep -E "카카오 토큰 하트비트|자동 갱신 완료|토큰 파일 덮어쓰기|invalid_grant|알림 워커"
 ```
 
 ### 카카오 401 / 재인증
@@ -303,6 +308,8 @@ py -3 scripts\emergency_exit.py
 | Stateless Kakao | `KakaoNotifier` — self 토큰 제거, 정본 실시간 조회 |
 | Thread-safe Refresh | `refresh_kakao_access_token_sync()` Double-checked locking |
 | 갱신 알림 데드락 방지 | 성공 리스너는 락 **해제 후** 호출 (`kakao_utils.refresh_kakao_access_token_sync`) |
+| 토큰 디스크 정본 | `persist_kakao_tokens` 재읽기 검증 + `apply_token_response` 저장 실패 시 `""` 반환 |
+| 자동 로그인 갱신 | 알림 전송 시 만료만 refresh (`ensure_access_token_for_login` / `expires_at`) |
 | 알림 워커 자가 복구 | `AsyncNotifier.is_alive()` + 사망 시 자동 재기동 (`main_ai._ensure_async_kakao_started`) |
 | 인증 대기·하트비트 | `KAKAO_AUTH_RETRY_MINUTES` / `KAKAO_BLOCKED_LOG_MINUTES` / `KAKAO_HEARTBEAT_LOG_MINUTES` |
 | 루프 중복 방지 | `_CYCLE_LOCK`, `_wait_for_next_cycle_slot`, 캔들 단위 AI 1회 |
