@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -386,15 +387,19 @@ def test_token_heartbeat_throttle() -> None:
     m.logger.setLevel(logging.DEBUG)
     try:
         m.KAKAO_HEARTBEAT_LOG_AT_MONO = 0.0
-        with patch.object(m, "_ASYNC_KAKAO", None):
+        m.KAKAO_AUTH_EXHAUSTED = False
+        with patch.object(m, "_ASYNC_KAKAO", None), patch.object(
+            m, "_is_kakao_access_locally_fresh", return_value=True
+        ), patch.object(m, "_probe_kakao_refresh_if_access_stale", return_value=""):
             m._log_kakao_token_heartbeat()
             m._log_kakao_token_heartbeat()
     finally:
         m.logger.removeHandler(handler)
         m.logger.setLevel(old_level)
         m.KAKAO_HEARTBEAT_LOG_AT_MONO = 0.0
+        m.KAKAO_AUTH_EXHAUSTED = False
 
-    debugs = [r for r in records if r.levelno == logging.DEBUG and "자격증명 게이트 정상" in r.getMessage()]
+    debugs = [r for r in records if r.levelno == logging.DEBUG and "게이트 정상" in r.getMessage()]
     infos = [r for r in records if r.levelno == logging.INFO and "카카오 토큰 하트비트" in r.getMessage()]
     if len(debugs) != 2:
         fail("heartbeat", f"expected 2 DEBUG heartbeats, got {len(debugs)}")
@@ -403,6 +408,155 @@ def test_token_heartbeat_throttle() -> None:
         fail("heartbeat", f"expected 1 INFO heartbeat (throttled), got {len(infos)}")
         return
     ok("token heartbeat: DEBUG every call, INFO throttled to once per interval")
+
+
+def test_heartbeat_probes_refresh_when_stale() -> None:
+    """access 비fresh 이면 하트비트가 refresh 1회 점검한다."""
+    import main_ai as m
+
+    probes: list[str] = []
+
+    def fake_probe() -> str:
+        probes.append("hit")
+        return "new-access"
+
+    m.KAKAO_AUTH_EXHAUSTED = False
+    m.KAKAO_HEARTBEAT_LOG_AT_MONO = time.monotonic()  # INFO throttle skip
+    with patch.object(m, "_ASYNC_KAKAO", None), patch.object(
+        m, "_is_kakao_access_locally_fresh", return_value=False
+    ), patch.object(m, "_probe_kakao_refresh_if_access_stale", fake_probe):
+        m._log_kakao_token_heartbeat()
+    m.KAKAO_AUTH_EXHAUSTED = False
+    if probes != ["hit"]:
+        fail("heartbeat_probe", f"expected one probe, got {probes}")
+        return
+    ok("heartbeat probes refresh once when access is stale")
+
+
+def test_exhausted_blocks_gate_despite_disk_tokens() -> None:
+    """invalid_grant 후 디스크에 토큰이 남아 있어도 평시 게이트는 차단한다."""
+    import main_ai as m
+
+    refresh_calls: list[str] = []
+
+    def boom(*a, **k):
+        refresh_calls.append("called")
+        return ""
+
+    m._clear_kakao_auth_exhausted()
+    m._mark_kakao_auth_exhausted("test invalid_grant")
+    # recovery not due
+    m.KAKAO_AUTH_EXHAUSTED_AT_MONO = time.monotonic()
+    with patch.object(m, "_kakao_alerts_enabled", return_value=True), patch.object(
+        m, "KakaoNotifier", object()
+    ), patch.object(m, "_hydrate_kakao_tokens", lambda: None), patch.object(
+        m, "get_access_token", lambda: "disk-access"
+    ), patch.object(m, "_get_kakao_refresh_token", lambda: "disk-refresh"), patch.object(
+        m, "_try_kakao_auth_code_from_env", lambda *_a, **_k: ""
+    ), patch.object(m, "_refresh_kakao_access_token", boom), patch.object(
+        m, "_kakao_auth_recovery_due", return_value=False
+    ):
+        got = m._ensure_kakao_access_token(for_login=False)
+        ready = m._kakao_auth_ready()
+    m._clear_kakao_auth_exhausted()
+    if got != "":
+        fail("exhausted_gate", f"expected '', got {got!r}")
+        return
+    if ready:
+        fail("exhausted_gate", "auth_ready must be False while exhausted")
+        return
+    if refresh_calls:
+        fail("exhausted_gate", "must not refresh before recovery due")
+        return
+    ok("exhausted blocks gate even when disk still has tokens")
+
+
+def test_recovery_does_not_fake_clear_on_disk_tokens() -> None:
+    """복구 주기 도래 시 디스크 토큰만으로 exhausted 를 풀지 않고 실제 refresh 한다."""
+    import main_ai as m
+
+    refresh_calls: list[str] = []
+
+    def fail_refresh(*a, **k):
+        refresh_calls.append("called")
+        m._mark_kakao_auth_exhausted("still dead")
+        return ""
+
+    def env_str(key: str, default: str = "") -> str:
+        if key == "KAKAO_REST_API_KEY":
+            return "test-rest-key"
+        return default
+
+    m._clear_kakao_auth_exhausted()
+    m._mark_kakao_auth_exhausted("initial")
+    with patch.object(m, "_kakao_alerts_enabled", return_value=True), patch.object(
+        m, "KakaoNotifier", object()
+    ), patch.object(m, "_hydrate_kakao_tokens", lambda: None), patch.object(
+        m, "get_access_token", lambda: "disk-access"
+    ), patch.object(m, "_get_kakao_refresh_token", lambda: "disk-refresh"), patch.object(
+        m, "_try_kakao_auth_code_from_env", lambda *_a, **_k: ""
+    ), patch.object(m, "_refresh_kakao_access_token", fail_refresh), patch.object(
+        m, "_kakao_auth_recovery_due", return_value=True
+    ), patch.object(m, "_manual_kakao_authorization_recovery", lambda *_a, **_k: ""), patch.object(
+        m, "_env_str", env_str
+    ):
+        got = m._ensure_kakao_access_token(for_login=False, show_auth_link=False)
+    still = m.KAKAO_AUTH_EXHAUSTED
+    m._clear_kakao_auth_exhausted()
+    if got != "":
+        fail("no_fake_recovery", f"expected '', got {got!r}")
+        return
+    if not refresh_calls:
+        fail("no_fake_recovery", "recovery due must attempt real refresh")
+        return
+    if not still:
+        fail("no_fake_recovery", "exhausted must remain after failed refresh")
+        return
+    ok("recovery due attempts real refresh; no fake clear on disk tokens")
+
+
+def test_invalid_grant_listener_marks_exhausted() -> None:
+    """kakao_utils invalid_grant 리스너가 매매 게이트 exhausted 를 켠다."""
+    import main_ai as m
+
+    m._clear_kakao_auth_exhausted()
+    m._on_kakao_invalid_grant_from_utils("invalid_grant", "expired_or_invalid_refresh_token")
+    marked = m.KAKAO_AUTH_EXHAUSTED
+    m._clear_kakao_auth_exhausted()
+    if not marked:
+        fail("invalid_grant_listener", "listener did not mark exhausted")
+        return
+    ok("invalid_grant listener marks auth exhausted")
+
+
+def test_gate_skips_http_refresh() -> None:
+    """평시 게이트(비exhausted)는 디스크 자격증명만 보고 HTTP refresh를 호출하지 않는다."""
+    import main_ai as m
+
+    refresh_calls: list[str] = []
+
+    def boom(*a, **k):
+        refresh_calls.append("called")
+        return ""
+
+    m._clear_kakao_auth_exhausted()
+    with patch.object(m, "_kakao_alerts_enabled", return_value=True), patch.object(
+        m, "KakaoNotifier", object()
+    ), patch.object(m, "_hydrate_kakao_tokens", lambda: None), patch.object(
+        m, "get_access_token", lambda: "disk-access"
+    ), patch.object(m, "_get_kakao_refresh_token", lambda: "disk-refresh"), patch.object(
+        m, "_try_kakao_auth_code_from_env", lambda *_a, **_k: ""
+    ), patch.object(m, "_refresh_kakao_access_token", boom), patch.object(
+        m, "KAKAO_AUTH_EXHAUSTED", False
+    ):
+        got = m._ensure_kakao_access_token(for_login=False)
+    if got != "disk-access":
+        fail("gate_no_http", f"expected disk-access, got {got!r}")
+        return
+    if refresh_calls:
+        fail("gate_no_http", "gate must not call refresh")
+        return
+    ok("auth gate uses disk credentials only (no proactive refresh)")
 
 
 def test_persist_tokens_validates_disk() -> None:
@@ -424,7 +578,9 @@ def test_persist_tokens_validates_disk() -> None:
         with patch.object(ku, "kakao_api_allowed", return_value=True), patch.object(
             ku, "KAKAO_CODE_JSON", json_path
         ), patch.object(ku, "_env_file_path", lambda: env_path):
-            ok_persist = ku.persist_kakao_tokens("new_access", "new_refresh", expires_in=3600)
+            ok_persist = ku.persist_kakao_tokens(
+                "new_access", "new_refresh", expires_in=3600, refresh_token_expires_in=60 * 86400
+            )
             if not ok_persist:
                 fail("persist_validate", "persist returned False")
                 return
@@ -439,6 +595,26 @@ def test_persist_tokens_validates_disk() -> None:
             if ku.get_access_expires_at() <= 0:
                 fail("persist_validate", "expires_at not saved")
                 return
+            if ku.get_refresh_expires_at() <= 0:
+                fail("persist_validate", "refresh_expires_at not saved")
+                return
+            left = ku.get_refresh_token_expires_in_remaining()
+            if left is None or left < 50 * 86400:
+                fail("persist_validate", f"refresh remaining unexpected: {left}")
+                return
+            # apply without refresh_token must keep refresh_expires_at
+            prev_rexp = ku.get_refresh_expires_at()
+            with patch.object(ku, "persist_kakao_tokens", wraps=ku.persist_kakao_tokens):
+                pass
+            ok2 = ku.persist_kakao_tokens(
+                "access2", None, expires_in=100, rotate_refresh=False
+            )
+            if not ok2:
+                fail("persist_validate", "access-only persist failed")
+                return
+            if abs(ku.get_refresh_expires_at() - prev_rexp) > 2:
+                fail("persist_validate", "refresh_expires_at wiped on access-only update")
+                return
             # apply_token_response must fail closed when persist fails
             with patch.object(ku, "persist_kakao_tokens", return_value=False):
                 empty = ku.apply_token_response(
@@ -447,36 +623,95 @@ def test_persist_tokens_validates_disk() -> None:
             if empty != "":
                 fail("persist_validate", "apply_token_response should return '' when persist fails")
                 return
-    ok("persist writes+validates json/.env; apply fails closed on persist error")
+    ok("persist writes+validates json/.env; refresh_expires_at saved; apply fails closed")
 
 
-def test_gate_skips_http_refresh() -> None:
-    """평시 게이트는 디스크 자격증명만 보고 HTTP refresh를 호출하지 않는다."""
+def test_omit_refresh_token_preserves_old() -> None:
+    """카카오가 refresh_token 필드를 생략하면 기존 refresh를 절대 지우지 않는다."""
+    import kakao_utils as ku
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        json_path = tmp_path / "kakao_code.json"
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "KAKAO_ACCESS_TOKEN=old_access\nKAKAO_REFRESH_TOKEN=keep_me_refresh\n",
+            encoding="utf-8",
+        )
+        json_path.write_text(
+            '{"access_token":"old_access","refresh_token":"keep_me_refresh"}\n',
+            encoding="utf-8",
+        )
+        with patch.object(ku, "kakao_api_allowed", return_value=True), patch.object(
+            ku, "KAKAO_CODE_JSON", json_path
+        ), patch.object(ku, "_env_file_path", lambda: env_path):
+            # 응답에 refresh_token 키 자체가 없음 (카카오 1개월+ 잔여 시 동작)
+            result = ku.apply_token_response(
+                {"access_token": "brand_new_access", "expires_in": 21600}
+            )
+            if result != "brand_new_access":
+                fail("omit_refresh", f"expected new access, got {result!r}")
+                return
+            access, refresh = ku._read_json_tokens()
+            if access != "brand_new_access":
+                fail("omit_refresh", f"access not updated: {access!r}")
+                return
+            if refresh != "keep_me_refresh":
+                fail("omit_refresh", f"refresh wiped/changed: {refresh!r}")
+                return
+            env_vals = ku._read_env_key_values(["KAKAO_ACCESS_TOKEN", "KAKAO_REFRESH_TOKEN"])
+            if env_vals["KAKAO_ACCESS_TOKEN"] != "brand_new_access":
+                fail("omit_refresh", f".env access wrong: {env_vals}")
+                return
+            if env_vals["KAKAO_REFRESH_TOKEN"] != "keep_me_refresh":
+                fail("omit_refresh", f".env refresh wiped: {env_vals}")
+                return
+            # refresh_token: null / "" 도 동일하게 유지
+            result2 = ku.apply_token_response(
+                {"access_token": "access2", "refresh_token": "", "expires_in": 100}
+            )
+            if result2 != "access2":
+                fail("omit_refresh", f"empty refresh field should still save access, got {result2!r}")
+                return
+            _, refresh2 = ku._read_json_tokens()
+            if refresh2 != "keep_me_refresh":
+                fail("omit_refresh", f"empty refresh_token wiped old value: {refresh2!r}")
+                return
+    ok("omit/empty refresh_token preserves existing refresh; access updates")
+
+
+def test_daily_report_survives_exception() -> None:
+    """일일 리포트 중 예외가 나도 루프로 전파되지 않고 last_report를 찍지 않는다."""
     import main_ai as m
 
-    refresh_calls: list[str] = []
+    stats: dict = {"last_report_at_kst": ""}
+    now = datetime(2026, 8, 17, 9, 0, tzinfo=KST)
 
-    def boom(*a, **k):
-        refresh_calls.append("called")
-        return ""
-
-    with patch.object(m, "_kakao_alerts_enabled", return_value=True), patch.object(
-        m, "KakaoNotifier", object()
-    ), patch.object(m, "_hydrate_kakao_tokens", lambda: None), patch.object(
-        m, "get_access_token", lambda: "disk-access"
-    ), patch.object(m, "_get_kakao_refresh_token", lambda: "disk-refresh"), patch.object(
-        m, "_try_kakao_auth_code_from_env", lambda *_a, **_k: ""
-    ), patch.object(m, "_refresh_kakao_access_token", boom), patch.object(
-        m, "KAKAO_AUTH_EXHAUSTED", False
+    with patch.object(m, "get_market_monitor_summary", side_effect=RuntimeError("timeout")), patch.object(
+        m, "_build_kakao_message", side_effect=RuntimeError("boom")
+    ), patch.object(m, "_notify_kakao", return_value=True), patch.object(
+        m, "save_trading_stats", lambda *_a, **_k: None
     ):
-        got = m._ensure_kakao_access_token(for_login=False)
-    if got != "disk-access":
-        fail("gate_no_http", f"expected disk-access, got {got!r}")
+        ok_flag = m._send_daily_status_report(
+            report={"decision": "HOLD"},
+            stats=stats,
+            learning_summary="",
+            close_info=None,
+            open_position=None,
+            dry_run=True,
+            live_futures_usdt=None,
+            krw_per_usdt=1380.0,
+            now_kst=now,
+            monitor_model="gpt-4o-mini",
+            snapshot={"symbol": "BTCUSDT"},
+        )
+    if ok_flag is not False:
+        fail("daily_report_survive", f"expected False on exception, got {ok_flag!r}")
         return
-    if refresh_calls:
-        fail("gate_no_http", "gate must not call refresh")
+    if stats.get("last_report_at_kst"):
+        fail("daily_report_survive", "last_report must not be set after failure")
         return
-    ok("auth gate uses disk credentials only (no proactive refresh)")
+    ok("daily report exceptions are swallowed; last_report not marked on failure")
 
 
 def main() -> int:
@@ -492,8 +727,14 @@ def main() -> int:
     test_refresh_listener_called_outside_lock()
     test_async_notifier_dead_worker_recovery()
     test_token_heartbeat_throttle()
+    test_heartbeat_probes_refresh_when_stale()
+    test_exhausted_blocks_gate_despite_disk_tokens()
+    test_recovery_does_not_fake_clear_on_disk_tokens()
+    test_invalid_grant_listener_marks_exhausted()
     test_persist_tokens_validates_disk()
+    test_omit_refresh_token_preserves_old()
     test_gate_skips_http_refresh()
+    test_daily_report_survives_exception()
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")

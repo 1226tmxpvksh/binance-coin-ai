@@ -64,11 +64,21 @@ class AsyncNotifier:
                     result = method(*args)
                     if result is False:
                         self.failed_count += 1
+                        logger.error(
+                            "[CRITICAL KAKAO ERROR] 비동기 알림 워커 — "
+                            "method=%s 반환 False (상세 원인은 위 CRITICAL KAKAO 로그 참고)",
+                            method_name,
+                        )
                     else:
                         self.success_count += 1
                 except Exception as exc:
                     self.failed_count += 1
-                    logger.error("비동기 알림 처리 실패: %s", exc)
+                    logger.error(
+                        "[CRITICAL KAKAO EXCEPTION] 비동기 알림 처리 실패: %s — %s",
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
                 finally:
                     self.notification_queue.task_done()
         except BaseException:

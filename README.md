@@ -53,13 +53,16 @@ KakaoNotifier.send_message()
 | **Safety First** | 카카오 Heartbeat 실패 시 해당 사이클 매매 차단, 프로세스는 유지·재시도 |
 | **토큰 갱신 알림** | HTTP refresh 성공 시 카카오 통보 (`register_kakao_token_refresh_listener`) — **락 해제 후** 발송(데드락 방지) |
 | **디스크 강제 저장** | 갱신 성공 시 `.env` + `kakao_code.json` 원자 저장 → 재읽기 100% 일치 검증. 실패 시 `[ERROR] 토큰 파일 덮어쓰기 실패!` |
+| **refresh 생략 방어** | 카카오가 응답에서 `refresh_token`을 빼면(잔여 수명 충분) **기존 refresh를 유지**하고 access만 갱신 — 빈칸 덮어쓰기 금지 |
+| **refresh 수명 기록** | 응답의 `refresh_token_expires_in` → `kakao_code.json`의 `refresh_expires_at` 저장. 잔여 1개월 미만이면 WARNING |
 | **자동 로그인 갱신** | 알림 전송 직전 로컬 `expires_at` 만료일 때만 refresh (카카오 API 정책·부하 회피) |
 | **갱신 3회 재시도** | refresh 실패 시 정본 재동기화 후 최대 3회 재시도 — 실행 중 재인증한 새 토큰 즉시 반영 |
-| **인증 대기 모드** | 인증 만료 시 영구 차단 대신 `KAKAO_AUTH_RETRY_MINUTES`(기본 30분)마다 자동 복구 재시도 — **재시작 불필요** |
+| **인증 대기 모드** | `invalid_grant` 시 매매 차단. 디스크에 낡은 토큰이 있어도 통과하지 않음. `KAKAO_AUTH_RETRY_MINUTES`(기본 30분)마다 **실제 refresh**로만 복구 재시도 — **재시작 불필요** |
 | **알림 워커 자가 복구** | `AsyncNotifier` 스레드가 죽어도 다음 알림 시 `is_alive()` 검사 후 자동 재기동 |
-| **생존 하트비트** | 매 사이클 DEBUG + `KAKAO_HEARTBEAT_LOG_MINUTES`(기본 60분)마다 INFO — journalctl에서 루프·워커 생존 확인 |
+| **생존 하트비트** | access 로컬 만료 시 **refresh 1회 점검**(죽은 refresh를 자정까지 방치하지 않음). 정상일 때만 INFO `게이트 정상` |
+| **일일 리포트 생존** | `_send_daily_status_report` — 생성/발송 예외를 삼킴(`[ERROR] 일일 리포트 발송 중 오류 발생`). 실패 시 `last_report` 미갱신 → 다음 사이클/다음 날 재시도 |
 
-별도의 “6시간 갱신 스레드”는 없습니다. 매매 사이클에서는 디스크 자격증명만 확인하고, **알림(로그인) 시 만료된 토큰만** refresh합니다. 저장 검증에 실패하면 갱신을 성공으로 취급하지 않아 재시작 후 `invalid_grant`를 예방합니다.
+별도의 “6시간 갱신 스레드”는 없습니다. 매매 게이트는 디스크 자격증명(+인증 대기 모드)을 보고, **access 만료 시 하트비트·알림 경로에서 refresh**합니다. 저장 검증에 실패하면 갱신을 성공으로 취급하지 않습니다.
 
 ### 3. 다층 방어 기제
 

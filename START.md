@@ -75,7 +75,13 @@ journalctl -u coinbot.service -f
 생존·저장 실패 확인:
 
 ```bash
-journalctl -u coinbot.service --since "1 hour ago" --no-pager | grep -E "카카오 토큰 하트비트|자동 갱신 완료|토큰 파일 덮어쓰기|invalid_grant|알림 워커"
+journalctl -u coinbot.service --since "1 hour ago" --no-pager | grep -E "카카오 토큰 하트비트|자동 갱신 완료|토큰 파일 덮어쓰기|invalid_grant|CRITICAL KAKAO|알림 워커"
+```
+
+카톡 1회 수동 발송 진단:
+
+```bash
+cd ~/Coin && source ~/venv/bin/activate && python scripts/test_kakao_send.py
 ```
 
 ---

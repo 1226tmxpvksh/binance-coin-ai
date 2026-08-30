@@ -114,6 +114,7 @@ try:
         refresh_kakao_access_token_sync as _refresh_kakao_access_token_sync,
         refresh_access_token_request as _refresh_kakao_access_token_request,
         register_kakao_token_refresh_listener as _register_kakao_token_refresh_listener,
+        register_kakao_invalid_grant_listener as _register_kakao_invalid_grant_listener,
         validate_access_token as _validate_kakao_access_token_util,
     )
 except Exception:
@@ -132,6 +133,7 @@ except Exception:
     _refresh_kakao_access_token_sync = None  # type: ignore
     _refresh_kakao_access_token_request = None  # type: ignore
     _register_kakao_token_refresh_listener = None  # type: ignore
+    _register_kakao_invalid_grant_listener = None  # type: ignore
     _validate_kakao_access_token_util = None  # type: ignore
     get_access_token = None  # type: ignore
 
@@ -940,7 +942,18 @@ def _mark_kakao_auth_exhausted(reason: str) -> None:
     if KAKAO_AUTH_EXHAUSTED:
         return
     KAKAO_AUTH_EXHAUSTED = True
+    logger.error(
+        "[CRITICAL KAKAO AUTH] 인증 대기 모드 진입 — 매매·알림 차단. 원인: %s. "
+        "즉시 복구: bash ~/Coin/scripts/coinbot_watch.sh (봇 재시작 불필요)",
+        reason,
+    )
     _log_kakao_manual_auth_link(reason)
+
+
+def _on_kakao_invalid_grant_from_utils(error_code: str, error_description: str) -> None:
+    """kakao_utils refresh HTTP invalid_grant → 매매 게이트를 즉시 인증 대기 모드로."""
+    detail = error_description or error_code or "expired_or_invalid_refresh_token"
+    _mark_kakao_auth_exhausted(f"refresh_token invalid_grant ({detail})")
 
 
 def _clear_kakao_auth_exhausted() -> None:
@@ -1431,9 +1444,9 @@ def _ensure_kakao_access_token(
     """카카오 토큰 확보.
 
     for_login=False (매매 게이트/평시):
-      - HTTP validate / refresh 를 하지 않는다 (카카오 API 정책·부하 회피).
-      - 디스크에 access+refresh 가 있고 exhausted 가 아니면 통과.
-      - 실제 갱신은 알림 전송(로그인 시도) 시 KakaoNotifier 가 수행한다.
+      - 인증 대기 모드(exhausted)면 디스크에 토큰이 있어도 통과시키지 않는다.
+      - 복구 주기 도래 시에만 실제 refresh/인가코드로 복구를 시도한다.
+      - 그 외에는 디스크 자격증명만 확인(HTTP 없음). access 만료 점검은 하트비트가 수행.
 
     for_login=True (알림·기동 복구):
       - 로컬 만료면 refresh, 401/무효면 강제 refresh + 디스크 저장 검증.
@@ -1449,20 +1462,42 @@ def _ensure_kakao_access_token(
     if not _kakao_alerts_enabled():
         return ""
 
+    rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
+
     if KAKAO_AUTH_EXHAUSTED:
         # 인증 대기 모드: 재시도 주기 전에는 조용히 차단만 유지(로그 스팸 방지)
         if not _kakao_auth_recovery_due():
             return ""
-        # 주기 도래 — 자동 복구 시도. 운영자가 봇 실행 중에 coinbot_watch.sh 로
-        # 재인증해 kakao_code.json 이 갱신됐다면 여기서 재시작 없이 살아난다.
+        # 주기 도래 — 실제 HTTP/인가코드로만 복구. 디스크에 낡은 토큰이 있어도
+        # exhausted 를 함부로 해제하지 않는다 (과거 fake-recovery 버그 방지).
         logger.info(
             "카카오 인증 대기 모드 — 자동 복구를 재시도합니다 (주기 %s분, KAKAO_AUTH_RETRY_MINUTES)",
             _kakao_auth_retry_interval_seconds() // 60,
         )
-        _clear_kakao_auth_exhausted()
+        _hydrate_kakao_tokens()
+        from_env = _try_kakao_auth_code_from_env(rest_api_key)
+        if from_env:
+            _clear_kakao_auth_exhausted()
+            return from_env
+        refresh_token = _get_kakao_refresh_token().strip()
+        if refresh_token and rest_api_key:
+            refreshed = _refresh_kakao_access_token(refresh_token, rest_api_key)
+            if refreshed:
+                return refreshed
+        if show_auth_link:
+            recovered = _manual_kakao_authorization_recovery(
+                rest_api_key, "리프레시 토큰이 만료되었거나 유효하지 않습니다."
+            )
+            if recovered:
+                _clear_kakao_auth_exhausted()
+                return recovered
+        if not KAKAO_AUTH_EXHAUSTED:
+            _mark_kakao_auth_exhausted("인증 대기 모드 자동 복구 실패")
+        else:
+            _touch_kakao_auth_exhausted()
+        return ""
 
     _hydrate_kakao_tokens()
-    rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
 
     from_env = _try_kakao_auth_code_from_env(rest_api_key)
     if from_env:
@@ -1471,10 +1506,9 @@ def _ensure_kakao_access_token(
     access_token = get_access_token().strip()
     refresh_token = _get_kakao_refresh_token().strip()
 
-    # --- 평시 게이트: 디스크 자격증명만 확인 (HTTP 없음) ---
+    # --- 평시 게이트: 디스크 자격증명만 확인 (HTTP 없음). exhausted 는 위에서 이미 처리. ---
     if not for_login:
         if access_token and refresh_token:
-            _clear_kakao_auth_exhausted()
             return access_token
         if show_auth_link and not refresh_token and not KAKAO_AUTH_EXHAUSTED:
             recovered = _manual_kakao_authorization_recovery(
@@ -1523,6 +1557,31 @@ def _ensure_kakao_access_token(
     return ""
 
 
+def _probe_kakao_refresh_if_access_stale() -> str:
+    """access 로컬 만료 시 하트비트용 refresh 1회.
+
+    성공하면 새 access, 실패·invalid_grant 면 '' (exhausted 는 refresh 경로에서 설정).
+    """
+    if (
+        KAKAO_AUTH_EXHAUSTED
+        or _refresh_kakao_access_token_sync is None
+        or _get_kakao_refresh_token is None
+        or get_access_token is None
+    ):
+        return ""
+    if _is_kakao_access_locally_fresh is not None and _is_kakao_access_locally_fresh():
+        return get_access_token().strip()
+    rest_api_key = _env_str("KAKAO_REST_API_KEY", "")
+    refresh_token = _get_kakao_refresh_token().strip()
+    if not rest_api_key or not refresh_token:
+        return ""
+    logger.info(
+        "카카오 하트비트 — access 만료/임박 감지, refresh 1회 점검 "
+        "(죽은 refresh 를 자정 리포트까지 방치하지 않음)"
+    )
+    return _refresh_kakao_access_token(refresh_token, rest_api_key)
+
+
 def _log_kakao_auth_blocked_throttled() -> None:
     """매매 차단 안내 로그 — 처음 1회는 ERROR, 이후 KAKAO_BLOCKED_LOG_MINUTES(기본 60분)마다 1회.
 
@@ -1530,7 +1589,7 @@ def _log_kakao_auth_blocked_throttled() -> None:
     """
     global KAKAO_AUTH_BLOCKED_LOG_AT_MONO
     msg = (
-        "카카오 인증 실패 — 매매 로직을 실행하지 않습니다 (인증 대기 모드, %s분마다 자동 복구 재시도). "
+        "[CRITICAL KAKAO AUTH] 매매 차단(인증 대기 모드, %s분마다 자동 복구 재시도). "
         "즉시 복구: SSH에서 bash ~/Coin/scripts/coinbot_watch.sh 실행 (봇 재시작 불필요)."
     ) % (_kakao_auth_retry_interval_seconds() // 60)
     throttle_seconds = max(1, _env_int("KAKAO_BLOCKED_LOG_MINUTES", 60)) * 60
@@ -1545,17 +1604,44 @@ def _log_kakao_auth_blocked_throttled() -> None:
 def _log_kakao_token_heartbeat() -> None:
     """토큰/알림 루프 생존 로그.
 
-    - 매 사이클 DEBUG
-    - KAKAO_HEARTBEAT_LOG_MINUTES(기본 60분)마다 1회 INFO
-    평시에는 HTTP 갱신하지 않음 — 알림(로그인) 시 만료 토큰만 갱신.
+    - access 로컬 만료면 refresh 1회 점검(죽은 refresh 조기 발견 → 인증 대기 모드)
+    - 인증 대기 모드면 '게이트 정상'을 찍지 않고 CRITICAL 차단 로그만
+    - 매 사이클 DEBUG / KAKAO_HEARTBEAT_LOG_MINUTES(기본 60분)마다 1회 INFO
     """
     global KAKAO_HEARTBEAT_LOG_AT_MONO
-    logger.debug("카카오 자격증명 게이트 정상 — 다음 주기 대기(갱신은 알림 로그인 시에만)")
-    interval = max(1, _env_int("KAKAO_HEARTBEAT_LOG_MINUTES", 60)) * 60
-    now = time.monotonic()
-    if KAKAO_HEARTBEAT_LOG_AT_MONO > 0 and now - KAKAO_HEARTBEAT_LOG_AT_MONO < interval:
+
+    if KAKAO_AUTH_EXHAUSTED:
+        logger.debug("카카오 하트비트 — 인증 대기 모드(게이트 비정상)")
+        _log_kakao_auth_blocked_throttled()
         return
-    KAKAO_HEARTBEAT_LOG_AT_MONO = now
+
+    # access 만료 시 즉시 refresh 점검 — 알림이 없어도 죽은 RT를 발견·차단
+    probed = ""
+    try:
+        if _is_kakao_access_locally_fresh is None or not _is_kakao_access_locally_fresh():
+            probed = _probe_kakao_refresh_if_access_stale()
+            if KAKAO_AUTH_EXHAUSTED:
+                logger.error(
+                    "[CRITICAL KAKAO AUTH] 하트비트 refresh 점검 실패(invalid_grant) — "
+                    "매매를 차단합니다. 복구: bash ~/Coin/scripts/coinbot_watch.sh"
+                )
+                return
+            if probed:
+                logger.info("카카오 하트비트 — access 갱신 성공(디스크 저장·검증 통과)")
+    except Exception as exc:
+        logger.error(
+            "[CRITICAL KAKAO AUTH] 하트비트 refresh 점검 예외: %s — %s",
+            type(exc).__name__,
+            exc,
+        )
+
+    local_fresh = False
+    try:
+        if _is_kakao_access_locally_fresh is not None:
+            local_fresh = bool(_is_kakao_access_locally_fresh())
+    except Exception:
+        local_fresh = False
+
     worker_state = "미기동"
     if _ASYNC_KAKAO is not None:
         try:
@@ -1568,18 +1654,31 @@ def _log_kakao_token_heartbeat() -> None:
             ) if alive else "죽음(다음 알림 시 재기동)"
         except Exception:
             worker_state = "상태 확인 실패"
-    local_fresh = False
-    try:
-        if _is_kakao_access_locally_fresh is not None:
-            local_fresh = bool(_is_kakao_access_locally_fresh())
-    except Exception:
-        local_fresh = False
-    logger.info(
-        "카카오 토큰 하트비트 — 게이트 정상(로컬 fresh=%s). "
-        "갱신은 알림 전송(자동 로그인) 시 만료된 경우만 / 알림 워커: %s",
-        local_fresh,
-        worker_state,
-    )
+
+    if local_fresh:
+        logger.debug("카카오 자격증명 게이트 정상 — access fresh, 알림 워커=%s", worker_state)
+    else:
+        logger.debug(
+            "카카오 자격증명 게이트 — access 비fresh(점검 후에도 만료). 워커=%s",
+            worker_state,
+        )
+
+    interval = max(1, _env_int("KAKAO_HEARTBEAT_LOG_MINUTES", 60)) * 60
+    now = time.monotonic()
+    if KAKAO_HEARTBEAT_LOG_AT_MONO > 0 and now - KAKAO_HEARTBEAT_LOG_AT_MONO < interval:
+        return
+    KAKAO_HEARTBEAT_LOG_AT_MONO = now
+    if local_fresh:
+        logger.info(
+            "카카오 토큰 하트비트 — 게이트 정상(로컬 fresh=True). 알림 워커: %s",
+            worker_state,
+        )
+    else:
+        logger.warning(
+            "카카오 토큰 하트비트 — access 비fresh(게이트는 디스크 자격증명만 통과). "
+            "다음 사이클에서 재점검 / 알림 워커: %s",
+            worker_state,
+        )
 
 
 def _build_kakao_notifier_core():
@@ -1745,14 +1844,16 @@ def _kakao_auth_ready() -> bool:
 
     카카오 알림은 시스템 생존 신호(Heartbeat)이므로 매매 엔진의 '전제 조건'이다.
     - KAKAO_ALERTS_ENABLED=false 이면 운영자가 알림을 의도적으로 끈 것이므로 통과시킨다.
-    - 평시에는 디스크 자격증명만 확인(HTTP validate/refresh 없음).
-    - 실제 토큰 갱신은 알림 전송(자동 로그인) 시 만료됐을 때만 수행한다.
+    - 인증 대기 모드(exhausted)면 디스크에 토큰이 있어도 차단.
+    - 평시에는 디스크 자격증명만 확인. access 만료 시 하트비트가 refresh 점검.
     - 점검 중 예외가 나도 호출자에게 전파하지 않고 False(안전 측)로 처리한다.
     """
     if not _kakao_alerts_enabled():
         return True
     if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
         logger.error("카카오 모듈 로드 실패 — 인증 확인 불가로 매매를 차단합니다.")
+        return False
+    if KAKAO_AUTH_EXHAUSTED and not _kakao_auth_recovery_due():
         return False
     try:
         access = _ensure_kakao_access_token(show_auth_link=True, for_login=False)
@@ -1763,7 +1864,7 @@ def _kakao_auth_ready() -> bool:
             exc,
         )
         return False
-    return bool(access)
+    return bool(access) and not KAKAO_AUTH_EXHAUSTED
 
 
 def _decision_emoji(decision: str, risk_blocked: bool) -> str:
@@ -2985,6 +3086,100 @@ def install_shutdown_handlers() -> None:
     _SIGNAL_HANDLERS_INSTALLED = True
 
 
+def _send_daily_status_report(
+    *,
+    report: Dict[str, Any],
+    stats: Dict[str, Any],
+    learning_summary: str,
+    close_info: Dict[str, Any] | None,
+    open_position: Dict[str, Any] | None,
+    dry_run: bool,
+    live_futures_usdt: float | None,
+    krw_per_usdt: float,
+    now_kst: datetime,
+    monitor_model: str,
+    snapshot: Dict[str, Any] | None = None,
+) -> bool:
+    """일일(주기) 상태 리포트 생성·발송. 어떤 예외도 호출자/루프로 전파하지 않는다.
+
+    성공 시에만 last_report_at_kst 를 갱신한다 — 실패하면 같은 날 다음 사이클에서 재시도.
+    """
+    try:
+        if snapshot is not None:
+            try:
+                monitor_summary = get_market_monitor_summary(snapshot, model=monitor_model)
+                stats["ai_monitor_calls"] = _safe_int(stats.get("ai_monitor_calls", 0)) + 1
+                report["monitor_summary"] = monitor_summary.get("summary", "")
+            except Exception as mon_exc:
+                logger.warning(
+                    "일일 리포트 모니터 요약 실패(리포트는 계속 발송): %s — 원인=%s",
+                    type(mon_exc).__name__,
+                    mon_exc,
+                )
+                report.setdefault("monitor_summary", "")
+
+        msg = _build_kakao_message(
+            report=report,
+            stats=stats,
+            learning_summary=learning_summary,
+            close_info=close_info,
+            open_position=open_position,
+            dry_run=dry_run,
+            live_futures_usdt=live_futures_usdt,
+            krw_per_usdt=krw_per_usdt,
+            now_kst=now_kst,
+        )
+        ok = _notify_kakao(
+            f"📊 {_report_bracket_title(dry_run)} AI Self-Learning Engine",
+            msg,
+            daily_digest=True,
+        )
+        if ok:
+            stats["last_report_at_kst"] = now_kst.isoformat()
+            save_trading_stats(stats)
+            logger.info("일일 리포트 발송 완료 (KST %s)", now_kst.strftime("%Y-%m-%d %H:%M"))
+            return True
+        logger.warning(
+            "일일 리포트 발송 실패 — last_report 미갱신(다음 사이클에서 재시도). "
+            "카카오 토큰/워커 상태를 확인하세요."
+        )
+        return False
+    except Exception as e:
+        logger.error("일일 리포트 발송 중 오류 발생: %s", e, exc_info=True)
+        return False
+
+
+def _send_weekend_daily_digest(
+    *,
+    stats: Dict[str, Any],
+    dry_run: bool,
+    now_kst: datetime,
+    open_position: Dict[str, Any],
+    weekend_reason: str,
+) -> bool:
+    """주말 감시용 일일 다이제스트. 예외를 삼켜 매매/감시 루프를 죽이지 않는다."""
+    try:
+        trade_summary = _format_daily_trade_summary(now_kst)
+        ok = _notify_kakao(
+            f"📊 {_report_bracket_title(dry_run)} 주말 감시",
+            (
+                f"{weekend_reason}\n"
+                f"보유: {open_position.get('side', '')} @ {_format_price(open_position.get('entry_price', 0.0))}\n\n"
+                f"📅 [오늘 매매 내역 (KST)]\n{trade_summary}"
+            ),
+            daily_digest=True,
+        )
+        if ok:
+            stats["last_report_at_kst"] = now_kst.isoformat()
+            save_trading_stats(stats)
+            return True
+        logger.warning("주말 일일 리포트 발송 실패 — 다음 사이클에서 재시도")
+        return False
+    except Exception as e:
+        logger.error("일일 리포트 발송 중 오류 발생: %s", e, exc_info=True)
+        return False
+
+
 def _is_weekend_trading_blocked(now_kst: datetime) -> bool:
     if _env_bool("AI_TRADE_ON_WEEKENDS", False):
         return False
@@ -3057,18 +3252,13 @@ def _run_weekend_monitor_cycle(
             f"{symbol} ({interval}) 포지션 청산: {close_info.get('close_event', {}).get('exit_reason', '')}",
         )
     elif open_position and _should_send_periodic_report(stats, now_kst, status_report_minutes):
-        trade_summary = _format_daily_trade_summary(now_kst)
-        _notify_kakao(
-            f"📊 {_report_bracket_title(dry_run)} 주말 감시",
-            (
-                f"{weekend_reason}\n"
-                f"보유: {open_position.get('side', '')} @ {_format_price(open_position.get('entry_price', 0.0))}\n\n"
-                f"📅 [오늘 매매 내역 (KST)]\n{trade_summary}"
-            ),
-            daily_digest=True,
+        _send_weekend_daily_digest(
+            stats=stats,
+            dry_run=dry_run,
+            now_kst=now_kst,
+            open_position=open_position,
+            weekend_reason=weekend_reason,
         )
-        stats["last_report_at_kst"] = now_kst.isoformat()
-        save_trading_stats(stats)
     return report
 
 
@@ -3348,10 +3538,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
 
     send_report = _should_send_periodic_report(stats, now_kst, status_report_minutes)
     if send_report:
-        monitor_summary = get_market_monitor_summary(snapshot, model=monitor_model)
-        stats["ai_monitor_calls"] = _safe_int(stats.get("ai_monitor_calls", 0)) + 1
-        report["monitor_summary"] = monitor_summary.get("summary", "")
-        msg = _build_kakao_message(
+        _send_daily_status_report(
             report=report,
             stats=stats,
             learning_summary=memory_summary,
@@ -3361,10 +3548,9 @@ def _run_cycle_impl() -> Dict[str, Any]:
             live_futures_usdt=live_wallet_usdt,
             krw_per_usdt=krw_per_usdt,
             now_kst=now_kst,
+            monitor_model=monitor_model,
+            snapshot=snapshot,
         )
-        _notify_kakao(f"📊 {_report_bracket_title(dry_run)} AI Self-Learning Engine", msg, daily_digest=True)
-        stats["last_report_at_kst"] = now_kst.isoformat()
-        save_trading_stats(stats)
     return report
 
 
@@ -3394,6 +3580,8 @@ def _initialize_trading_loop_once(*, send_startup_report: bool = True) -> None:
         logger.error("카카오 비동기 알림 워커 기동 실패: %s", type(exc).__name__)
     if _register_kakao_token_refresh_listener is not None:
         _register_kakao_token_refresh_listener(_notify_kakao_token_refresh_success)
+    if _register_kakao_invalid_grant_listener is not None:
+        _register_kakao_invalid_grant_listener(_on_kakao_invalid_grant_from_utils)
     try:
         _bootstrap_kakao_tokens()
     except Exception as exc:
@@ -3418,11 +3606,15 @@ def run_forever() -> None:
             if not _kakao_auth_ready():
                 _log_kakao_auth_blocked_throttled()
             else:
+                # access 만료 시 refresh 점검 — invalid_grant 면 exhausted 후 매매 스킵
                 _log_kakao_token_heartbeat()
-                result = run_cycle()
-                if not result.get("cycle_skipped"):
-                    print(_format_cycle_dashboard(result))
-                    _mark_cycle_completed()
+                if KAKAO_AUTH_EXHAUSTED or not _kakao_auth_ready():
+                    _log_kakao_auth_blocked_throttled()
+                else:
+                    result = run_cycle()
+                    if not result.get("cycle_skipped"):
+                        print(_format_cycle_dashboard(result))
+                        _mark_cycle_completed()
         except KeyboardInterrupt:
             try:
                 with _SHUTDOWN_LOCK:

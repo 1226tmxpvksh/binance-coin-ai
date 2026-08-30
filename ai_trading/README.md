@@ -197,6 +197,7 @@ py -3 ai_trading\main_ai.py
 | **인증 대기 모드** | 만료 시 `KAKAO_AUTH_RETRY_MINUTES`(기본 30분)마다 자동 복구 재시도, 차단 ERROR 로그는 `KAKAO_BLOCKED_LOG_MINUTES`(기본 60분)당 1회 |
 | **데드락 방지** | 갱신 성공 알림 리스너는 `_KAKAO_REFRESH_LOCK` **해제 후** 호출 — 알림 경로에서 같은 스레드가 재갱신에 진입해도 락에 걸리지 않음 |
 | **디스크 강제 저장** | `persist_kakao_tokens` — `.env` + `kakao_code.json` 원자 쓰기 후 재읽기 검증. 불일치 시 `[ERROR] 토큰 파일 덮어쓰기 실패!` 및 갱신 실패 처리 |
+| **refresh 생략 방어** | 응답에 `refresh_token` 필드가 없거나 빈 값이면 기존 refresh 유지(`rotate_refresh=False`). access만 새 값으로 저장 |
 | **자동 로그인** | `KakaoNotifier.send_message` / `ensure_access_token_for_login` — 로컬 `expires_at` 만료일 때만 refresh (평시 HTTP 없음) |
 | **워커 자가 복구** | 비동기 알림 워커 스레드가 비정상 종료돼도 다음 알림 시 자동 재기동 (`is_alive()` 실체크) |
 | **생존 하트비트** | 인증 정상 사이클마다 DEBUG, `KAKAO_HEARTBEAT_LOG_MINUTES`(기본 60분)마다 INFO 하트비트 |
@@ -312,6 +313,7 @@ py -3 scripts\emergency_exit.py
 | 자동 로그인 갱신 | 알림 전송 시 만료만 refresh (`ensure_access_token_for_login` / `expires_at`) |
 | 알림 워커 자가 복구 | `AsyncNotifier.is_alive()` + 사망 시 자동 재기동 (`main_ai._ensure_async_kakao_started`) |
 | 인증 대기·하트비트 | `KAKAO_AUTH_RETRY_MINUTES` / `KAKAO_BLOCKED_LOG_MINUTES` / `KAKAO_HEARTBEAT_LOG_MINUTES` |
+| 일일 리포트 생존 | `_send_daily_status_report` try/except — 예외 시 ERROR 로그만, `last_report_at_kst`는 성공 시에만 갱신 |
 | 루프 중복 방지 | `_CYCLE_LOCK`, `_wait_for_next_cycle_slot`, 캔들 단위 AI 1회 |
 | 대화형 인증 | `scripts/auth_kakao.py` — URL/코드 스마트 파싱 |
 | 레거시 제거 | `main_live`·스캘핑·`order_executor` 등 미사용 엔진 삭제 |

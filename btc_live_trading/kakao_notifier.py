@@ -19,12 +19,16 @@ import requests
 
 from kakao_utils import (
     ensure_access_token_for_login,
+    get_access_expires_at,
     get_access_token,
+    get_refresh_expires_at,
     get_refresh_token,
+    get_refresh_token_expires_in_remaining,
     hydrate_tokens_from_json,
     is_access_token_locally_fresh,
     kakao_api_allowed,
     refresh_kakao_access_token_sync,
+    validate_access_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,87 +81,199 @@ class KakaoNotifier:
             return ""
         return key
 
+    def _mask_token_short(self, token: str) -> str:
+        t = (token or "").strip()
+        if not t:
+            return "(없음)"
+        if len(t) <= 12:
+            return f"{t[:2]}…{t[-2:]}(len={len(t)})"
+        return f"{t[:6]}…{t[-4:]}(len={len(t)})"
+
+    def _log_token_state_diagnosis(self, *, context: str) -> None:
+        """전송 실패 시 현재 access_token 상태(로컬 만료·HTTP 검증)를 ERROR로 남긴다."""
+        try:
+            self._sync_tokens_from_store()
+            access = (self.access_token or "").strip()
+            refresh = (self.refresh_token or "").strip()
+            expires_at = get_access_expires_at()
+            refresh_expires_at = get_refresh_expires_at()
+            refresh_left = get_refresh_token_expires_in_remaining()
+            local_fresh = is_access_token_locally_fresh()
+            expires_in = int(expires_at - time.time()) if expires_at > 0 else None
+            http_valid: str = "미검사"
+            if access and kakao_api_allowed():
+                try:
+                    http_valid = "유효" if validate_access_token(access) else "무효/만료(HTTP)"
+                except Exception as exc:
+                    http_valid = f"검증예외:{type(exc).__name__}"
+            refresh_left_txt = "(미저장)"
+            if refresh_left is not None:
+                refresh_left_txt = f"{refresh_left}s/{refresh_left / 86400.0:.1f}일"
+            logger.error(
+                "[CRITICAL KAKAO ERROR] 토큰 상태 진단 (%s) — "
+                "access=%s refresh=%s local_fresh=%s access_expires_at=%s "
+                "access_expires_in_sec=%s refresh_expires_at=%s refresh_remaining=%s http_validate=%s",
+                context,
+                self._mask_token_short(access),
+                self._mask_token_short(refresh),
+                local_fresh,
+                int(expires_at) if expires_at > 0 else "(없음)",
+                expires_in if expires_in is not None else "(없음)",
+                int(refresh_expires_at) if refresh_expires_at > 0 else "(없음)",
+                refresh_left_txt,
+                http_valid,
+            )
+        except Exception as exc:
+            logger.error(
+                "[CRITICAL KAKAO EXCEPTION] 토큰 상태 진단 중 예외: %s — %s",
+                type(exc).__name__,
+                exc,
+            )
+
+    def _log_send_http_failure(self, response: requests.Response, *, title: str) -> None:
+        body = response.text or ""
+        api_code = ""
+        api_msg = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                api_code = str(payload.get("code") or payload.get("error") or "")
+                api_msg = str(
+                    payload.get("msg")
+                    or payload.get("error_description")
+                    or payload.get("message")
+                    or ""
+                )
+        except (ValueError, json.JSONDecodeError):
+            pass
+        logger.error(
+            "[CRITICAL KAKAO ERROR] 메시지 전송 실패! HTTP: %s, 응답내용: %s | "
+            "title=%s api_code=%s api_msg=%s",
+            response.status_code,
+            body[:800],
+            (title or "")[:80],
+            api_code or "(없음)",
+            api_msg or "(없음)",
+        )
+        self._log_token_state_diagnosis(context=f"HTTP {response.status_code}")
+
     def send_message(self, title: str, description: str, retry_count: int = 0) -> bool:
         if not self.enabled:
             logger.debug("카카오 알림 비활성화: %s", title)
             return False
 
         if not kakao_api_allowed():
-            logger.debug("환경 화이트리스트 불일치 — 카카오 메시지 전송 차단")
+            logger.error(
+                "[CRITICAL KAKAO ERROR] 환경 화이트리스트 불일치 — 카카오 메시지 전송 차단 "
+                "(hostname/project 확인)"
+            )
             return False
 
-        self._sync_tokens_from_store()
-
-        # 카톡 자동로그인처럼: 만료됐을 때만(또는 토큰 없을 때만) 로그인 시점에 갱신
-        if (not self.access_token) or (not is_access_token_locally_fresh()):
-            logger.info(
-                "카카오 자동 로그인 — 알림 전송 직전 토큰 확보 (access=%s fresh=%s)",
-                "있음" if self.access_token else "없음",
-                is_access_token_locally_fresh(),
-            )
-            if not self._refresh_access_token(force=bool(self.access_token)):
-                logger.error(
-                    "카카오 자동 로그인 실패 — 액세스 토큰을 확보하지 못해 알림을 보내지 않습니다. "
-                    "원인: refresh 실패 또는 토큰 파일 저장 실패. journalctl에서 "
-                    "'토큰 파일 덮어쓰기 실패' / 'invalid_grant' 를 확인하세요."
-                )
-                return False
+        try:
             self._sync_tokens_from_store()
 
-        message_text = f"{title}\n{description}"
-        if len(message_text) > MAX_MESSAGE_LENGTH:
-            logger.warning(
-                "카카오 메시지 길이 제한 초과: %s -> %s",
-                len(message_text),
-                MAX_MESSAGE_LENGTH,
-            )
-            message_text = message_text[:MAX_MESSAGE_LENGTH]
+            # 카톡 자동로그인처럼: 만료됐을 때만(또는 토큰 없을 때만) 로그인 시점에 갱신
+            if (not self.access_token) or (not is_access_token_locally_fresh()):
+                logger.info(
+                    "카카오 자동 로그인 — 알림 전송 직전 토큰 확보 (access=%s fresh=%s)",
+                    "있음" if self.access_token else "없음",
+                    is_access_token_locally_fresh(),
+                )
+                if not self._refresh_access_token(force=bool(self.access_token)):
+                    logger.error(
+                        "[CRITICAL KAKAO ERROR] 카카오 자동 로그인 실패 — "
+                        "액세스 토큰을 확보하지 못해 알림을 보내지 않습니다. "
+                        "원인: refresh 실패 또는 토큰 파일 저장 실패."
+                    )
+                    self._log_token_state_diagnosis(context="auto-login 실패")
+                    return False
+                self._sync_tokens_from_store()
 
-        payload = {
-            "object_type": "text",
-            "text": message_text,
-            "link": {
-                "web_url": "https://www.binance.com",
-                "mobile_web_url": "https://www.binance.com",
-            },
-        }
-        headers = {"Authorization": f"Bearer {self.access_token}"}
-        try:
-            response = requests.post(
-                self.api_url,
-                headers=headers,
-                data={"template_object": json.dumps(payload)},
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
+            message_text = f"{title}\n{description}"
+            if len(message_text) > MAX_MESSAGE_LENGTH:
+                logger.warning(
+                    "카카오 메시지 길이 제한 초과: %s -> %s",
+                    len(message_text),
+                    MAX_MESSAGE_LENGTH,
+                )
+                message_text = message_text[:MAX_MESSAGE_LENGTH]
+
+            payload = {
+                "object_type": "text",
+                "text": message_text,
+                "link": {
+                    "web_url": "https://www.binance.com",
+                    "mobile_web_url": "https://www.binance.com",
+                },
+            }
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            try:
+                response = requests.post(
+                    self.api_url,
+                    headers=headers,
+                    data={"template_object": json.dumps(payload)},
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+            except requests.Timeout as exc:
+                logger.error(
+                    "[CRITICAL KAKAO EXCEPTION] Timeout — 메시지 전송 타임아웃: %s",
+                    exc,
+                )
+                self._log_token_state_diagnosis(context="Timeout")
+                return False
+            except requests.ConnectionError as exc:
+                logger.error(
+                    "[CRITICAL KAKAO EXCEPTION] ConnectionError — 네트워크 연결 실패: %s",
+                    exc,
+                )
+                self._log_token_state_diagnosis(context="ConnectionError")
+                return False
+            except requests.RequestException as exc:
+                logger.error(
+                    "[CRITICAL KAKAO EXCEPTION] RequestException — %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                self._log_token_state_diagnosis(context=type(exc).__name__)
+                return False
+
             if response.status_code == 200:
                 logger.info("카카오 알림 전송 성공: %s", title)
                 return True
 
+            # 401: 1회 강제 갱신 후 재시도 (재시도 전에도 CRITICAL 로그)
             if response.status_code == 401 and retry_count < MAX_REFRESH_RETRY_COUNT:
+                self._log_send_http_failure(response, title=title)
                 logger.warning(
-                    "카카오 액세스 토큰 만료/무효(HTTP 401). 로그인 재시도로 강제 갱신합니다. body=%s",
-                    (response.text or "")[:200],
+                    "카카오 액세스 토큰 만료/무효(HTTP 401). 로그인 재시도로 강제 갱신합니다."
                 )
                 if self._refresh_access_token(force=True):
                     logger.info("카카오 액세스 토큰 갱신 성공. 메시지 전송을 재시도합니다.")
                     return self.send_message(title, description, retry_count + 1)
                 logger.error(
-                    "카카오 액세스 토큰 갱신 실패로 메시지 전송을 중단합니다. "
-                    "원인: invalid_grant 또는 토큰 파일 저장 실패 가능."
+                    "[CRITICAL KAKAO ERROR] 401 후 토큰 강제 갱신 실패 — 메시지 전송 중단. "
+                    "invalid_grant 또는 토큰 파일 저장 실패 가능."
                 )
+                self._log_token_state_diagnosis(context="401 갱신 실패")
                 return False
 
-            logger.error(
-                "카카오 알림 전송 실패: status=%s body=%s",
-                response.status_code,
-                (response.text or "")[:300],
-            )
+            self._log_send_http_failure(response, title=title)
             return False
-        except requests.RequestException as exc:
-            logger.error("카카오 알림 전송 중 네트워크 오류: %s — 원인=%s", type(exc).__name__, exc)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "[CRITICAL KAKAO EXCEPTION] JSONDecodeError — %s",
+                exc,
+            )
+            self._log_token_state_diagnosis(context="JSONDecodeError")
             return False
         except Exception as exc:
-            logger.error("카카오 알림 전송 중 오류: %s — 원인=%s", type(exc).__name__, exc)
+            logger.error(
+                "[CRITICAL KAKAO EXCEPTION] %s — %s",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            self._log_token_state_diagnosis(context=type(exc).__name__)
             return False
 
     def _refresh_access_token(self, *, force: bool = False) -> bool:
@@ -182,6 +298,7 @@ class KakaoNotifier:
             return False
 
         last_error: Exception | str | None = None
+        invalid_grant_seen = False
         for attempt in range(1, TOKEN_REFRESH_MAX_ATTEMPTS + 1):
             try:
                 if force:
@@ -192,6 +309,9 @@ class KakaoNotifier:
                     new_access = ensure_access_token_for_login(client_id, "").strip()
             except Exception as exc:
                 last_error = exc
+                err_txt = f"{type(exc).__name__}: {exc}".lower()
+                if "invalid_grant" in err_txt or "expired_or_invalid_refresh_token" in err_txt:
+                    invalid_grant_seen = True
                 logger.error(
                     "카카오 토큰 갱신 요청 실패 (시도 %s/%s): %s — 원인=%s",
                     attempt,
@@ -208,6 +328,14 @@ class KakaoNotifier:
                 else:
                     logger.info("카카오 액세스 토큰 자동 갱신 완료")
                 return True
+
+            if invalid_grant_seen:
+                logger.error(
+                    "[CRITICAL KAKAO ERROR] refresh_token invalid_grant — "
+                    "동일 토큰 재시도 중단. 매매 게이트가 인증 대기 모드로 전환됩니다. "
+                    "복구: bash ~/Coin/scripts/coinbot_watch.sh"
+                )
+                break
 
             if attempt < TOKEN_REFRESH_MAX_ATTEMPTS:
                 time.sleep(TOKEN_REFRESH_RETRY_DELAY_SECONDS)
