@@ -60,6 +60,7 @@ KakaoNotifier.send_message()
 | **인증 대기 모드** | `invalid_grant` 시 매매 차단. 디스크에 낡은 토큰이 있어도 통과하지 않음. `KAKAO_AUTH_RETRY_MINUTES`(기본 30분)마다 **실제 refresh**로만 복구 재시도 — **재시작 불필요** |
 | **알림 워커 자가 복구** | `AsyncNotifier` 스레드가 죽어도 다음 알림 시 `is_alive()` 검사 후 자동 재기동 |
 | **생존 하트비트** | access 로컬 만료 시 **refresh 1회 점검**(죽은 refresh를 자정까지 방치하지 않음). 정상일 때만 INFO `게이트 정상` |
+| **RT 헬스체크(진단)** | `scripts/kakao_rt_healthcheck.py` — coinbot과 분리, 15분마다 force refresh → `data/kakao_rt_health.jsonl`. 조회: `python scripts/kakao_rt_health_report.py` |
 | **일일 리포트 생존** | `_send_daily_status_report` — 생성/발송 예외를 삼킴(`[ERROR] 일일 리포트 발송 중 오류 발생`). 실패 시 `last_report` 미갱신 → 다음 사이클/다음 날 재시도 |
 
 별도의 “6시간 갱신 스레드”는 없습니다. 매매 게이트는 디스크 자격증명(+인증 대기 모드)을 보고, **access 만료 시 하트비트·알림 경로에서 refresh**합니다. 저장 검증에 실패하면 갱신을 성공으로 취급하지 않습니다.

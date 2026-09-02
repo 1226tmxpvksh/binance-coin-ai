@@ -4,6 +4,12 @@
 !.env.example
 btc_live_trading/kakao_code.json
 
+# 카카오 RT 진단 로그 (프로젝트 루트 data/)
+/data/kakao_rt_health.jsonl
+/data/kakao_auth_events.jsonl
+/data/kakao_rt_healthcheck.cron.log
+.kakao_rt_healthcheck.lock
+
 # Python
 __pycache__/
 *.py[cod]

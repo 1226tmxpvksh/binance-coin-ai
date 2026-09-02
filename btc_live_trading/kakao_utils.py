@@ -684,6 +684,68 @@ def clear_kakao_auth_code() -> None:
     clear_env_key("KAKAO_AUTH_CODE")
 
 
+def _project_root_dir() -> Path:
+    """Coin 프로젝트 루트 (btc_live_trading 의 부모)."""
+    return _MODULE_DIR.parent
+
+
+def _kakao_audit_data_dir() -> Path:
+    path = _project_root_dir() / "data"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _infer_kakao_auth_trigger() -> str:
+    """호출 스택·환경변수로 재인증 트리거를 최대한 구분한다."""
+    env_trigger = (os.environ.get("KAKAO_AUTH_TRIGGER") or "").strip()
+    if env_trigger:
+        return env_trigger
+
+    try:
+        import inspect
+
+        frames = inspect.stack()[1:25]
+    except Exception:
+        return "unknown"
+
+    blob = " ".join(f"{fr.filename}|{fr.function}" for fr in frames).lower()
+    if "try_kakao_auth_code_from_env" in blob or "_exchange_kakao_auth_code" in blob:
+        return "env_code"
+    if "capture_authorization_code_via_localhost" in blob or "try_kakao_local_oauth" in blob:
+        return "localhost_oauth"
+    if "auth_kakao" in blob:
+        return "manual_auth_kakao_py"
+    if "main_ai" in blob or "coinbot" in blob:
+        return "main_ai"
+    return "unknown"
+
+
+def append_kakao_auth_event(
+    *,
+    refresh_token: str = "",
+    trigger: str | None = None,
+) -> None:
+    """인가코드 교환 성공 감사 로그 (data/kakao_auth_events.jsonl). 실패해도 본 흐름은 유지."""
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        kst = timezone(timedelta(hours=9))
+        rt = (refresh_token or "").strip()
+        masked = (rt[:6] if rt else "")
+        record = {
+            "happened_at_kst": datetime.now(kst).isoformat(timespec="seconds"),
+            "trigger": (trigger or _infer_kakao_auth_trigger()).strip() or "unknown",
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "masked_refresh_token": masked,
+        }
+        path = _kakao_audit_data_dir() / "kakao_auth_events.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("kakao_auth_events.jsonl 기록 실패", exc_info=True)
+
+
 def apply_token_response(token_data: Dict[str, Any]) -> str:
     """OAuth/refresh 응답 JSON에서 토큰을 꺼내 **디스크에 저장·검증**한 뒤 access를 반환.
 
@@ -789,7 +851,15 @@ def exchange_authorization_code(
         except Exception:
             logger.error("Kakao token exchange failed: HTTP %s", response.status_code)
         response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    # 감사 로그만 추가 — 교환/저장 본 흐름은 변경하지 않음
+    try:
+        append_kakao_auth_event(
+            refresh_token=str(payload.get("refresh_token") or ""),
+        )
+    except Exception:
+        logger.debug("인가코드 교환 감사 로그 생략", exc_info=True)
+    return payload
 
 
 def capture_authorization_code_via_localhost(

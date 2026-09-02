@@ -105,6 +105,8 @@ echo
 if ! "$PYTHON" "$ROOT/scripts/check_kakao_auth.py" >/dev/null 2>&1; then
   echo "[카카오] 마스터 열쇠가 없거나 만료되었습니다. 아래에서 인증을 진행합니다."
   echo
+  # 감사 로그 trigger 구분용 (kakao_utils.append_kakao_auth_event)
+  export KAKAO_AUTH_TRIGGER=watch_script
   if ! "$PYTHON" "$ROOT/scripts/auth_kakao.py"; then
     echo
     echo "카카오 인증에 실패했습니다. 코드/Redirect URI를 확인한 뒤 다시 실행하세요." >&2
