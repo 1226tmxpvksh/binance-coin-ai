@@ -128,7 +128,7 @@ KakaoNotifier.send_message()
 | **`ai_trading/`** | 메인 루프, AI 판단, 선물 주문, 리포트, 학습 로그 |
 | **`btc_live_trading/`** | `.env`, 카카오 OAuth, 환율, 공용 전략 모듈 |
 | **`btc_day_strategy/`** | 백테스트·전략 라이브러리 |
-| **`scripts/`** | `coinbot_watch.sh`, `auth_kakao.py`, `check_kakao_auth.py` 등 |
+| **`scripts/`** | `coinbot_watch.sh`, `auth_kakao.py`, `kakao_rt_healthcheck.py` 등 |
 
 ---
 
@@ -153,7 +153,53 @@ bash ~/Coin/scripts/coinbot_watch.sh
 python ~/Coin/scripts/auth_kakao.py
 ```
 
-→ URL 로그인 → code 붙여넣기 → `systemctl restart coinbot.service`
+→ URL 로그인 → code 붙여넣기 → `systemctl restart coinbot.service`  
+`coinbot_watch.sh` 경로는 감사 로그에 `trigger=watch_script`로 남고, `auth_kakao.py` 단독은 `manual_auth_kakao_py`로 구분됩니다.
+
+### refresh_token 조기 사망 진단 (헬스체크)
+
+문서상 refresh는 약 60일이지만, 실제로는 수일 만에 `invalid_grant`가 나는 경우가 있어 **coinbot과 분리된** 진단 스크립트로 사망 시각을 분 단위로 잡습니다. 알림은 보내지 않고 로그 파일만 남깁니다.
+
+| 도구 | 용도 · 실행 |
+|------|-------------|
+| `scripts/kakao_rt_healthcheck.py` | access fresh와 무관하게 **force refresh 1회** → `data/kakao_rt_health.jsonl`에 결과 기록. `python scripts/kakao_rt_healthcheck.py` |
+| `scripts/kakao_rt_health_report.py` | jsonl에서 최근 **ok → invalid_grant** 전환(사망 구간) 1건 요약. `python scripts/kakao_rt_health_report.py` |
+| `kakao_utils` 감사 로그 | 인가코드 교환 성공 시 `data/kakao_auth_events.jsonl`에 시각·trigger·masked refresh 기록 (본 흐름 변경 없음) |
+
+**기록 파일**
+
+| 파일 | 내용 |
+|------|------|
+| `data/kakao_rt_health.jsonl` | 헬스체크 시각(`checked_at_kst`), `result`(`ok` / `invalid_grant` / …), HTTP·에러 코드, 갱신 전 `refresh_remaining_days`, pid/hostname |
+| `data/kakao_auth_events.jsonl` | 재인증(인가코드 교환) 시각, `trigger`(`watch_script` / `manual_auth_kakao_py` / `env_code` 등), masked refresh 앞 6자 |
+
+**사망 원인 규명 절차**
+
+```bash
+cd ~/Coin && source ~/venv/bin/activate
+python scripts/kakao_rt_health_report.py
+# → 마지막 성공 시각 / 첫 invalid_grant 시각 출력
+
+# 같은 구간에 우리 쪽 재인증이 있었는지 대조
+tail -n 50 data/kakao_auth_events.jsonl
+```
+
+헬스체크 로그만 있고 사망 전환이 없으면 `아직 사망 구간 없음`만 출력합니다(예외 없음).
+
+**crontab 등록 필수 (bot2, 15분 간격)** — 등록하지 않으면 진단 로그가 쌓이지 않습니다.
+
+```bash
+# bot2 유저로:
+crontab -e
+```
+
+아래 **한 줄**을 추가합니다.
+
+```cron
+*/15 * * * * cd /home/bot2/Coin && /home/bot2/venv/bin/python scripts/kakao_rt_healthcheck.py >>/home/bot2/Coin/data/kakao_rt_healthcheck.cron.log 2>&1
+```
+
+코드 반영 직후 한 번 수동 실행해 jsonl이 생기는지 확인하세요: `python scripts/kakao_rt_healthcheck.py`
 
 ### 로컬 실행 (개발·Dry-run)
 
@@ -197,8 +243,9 @@ KAKAO_HEARTBEAT_LOG_MINUTES=60   # 토큰 검증 루프 생존 INFO 하트비트
 
 ## Git 제외 (민감·런타임 데이터)
 
-`.env`, `kakao_code.json`, `trading_stats.json`, `virtual_trades.jsonl`, `ai_learning_logs.csv`, `.coinbot.lock`  
-→ WinSCP로 **코드만** 업로드하고, 토큰·운영 데이터는 서버에 유지합니다.
+`.env`, `kakao_code.json`, `trading_stats.json`, `virtual_trades.jsonl`, `ai_learning_logs.csv`, `.coinbot.lock`,  
+`data/kakao_rt_health.jsonl`, `data/kakao_auth_events.jsonl`, `.kakao_rt_healthcheck.lock`  
+→ WinSCP로 **코드만** 업로드하고, 토큰·운영·진단 데이터는 서버에 유지합니다.
 
 ---
 

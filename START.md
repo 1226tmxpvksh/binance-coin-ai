@@ -86,6 +86,34 @@ cd ~/Coin && source ~/venv/bin/activate && python scripts/test_kakao_send.py
 
 ---
 
+## 2-1. refresh 조기 사망 진단 (헬스체크 · 최초 1회 등록)
+
+`invalid_grant`가 **언제** 났는지 분 단위로 잡으려면, coinbot과 별도인 헬스체크를 **crontab에 등록**해야 합니다(등록 안 하면 로그가 안 쌓임).
+
+```bash
+su - bot2
+crontab -e
+```
+
+추가할 한 줄:
+
+```cron
+*/15 * * * * cd /home/bot2/Coin && /home/bot2/venv/bin/python scripts/kakao_rt_healthcheck.py >>/home/bot2/Coin/data/kakao_rt_healthcheck.cron.log 2>&1
+```
+
+수동 1회 · 사망 구간 조회:
+
+```bash
+cd ~/Coin && source ~/venv/bin/activate
+python scripts/kakao_rt_healthcheck.py
+python scripts/kakao_rt_health_report.py
+tail -n 50 data/kakao_auth_events.jsonl   # 같은 시각대 재인증 여부 대조
+```
+
+상세(파일 필드·trigger 구분): [README.md — refresh_token 조기 사망 진단](README.md#refreshtoken-조기-사망-진단-헬스체크)
+
+---
+
 ## 3. WinSCP로 `.sh` 파일 올렸을 때만
 
 `coinbot_watch.sh` 올린 직후 한 번만 (CRLF 오류 나면):
@@ -109,6 +137,7 @@ sed -i 's/\r$//' /home/bot2/Coin/scripts/coinbot_watch.sh
 | 토큰 갱신 알림이 **만료 후 알림 보낼 때** 옴 | 정상 (`🔑 카카오 토큰 갱신 성공`). 고정 6시간 스케줄 아님. 일일 리포트(1회)와 별개 |
 | 재시작 후 `invalid_grant` | 예전엔 갱신값이 메모리만 남는 경우 있음 — 최신 코드는 디스크 저장 검증 필수. `journalctl \| grep "토큰 파일 덮어쓰기"` 확인 |
 | 갱신 성공 후 카톡이 끊김 | 예전 데드락/워커 사망 경로 — 최신 코드는 락 해제 후 알림·워커 자가 복구. `journalctl \| grep "하트비트\|알림 워커"` 로 생존 확인 |
+| refresh가 며칠 만에 `invalid_grant` | §2-1 헬스체크 crontab 등록 후 `kakao_rt_health_report.py`로 사망 시각 확인. `kakao_auth_events.jsonl`과 대조 |
 | `카카오 인증 실패` 로그 | 인증 대기 모드 — 30분마다 자동 복구 시도. `coinbot_watch.sh` 재인증만 하면 재시작 없이 살아남. 원인은 `journalctl \| grep "리프레시 토큰 갱신 실패"` 의 `code=` 확인 |
 
 ---
