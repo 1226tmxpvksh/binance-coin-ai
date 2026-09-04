@@ -124,15 +124,19 @@ def test_notify_kakao_gating() -> None:
             sent.append(title)
             return True
 
-    with patch.object(m, "_kakao_alerts_enabled", return_value=True), patch.object(
+    with patch.object(m, "_notify_alerts_enabled", return_value=True), patch.object(
+        m, "_notify_channel", return_value="kakao"
+    ), patch.object(m, "_kakao_alerts_enabled", return_value=True), patch.object(
         m, "_env_str", side_effect=lambda k, d="": "key" if k == "KAKAO_REST_API_KEY" else d
     ), patch.object(m, "KakaoNotifier", object()), patch.object(m, "_hydrate_kakao_tokens", lambda: None), patch.object(
         m, "_kakao_once_per_day_enabled", return_value=True
     ), patch.object(m, "_kakao_already_sent_today", return_value=False), patch.object(
         m, "_ensure_async_kakao_started", lambda: None
     ), patch.object(m, "_ASYNC_KAKAO", None), patch.object(
-        m, "_build_kakao_notifier_core", _Core
-    ), patch.object(m, "_mark_kakao_sent_today", lambda *a, **k: None):
+        m, "_build_notifier_core", _Core
+    ), patch.object(m, "_build_kakao_notifier_core", _Core), patch.object(
+        m, "_mark_kakao_sent_today", lambda *a, **k: None
+    ):
         blocked = m._notify_kakao("startup", "body")
         digest = m._notify_kakao("digest", "body", daily_digest=True)
         refresh = m._notify_kakao("refresh", "body", exempt_daily_limit=True)
@@ -447,7 +451,9 @@ def test_exhausted_blocks_gate_despite_disk_tokens() -> None:
     m._mark_kakao_auth_exhausted("test invalid_grant")
     # recovery not due
     m.KAKAO_AUTH_EXHAUSTED_AT_MONO = time.monotonic()
-    with patch.object(m, "_kakao_alerts_enabled", return_value=True), patch.object(
+    with patch.object(m, "_notify_alerts_enabled", return_value=True), patch.object(
+        m, "_kakao_alerts_enabled", return_value=True
+    ), patch.object(m, "_notify_channel", return_value="kakao"), patch.object(
         m, "KakaoNotifier", object()
     ), patch.object(m, "_hydrate_kakao_tokens", lambda: None), patch.object(
         m, "get_access_token", lambda: "disk-access"
@@ -489,7 +495,9 @@ def test_recovery_does_not_fake_clear_on_disk_tokens() -> None:
 
     m._clear_kakao_auth_exhausted()
     m._mark_kakao_auth_exhausted("initial")
-    with patch.object(m, "_kakao_alerts_enabled", return_value=True), patch.object(
+    with patch.object(m, "_notify_alerts_enabled", return_value=True), patch.object(
+        m, "_kakao_alerts_enabled", return_value=True
+    ), patch.object(m, "_notify_channel", return_value="kakao"), patch.object(
         m, "KakaoNotifier", object()
     ), patch.object(m, "_hydrate_kakao_tokens", lambda: None), patch.object(
         m, "get_access_token", lambda: "disk-access"
@@ -540,7 +548,9 @@ def test_gate_skips_http_refresh() -> None:
         return ""
 
     m._clear_kakao_auth_exhausted()
-    with patch.object(m, "_kakao_alerts_enabled", return_value=True), patch.object(
+    with patch.object(m, "_notify_alerts_enabled", return_value=True), patch.object(
+        m, "_kakao_alerts_enabled", return_value=True
+    ), patch.object(m, "_notify_channel", return_value="kakao"), patch.object(
         m, "KakaoNotifier", object()
     ), patch.object(m, "_hydrate_kakao_tokens", lambda: None), patch.object(
         m, "get_access_token", lambda: "disk-access"

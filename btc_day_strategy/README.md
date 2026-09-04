@@ -49,7 +49,6 @@ btc_day_strategy/              # 백테스트 전용 (이 폴더)
 ├── config.py                  # 원본 전략 설정 (RISK 2%)
 ├── config_live_settings.py    # 실전 설정 비교용 (RISK 1%)
 ├── compare_strategies.py      # 전략 비교 도구
-├── run_comparison.bat         # 비교 실행 (Windows)
 ├── backtest_engine.py         # 백테스트 엔진
 ├── performance.py             # 성과 분석
 ├── visualization.py           # 그래프 생성
@@ -64,7 +63,8 @@ btc_day_strategy/              # 백테스트 전용 (이 폴더)
 └── README.md                  # 이 문서
 
 ../ai_trading/                 # 실전 AI 매매 (main_ai.py)
-../btc_live_trading/           # 공용 .env·카카오·환율·strategy/
+../btc_live_trading/           # 공용 .env·알림·환율·strategy/
+../legacy/kakao/               # 카카오 레거시 (보존)
 ```
 
 ## 🚀 빠른 시작
@@ -103,12 +103,6 @@ python main.py
 
 ```bash
 python compare_strategies.py
-```
-
-또는 Windows:
-
-```bash
-run_comparison.bat
 ```
 
 > ⚠️ **실전 매매를 시작하기 전에 반드시 `compare_strategies.py`로 실전 설정의 성과를 확인하세요!**
@@ -223,7 +217,6 @@ MIN_POSITION_SIZE_USDT = 20  # 바이낸스 최소
 ```bash
 cd btc_day_strategy
 python compare_strategies.py
-# Windows: run_comparison.bat
 ```
 
 ### 출력
@@ -258,7 +251,8 @@ python compare_strategies.py
 
 - `../README.md` — 시스템 개요·아키텍처
 - `../ai_trading/README.md` — 실전 AI 매매 가이드
-- `../START.md` — Vultr 서버 운영
+- `../DEPLOY.md` — Vultr 서버 배포·일상 운영
+- `../README.md` — 프로젝트 구조
 
 ## ❓ 자주 묻는 질문
 

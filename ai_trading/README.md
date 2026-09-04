@@ -12,13 +12,12 @@
 | `ai_trading/risk_guard.py` | 포지션 리스크 계산 |
 | `ai_trading/ai_logic/decision_engine.py` | OpenAI 호출 |
 | `ai_trading/data/` | 통계·`virtual_trades.jsonl`·`ai_learning_logs.csv`·로그 |
-| `btc_live_trading/.env` | API 키·카카오·운영 변수(공유) |
+| `btc_live_trading/.env` | API 키·알림·운영 변수(공유) |
 | `btc_live_trading/fx_rates.py` | USDT/KRW (CoinGecko) |
+| `legacy/kakao/` | 카카오 OAuth·알림 레거시 (shim: `btc_live_trading/kakao_*.py`) |
 | `btc_day_strategy/` | 백테스트·전략 라이브러리 (시작 시 연결 점검) |
 
-**통합 정리**: `main_ai` 안에 있던 Binance 잔고 조회(직접 `Client` 생성)를 제거하고, **`binance_futures_tools.fetch_futures_usdt_balance_from_env`** 한 경로로 맞췄습니다. 레거시 단타·`main_live` 실전 엔진(`order_executor.py`, `live_trading_engine.py`, `scalping_engine.py` 등)은 더 이상 쓰이지 않아 **제거**했습니다.
-
-상위 폴더 개요는 저장소 루트 **`README.md`** 를 참고하세요.
+상위 폴더 개요·주의사항은 저장소 루트 **`README.md`**, 배포는 **`DEPLOY.md`** 를 참고하세요.
 
 ## 주요 기능
 

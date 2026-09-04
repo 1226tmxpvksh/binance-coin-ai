@@ -10,3 +10,6 @@ requests>=2.31.0
 
 # 환경 변수 관리
 python-dotenv>=1.0.0
+
+# 디스코드 슬래시 명령어 봇 (scripts/discord_bot.py — 웹훅 notifier와 별개)
+discord.py>=2.3.0

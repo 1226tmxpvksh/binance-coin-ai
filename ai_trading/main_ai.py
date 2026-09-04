@@ -97,6 +97,7 @@ except Exception as exc:
 
 try:
     from btc_live_trading.kakao_notifier import KakaoNotifier
+    from btc_live_trading.discord_notifier import DiscordNotifier
     from btc_live_trading.async_notifier import AsyncNotifier
     from btc_live_trading.kakao_utils import (
         LOCALHOST_REDIRECT_URI,
@@ -119,6 +120,7 @@ try:
     )
 except Exception:
     KakaoNotifier = None
+    DiscordNotifier = None
     AsyncNotifier = None
     _apply_kakao_token_response = None  # type: ignore
     _capture_kakao_auth_localhost = None  # type: ignore
@@ -1179,12 +1181,33 @@ def _try_kakao_auth_code_from_env(rest_api_key: str) -> str:
     return _exchange_kakao_auth_code(rest_api_key, redirect_uri, code)
 
 
-def _kakao_alerts_enabled() -> bool:
-    """KAKAO_ALERTS_ENABLED=false 면 재인증 전까지 카카오 관련 호출·로그를 모두 끔.
+def _notify_channel() -> str:
+    """알림 채널: discord(기본) | kakao(레거시)."""
+    raw = _env_str("NOTIFY_CHANNEL", "discord").strip().lower()
+    if raw in {"kakao", "kakaotalk", "카카오"}:
+        return "kakao"
+    return "discord"
 
-    환경 화이트리스트(hostname=example1, project=/home/bot2/Coin) 불일치 시
-    .env 설정과 무관하게 항상 False — 유령 봇·WSL·백업 폴더 차단.
+
+def _notify_alerts_enabled() -> bool:
+    """알림 ON/OFF. NOTIFY_ALERTS_ENABLED 우선, 없으면 KAKAO_ALERTS_ENABLED 하위호환.
+
+    discord 채널은 카카오 호스트 화이트리스트와 무관하다.
+    kakao 채널은 기존처럼 Vultr 화이트리스트를 적용한다.
     """
+    if os.getenv("NOTIFY_ALERTS_ENABLED", "").strip() != "":
+        if not _env_bool("NOTIFY_ALERTS_ENABLED", True):
+            return False
+    elif not _env_bool("KAKAO_ALERTS_ENABLED", True):
+        return False
+
+    if _notify_channel() == "discord":
+        return True
+    return _kakao_channel_allowed()
+
+
+def _kakao_channel_allowed() -> bool:
+    """카카오 채널 전용: 환경 화이트리스트 + (호출부에서 이미 alerts 플래그 확인)."""
     global _KAKAO_ENV_WARNED
     if _kakao_api_allowed is not None and not _kakao_api_allowed():
         if not _KAKAO_ENV_WARNED:
@@ -1203,7 +1226,18 @@ def _kakao_alerts_enabled() -> bool:
             )
             _KAKAO_ENV_WARNED = True
         return False
-    return _env_bool("KAKAO_ALERTS_ENABLED", True)
+    return True
+
+
+def _kakao_alerts_enabled() -> bool:
+    """하위호환: 카카오 채널일 때만 실질적으로 True. discord면 False(카카오 API 스킵용)."""
+    if _notify_channel() != "kakao":
+        return False
+    return _notify_alerts_enabled()
+
+
+def _discord_webhook_configured() -> bool:
+    return bool(_env_str("DISCORD_WEBHOOK_URL", "").strip())
 
 
 def _interactive_kakao_auth_until_done(rest_api_key: str) -> str:
@@ -1268,15 +1302,21 @@ def _interactive_kakao_auth_until_done(rest_api_key: str) -> str:
 
 
 def _bootstrap_kakao_tokens() -> None:
-    """기동 시 마스터 열쇠 확보: env코드 → 기존토큰검증 → 리프레시 → 대화형 인증(input 대기).
+    """기동 시 마스터 열쇠 확보 (NOTIFY_CHANNEL=kakao 일 때만).
 
     대화형 환경에서는 인증이 성공할 때까지 봇을 일시 중지하고 터미널에서
     인가 코드를 직접 받는다. 인증·저장·검증이 끝나야 매매 루프로 진입한다.
     """
+    if _notify_channel() != "kakao":
+        logger.info(
+            "알림 채널=%s — 카카오 토큰 부트스트랩을 건너뜁니다.",
+            _notify_channel(),
+        )
+        return
     if KakaoNotifier is None or _hydrate_kakao_tokens is None:
         return
-    if not _kakao_alerts_enabled():
-        logger.info("카카오 알림 비활성화(KAKAO_ALERTS_ENABLED=false) — 토큰 갱신/알림을 건너뜁니다.")
+    if not _notify_alerts_enabled():
+        logger.info("알림 비활성화 — 카카오 토큰 갱신/알림을 건너뜁니다.")
         return
     if KAKAO_AUTH_EXHAUSTED:
         return
@@ -1583,15 +1623,18 @@ def _probe_kakao_refresh_if_access_stale() -> str:
 
 
 def _log_kakao_auth_blocked_throttled() -> None:
-    """매매 차단 안내 로그 — 처음 1회는 ERROR, 이후 KAKAO_BLOCKED_LOG_MINUTES(기본 60분)마다 1회.
-
-    그 사이 사이클은 DEBUG로만 남겨 journalctl 스팸을 방지한다 (인증 대기 모드).
-    """
+    """매매 차단 안내 로그 — 처음 1회는 ERROR, 이후 KAKAO_BLOCKED_LOG_MINUTES(기본 60분)마다 1회."""
     global KAKAO_AUTH_BLOCKED_LOG_AT_MONO
-    msg = (
-        "[CRITICAL KAKAO AUTH] 매매 차단(인증 대기 모드, %s분마다 자동 복구 재시도). "
-        "즉시 복구: SSH에서 bash ~/Coin/scripts/coinbot_watch.sh 실행 (봇 재시작 불필요)."
-    ) % (_kakao_auth_retry_interval_seconds() // 60)
+    if _notify_channel() == "discord":
+        msg = (
+            "[CRITICAL NOTIFY] 매매 차단 — DISCORD_WEBHOOK_URL 미설정. "
+            "btc_live_trading/.env 에 웹훅 URL을 넣은 뒤 재시작하세요."
+        )
+    else:
+        msg = (
+            "[CRITICAL KAKAO AUTH] 매매 차단(인증 대기 모드, %s분마다 자동 복구 재시도). "
+            "즉시 복구: SSH에서 bash ~/Coin/scripts/coinbot_watch.sh 실행 (봇 재시작 불필요)."
+        ) % (_kakao_auth_retry_interval_seconds() // 60)
     throttle_seconds = max(1, _env_int("KAKAO_BLOCKED_LOG_MINUTES", 60)) * 60
     now = time.monotonic()
     if KAKAO_AUTH_BLOCKED_LOG_AT_MONO <= 0 or now - KAKAO_AUTH_BLOCKED_LOG_AT_MONO >= throttle_seconds:
@@ -1681,7 +1724,26 @@ def _log_kakao_token_heartbeat() -> None:
         )
 
 
+def _build_notifier_core():
+    """NOTIFY_CHANNEL 에 따라 DiscordNotifier 또는 KakaoNotifier 반환."""
+    channel = _notify_channel()
+    if channel == "discord":
+        if DiscordNotifier is None:
+            return None
+        url = _env_str("DISCORD_WEBHOOK_URL", "").strip()
+        if not url:
+            return None
+        return DiscordNotifier(webhook_url=url, enabled=True)
+    if KakaoNotifier is None:
+        return None
+    rest = _env_str("KAKAO_REST_API_KEY", "")
+    if not rest:
+        return None
+    return KakaoNotifier(enabled=True, rest_api_key=rest)
+
+
 def _build_kakao_notifier_core():
+    """하위호환 별칭 — 카카오 코어만 필요할 때."""
     if KakaoNotifier is None:
         return None
     rest = _env_str("KAKAO_REST_API_KEY", "")
@@ -1691,25 +1753,25 @@ def _build_kakao_notifier_core():
 
 
 def _ensure_async_kakao_started() -> None:
-    """AsyncNotifier 워커 기동(프로세스당 1회)."""
+    """AsyncNotifier 워커 기동(프로세스당 1회). Discord/Kakao 공통."""
     global _ASYNC_KAKAO, _KAKAO_NOTIFIER_CORE
-    if AsyncNotifier is None or KakaoNotifier is None or _hydrate_kakao_tokens is None:
+    if AsyncNotifier is None:
         return
-    if not _kakao_alerts_enabled():
+    if not _notify_alerts_enabled():
         return
     if _ASYNC_KAKAO is not None:
         alive = _ASYNC_KAKAO.is_alive() if hasattr(_ASYNC_KAKAO, "is_alive") else _ASYNC_KAKAO.is_running
         if alive:
             return
-        # 워커 스레드가 죽어 있으면(비정상 종료) 새로 만들어 재기동한다 — 알림 증발 방지.
-        logger.error("카카오 비동기 알림 워커가 죽어 있어 재기동합니다.")
+        logger.error("비동기 알림 워커가 죽어 있어 재기동합니다.")
         try:
             _ASYNC_KAKAO.stop(drain_timeout=0.1)
         except Exception:
             pass
         _ASYNC_KAKAO = None
-    _hydrate_kakao_tokens()
-    core = _build_kakao_notifier_core()
+    if _notify_channel() == "kakao" and _hydrate_kakao_tokens is not None:
+        _hydrate_kakao_tokens()
+    core = _build_notifier_core()
     if core is None:
         return
     _KAKAO_NOTIFIER_CORE = core
@@ -1748,7 +1810,8 @@ def _log_kakao_report_settings_once() -> None:
         return
     KAKAO_REPORT_SETTINGS_LOGGED = True
     logger.info(
-        "카카오 리포트 설정: KAKAO_ONCE_PER_DAY=%s, AI_STATUS_REPORT_MINUTES=%s (적용=%s분)",
+        "알림 설정: NOTIFY_CHANNEL=%s, KAKAO_ONCE_PER_DAY=%s, AI_STATUS_REPORT_MINUTES=%s (적용=%s분)",
+        _notify_channel(),
         _kakao_once_per_day_enabled(),
         _env_str("AI_STATUS_REPORT_MINUTES", "(미설정→1440)"),
         _resolve_status_report_minutes(),
@@ -1778,7 +1841,9 @@ def _mark_kakao_sent_today(now_kst: datetime | None = None) -> None:
 
 
 def _notify_kakao_token_refresh_success() -> None:
-    """액세스 토큰 HTTP 갱신 성공 시 카카오 알림(일일 리포트 한도와 별도)."""
+    """액세스 토큰 HTTP 갱신 성공 시 알림(일일 리포트 한도와 별도). 카카오 채널 전용."""
+    if _notify_channel() != "kakao":
+        return
     now = datetime.now(KST)
     body = "\n".join(
         [
@@ -1794,39 +1859,47 @@ def _notify_kakao_token_refresh_success() -> None:
 
 
 def _notify_kakao(title: str, body: str, *, sync: bool = False, daily_digest: bool = False, exempt_daily_limit: bool = False) -> bool:
-    """카카오 알림 — 기본 비동기(매매 블로킹 방지), sync=True는 종료·긴급용."""
+    """알림 전송 — 함수명 유지, 내부는 NOTIFY_CHANNEL(discord|kakao)로 분기.
+
+    기본 비동기(매매 블로킹 방지), sync=True는 종료·긴급용.
+    """
     try:
-        if KakaoNotifier is None or _hydrate_kakao_tokens is None:
+        if not _notify_alerts_enabled():
             return False
-        if not _kakao_alerts_enabled():
-            return False
-        if not _env_str("KAKAO_REST_API_KEY", ""):
-            return False
+        channel = _notify_channel()
+        if channel == "discord":
+            if DiscordNotifier is None or not _discord_webhook_configured():
+                return False
+        else:
+            if KakaoNotifier is None or _hydrate_kakao_tokens is None:
+                return False
+            if not _env_str("KAKAO_REST_API_KEY", ""):
+                return False
 
         if _kakao_once_per_day_enabled() and not daily_digest and not exempt_daily_limit:
-            logger.debug("카카오 일일 1회 제한 — 상태 리포트 외 알림 생략: %s", title[:60])
+            logger.debug("일일 1회 제한 — 상태 리포트 외 알림 생략: %s", title[:60])
             return False
 
         if daily_digest and _kakao_once_per_day_enabled() and _kakao_already_sent_today():
-            logger.debug("카카오 일일 1회 제한 — 오늘(KST) 이미 발송함: %s", title[:60])
+            logger.debug("일일 1회 제한 — 오늘(KST) 이미 발송함: %s", title[:60])
             return False
 
         ok = False
         if sync:
-            core = _KAKAO_NOTIFIER_CORE or _build_kakao_notifier_core()
+            core = _KAKAO_NOTIFIER_CORE or _build_notifier_core()
             if core is None:
                 return False
             ok = bool(core.send_message(title, body))
             if not ok:
-                logger.warning("카카오 동기 알림 실패: %s", title[:60])
+                logger.warning("동기 알림 실패(%s): %s", channel, title[:60])
         else:
             _ensure_async_kakao_started()
             if _ASYNC_KAKAO is not None:
                 ok = bool(_ASYNC_KAKAO.send_message(title, body))
                 if not ok:
-                    logger.warning("카카오 알림 큐 적재 실패: %s", title[:60])
+                    logger.warning("알림 큐 적재 실패(%s): %s", channel, title[:60])
             else:
-                core = _build_kakao_notifier_core()
+                core = _build_notifier_core()
                 if core is None:
                     return False
                 ok = bool(core.send_message(title, body))
@@ -1835,21 +1908,29 @@ def _notify_kakao(title: str, body: str, *, sync: bool = False, daily_digest: bo
             _mark_kakao_sent_today()
         return ok
     except Exception as exc:
-        logger.error("카카오 알림 전송 중 예외 발생(매매에는 영향 없음): %s", type(exc).__name__)
+        logger.error("알림 전송 중 예외 발생(매매에는 영향 없음): %s", type(exc).__name__)
         return False
 
 
 def _kakao_auth_ready() -> bool:
-    """Safety First 게이트: 매매를 진행해도 되는 카카오 인증 상태인지 확인한다.
+    """Safety First 게이트: 알림 채널이 매매 전제 조건을 만족하는지.
 
-    카카오 알림은 시스템 생존 신호(Heartbeat)이므로 매매 엔진의 '전제 조건'이다.
-    - KAKAO_ALERTS_ENABLED=false 이면 운영자가 알림을 의도적으로 끈 것이므로 통과시킨다.
-    - 인증 대기 모드(exhausted)면 디스크에 토큰이 있어도 차단.
-    - 평시에는 디스크 자격증명만 확인. access 만료 시 하트비트가 refresh 점검.
-    - 점검 중 예외가 나도 호출자에게 전파하지 않고 False(안전 측)로 처리한다.
+    - 알림 OFF → 통과(의도적으로 끈 것)
+    - NOTIFY_CHANNEL=discord → DISCORD_WEBHOOK_URL 존재 여부만 확인(카카오 OAuth 스킵)
+    - NOTIFY_CHANNEL=kakao → 기존 카카오 토큰/인증 대기 모드 로직
     """
-    if not _kakao_alerts_enabled():
+    if not _notify_alerts_enabled():
         return True
+
+    if _notify_channel() == "discord":
+        if not _discord_webhook_configured():
+            logger.error(
+                "DISCORD_WEBHOOK_URL 이 비어 있어 매매를 차단합니다. "
+                "btc_live_trading/.env 에 웹훅 URL을 설정하세요."
+            )
+            return False
+        return True
+
     if KakaoNotifier is None or _hydrate_kakao_tokens is None or get_access_token is None:
         logger.error("카카오 모듈 로드 실패 — 인증 확인 불가로 매매를 차단합니다.")
         return False
@@ -2899,7 +2980,7 @@ def _send_startup_report() -> None:
             "시스템이 정상적으로 기동되었으며, 5분 주기로 시장 감시를 시작합니다.",
         ]
     )
-    _notify_kakao(f"🚀 {bracket} 운영 시작", body)
+    _notify_kakao(f"🚀 {bracket} 운영 시작", body, exempt_daily_limit=True)
     STARTUP_REPORT_SENT = True
 
 
@@ -3577,15 +3658,22 @@ def _initialize_trading_loop_once(*, send_startup_report: bool = True) -> None:
     try:
         _ensure_async_kakao_started()
     except Exception as exc:
-        logger.error("카카오 비동기 알림 워커 기동 실패: %s", type(exc).__name__)
-    if _register_kakao_token_refresh_listener is not None:
-        _register_kakao_token_refresh_listener(_notify_kakao_token_refresh_success)
-    if _register_kakao_invalid_grant_listener is not None:
-        _register_kakao_invalid_grant_listener(_on_kakao_invalid_grant_from_utils)
-    try:
-        _bootstrap_kakao_tokens()
-    except Exception as exc:
-        logger.error("카카오 토큰 부트스트랩 실패(매매는 계속 진행): %s", type(exc).__name__)
+        logger.error("비동기 알림 워커 기동 실패: %s", type(exc).__name__)
+    if _notify_channel() == "kakao":
+        if _register_kakao_token_refresh_listener is not None:
+            _register_kakao_token_refresh_listener(_notify_kakao_token_refresh_success)
+        if _register_kakao_invalid_grant_listener is not None:
+            _register_kakao_invalid_grant_listener(_on_kakao_invalid_grant_from_utils)
+        try:
+            _bootstrap_kakao_tokens()
+        except Exception as exc:
+            logger.error("카카오 토큰 부트스트랩 실패(매매는 계속 진행): %s", type(exc).__name__)
+    else:
+        logger.info(
+            "알림 채널=discord — 카카오 OAuth 리스너/부트스트랩 생략 "
+            "(웹훅 URL %s)",
+            "설정됨" if _discord_webhook_configured() else "미설정",
+        )
     if send_startup_report:
         try:
             _send_startup_report()
@@ -3601,12 +3689,11 @@ def run_forever() -> None:
         cycle_started = time.time()
         try:
             _wait_for_next_cycle_slot(loop_seconds)
-            # Safety First:
-            # 매매 로직(차트 분석·주문)을 통째로 건너뛴다.
+            # Safety First: 알림 채널 전제 조건 실패 시 매매 스킵
             if not _kakao_auth_ready():
                 _log_kakao_auth_blocked_throttled()
-            else:
-                # access 만료 시 refresh 점검 — invalid_grant 면 exhausted 후 매매 스킵
+            elif _notify_channel() == "kakao":
+                # 카카오: access 만료 시 refresh 점검
                 _log_kakao_token_heartbeat()
                 if KAKAO_AUTH_EXHAUSTED or not _kakao_auth_ready():
                     _log_kakao_auth_blocked_throttled()
@@ -3615,6 +3702,12 @@ def run_forever() -> None:
                     if not result.get("cycle_skipped"):
                         print(_format_cycle_dashboard(result))
                         _mark_cycle_completed()
+            else:
+                # 디스코드: OAuth 하트비트 없음
+                result = run_cycle()
+                if not result.get("cycle_skipped"):
+                    print(_format_cycle_dashboard(result))
+                    _mark_cycle_completed()
         except KeyboardInterrupt:
             try:
                 with _SHUTDOWN_LOCK:
