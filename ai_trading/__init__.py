@@ -1,0 +1,1 @@
+"""Independent AI trading package."""

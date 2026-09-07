@@ -1,0 +1,45 @@
+# 환경 변수 파일 (절대 커밋 금지!)
+.env
+*.env
+
+# 카카오 OAuth 토큰 (자동 저장)
+kakao_code.json
+
+# 로그 파일 (민감한 정보 포함 가능)
+*.log
+logs/
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 가상 환경
+venv/
+env/
+ENV/
+
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 바이낸스 데이터
+*.csv
+data/
+
+# 테스트 파일
+test_*.py
+*_test.py
+
+# 백업 파일
+*.bak
+*.backup
+*.old
+
+# 시스템 파일
+.DS_Store
+Thumbs.db

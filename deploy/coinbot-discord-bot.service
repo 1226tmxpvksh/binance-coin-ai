@@ -1,0 +1,22 @@
+[Unit]
+Description=Coin Discord status bot (read-only slash commands)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot2
+Group=bot2
+WorkingDirectory=/home/bot2/Coin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/bot2/venv/bin/python /home/bot2/Coin/scripts/discord_bot.py
+Restart=on-failure
+RestartSec=15
+# 토큰 누락 등으로 즉시 실패할 때 폭주 방지
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# 매매 서비스(coinbot.service)와 독립 — 이 유닛이 죽어도 매매는 계속됨
+
+[Install]
+WantedBy=multi-user.target
