@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 ﻿venv/
 data/
 .env
@@ -5,3 +6,100 @@ __pycache__/
 *.pyc
 kakao_code.json
 .coinbot.lock
+=======
+# 환경변수 및 민감한 정보 (절대 커밋 금지)
+.env
+*.env
+!.env.example
+btc_live_trading/kakao_code.json
+
+# 카카오 RT 진단 로그 (프로젝트 루트 data/)
+/data/kakao_rt_health.jsonl
+/data/kakao_auth_events.jsonl
+/data/kakao_rt_healthcheck.cron.log
+.kakao_rt_healthcheck.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 가상환경
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 로그
+*.log
+logs/
+*.log.*
+
+# 백업 파일
+*.bak
+*.backup
+
+# AI 매매 런타임 데이터 (PC·서버마다 다름 — Git 제외)
+ai_trading/data/trading_stats.json
+ai_trading/data/virtual_trades.jsonl
+ai_trading/data/history/
+ai_trading/data/*.csv
+ai_trading/data/ai_learning_logs.csv
+
+# 백테스트 산출물 (재생성 가능)
+btc_day_strategy/output/
+btc_day_strategy/*.log
+
+# 레거시 거래 데이터
+trades.json
+positions.json
+
+# 봇 단일 실행 락 (실행 시 자동 생성)
+.coinbot.lock
+
+# 임시 파일
+tmp/
+temp/
+*.tmp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# 테스트
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 기타
+.cache/
+>>>>>>> c9792f2b92b289b5482bbcf04bad9f04d67d398d
