@@ -123,6 +123,95 @@ def signed_position_amt_for_symbol(client: Any, symbol: str) -> float:
     return total
 
 
+def _commission_usdt_from_mapping(row: Dict[str, Any] | None) -> float | None:
+    """단일 체결/주문 맵에서 USDT(또는 USDC) commission만 추출. 없거나 다른 자산이면 None."""
+    if not isinstance(row, dict):
+        return None
+    raw = row.get("commission")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        val = abs(float(raw))
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    asset = str(row.get("commissionAsset") or row.get("commission_asset") or "USDT").upper()
+    if asset and asset not in ("USDT", "USDC"):
+        return None
+    return val
+
+
+def extract_order_commission_usdt(order: Dict[str, Any] | None) -> float | None:
+    """주문 응답의 commission / fills[].commission 합(USDT). 없으면 None."""
+    if not isinstance(order, dict):
+        return None
+    direct = _commission_usdt_from_mapping(order)
+    fills = order.get("fills")
+    fill_total = 0.0
+    fill_found = False
+    if isinstance(fills, list):
+        for fill in fills:
+            part = _commission_usdt_from_mapping(fill if isinstance(fill, dict) else None)
+            if part is not None:
+                fill_total += part
+                fill_found = True
+    if fill_found:
+        return fill_total
+    return direct
+
+
+def fetch_order_commission_usdt(client: Any, symbol: str, order_id: Any) -> float | None:
+    """userTrades에서 해당 orderId의 USDT commission 합. 조회 실패·없으면 None."""
+    if client is None or order_id is None or str(order_id).strip() == "":
+        return None
+    rows: Any = None
+    try:
+        rows = client.futures_account_trades(symbol=str(symbol).upper(), orderId=int(order_id))
+    except (TypeError, ValueError, BinanceAPIException):
+        rows = None
+    except Exception:
+        rows = None
+    if not isinstance(rows, list):
+        try:
+            all_rows = client.futures_account_trades(symbol=str(symbol).upper(), limit=100)
+        except Exception:
+            return None
+        rows = [r for r in (all_rows or []) if str(r.get("orderId")) == str(order_id)]
+    total = 0.0
+    found = False
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        part = _commission_usdt_from_mapping(row)
+        if part is None:
+            continue
+        total += part
+        found = True
+    return total if found else None
+
+
+def resolve_order_commission_usdt(
+    client: Any,
+    symbol: str,
+    order: Dict[str, Any] | None = None,
+    order_id: Any = None,
+) -> float | None:
+    """주문 응답 commission 우선, 없으면 userTrades. 둘 다 없으면 None(호출측이 요율 추정)."""
+    extracted = extract_order_commission_usdt(order)
+    if extracted is not None:
+        return extracted
+    oid = order_id
+    if oid is None and isinstance(order, dict):
+        oid = order.get("orderId")
+    return fetch_order_commission_usdt(client, symbol, oid)
+
+
+def _append_close_order(orders_out: List[Dict[str, Any]] | None, order: Any) -> None:
+    if orders_out is not None and isinstance(order, dict):
+        orders_out.append(order)
+
+
 def _futures_market_reduce(
     client: Any,
     symbol: str,
@@ -130,7 +219,7 @@ def _futures_market_reduce(
     side: str,
     quantity: float,
     position_side: str | None,
-) -> None:
+) -> Any:
     params: Dict[str, Any] = {
         "symbol": symbol.upper(),
         "side": side,
@@ -140,10 +229,15 @@ def _futures_market_reduce(
     }
     if position_side in ("LONG", "SHORT"):
         params["positionSide"] = position_side
-    client.futures_create_order(**params)
+    return client.futures_create_order(**params)
 
 
-def market_close_symbol(client: Any, symbol: str) -> Tuple[bool, str]:
+def market_close_symbol(
+    client: Any,
+    symbol: str,
+    *,
+    orders_out: List[Dict[str, Any]] | None = None,
+) -> Tuple[bool, str]:
     """해당 심볼의 열린 USDT-M 포지션을 모두 시장가로 줄인다."""
     sym = symbol.upper()
     dual = futures_dual_side_position(client)
@@ -170,10 +264,16 @@ def market_close_symbol(client: Any, symbol: str) -> Tuple[bool, str]:
                 continue
             try:
                 if ps == "LONG" and amt > 0:
-                    _futures_market_reduce(client, sym, side="SELL", quantity=qty, position_side="LONG")
+                    order = _futures_market_reduce(
+                        client, sym, side="SELL", quantity=qty, position_side="LONG"
+                    )
+                    _append_close_order(orders_out, order)
                     msgs.append(f"LONG:{qty}")
                 elif ps == "SHORT" and amt < 0:
-                    _futures_market_reduce(client, sym, side="BUY", quantity=qty, position_side="SHORT")
+                    order = _futures_market_reduce(
+                        client, sym, side="BUY", quantity=qty, position_side="SHORT"
+                    )
+                    _append_close_order(orders_out, order)
                     msgs.append(f"SHORT:{qty}")
                 else:
                     logger.warning("헤지 포지션 행 스킵 %s ps=%s amt=%s", sym, ps, amt)
@@ -189,13 +289,15 @@ def market_close_symbol(client: Any, symbol: str) -> Tuple[bool, str]:
             net += float(row.get("positionAmt", 0) or 0)
         except (TypeError, ValueError):
             continue
-    return market_close_signed_position(client, sym, net)
+    return market_close_signed_position(client, sym, net, orders_out=orders_out)
 
 
 def market_close_signed_position(
     client: Any,
     symbol: str,
     signed_amt: float,
+    *,
+    orders_out: List[Dict[str, Any]] | None = None,
 ) -> Tuple[bool, str]:
     """원웨이 전용: signed_amt > 0 롱→SELL, < 0 숏→BUY."""
     sym = symbol.upper()
@@ -206,7 +308,8 @@ def market_close_signed_position(
         return False, "qty_rounded_zero"
     side = "SELL" if signed_amt > 0 else "BUY"
     try:
-        _futures_market_reduce(client, sym, side=side, quantity=qty, position_side=None)
+        order = _futures_market_reduce(client, sym, side=side, quantity=qty, position_side=None)
+        _append_close_order(orders_out, order)
         return True, f"{side}x{qty}"
     except Exception as exc:
         logger.exception("시장가 청산 실패 %s: %s", sym, exc)

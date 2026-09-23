@@ -58,7 +58,19 @@ Coin/
 카카오로 되돌리기: `.env`에서 `NOTIFY_CHANNEL=kakao` → `systemctl restart coinbot.service`.  
 자세한 복구: [legacy/kakao/README.md](legacy/kakao/README.md).
 
-슬래시 조회(`/status`, `/health`)는 웹훅과 **별도 프로세스** (`scripts/discord_bot.py`, `DISCORD_BOT_TOKEN`).
+슬래시 봇(`/status`, `/health`, `/mode`, `/help`, `/setmode`)은 웹훅과 **별도 프로세스** (`scripts/discord_bot.py`, `DISCORD_BOT_TOKEN`).
+
+| 명령 | 종류 | 설명 |
+|------|------|------|
+| `/status` | 조회 | 매매 상태·손익·포지션. 실전은 선물 지갑 잔고 |
+| `/health` | 조회 | 매매 루프 지연 여부 |
+| `/mode` | 조회 | 현재 페이퍼/실전 (`AI_DRY_RUN`) |
+| `/help` | 조회 | 등록된 명령어 목록(슬래시 트리에서 자동 생성) |
+| `/setmode` | 변경 | `paper` 즉시 / `live`는 30초 `/confirm_live`. 운영자만 |
+| `/confirm_live` | 변경 | 실전 전환 확인 |
+
+`/setmode`는 `.env`의 `AI_DRY_RUN` 줄만 바꾸고 `coinbot.service` 재시작은 안내만 합니다. 허용 사용자는 `DISCORD_AUTHORIZED_USER_ID`.  
+`/help` 목록은 `CommandTree`에서 가져옵니다. 새 명령어를 추가하면 description만 채우면 됩니다.
 
 ---
 
@@ -68,8 +80,8 @@ Coin/
 
 1. **거래소** — `BINANCE_API_KEY` / `SECRET`  
 2. **OpenAI** — API Key + 진입/모니터 모델명  
-3. **알림** — `NOTIFY_CHANNEL`, Discord 웹훅·봇 토큰, `KAKAO_*`(레거시)  
-4. **매매 엔진** — `AI_DRY_RUN`, 심볼, 루프 초, 레버리지, 리스크 비율, 가상원금  
+3. **알림** — `NOTIFY_CHANNEL`, Discord 웹훅·봇 토큰, `DISCORD_AUTHORIZED_USER_ID`, `KAKAO_*`(레거시)  
+4. **매매 엔진** — `AI_DRY_RUN`, 심볼, 루프 초, 레버리지, 리스크 비율, 가상원금, `BINANCE_TAKER_FEE_PCT`  
 5. **리스크/필터** — ATR, R/R, 거래량 게이트, 오답노트 유사도  
 6. **운영/로그** — 비용 추정, 트레이드/학습 로그 최대 줄 수  
 

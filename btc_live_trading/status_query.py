@@ -2,7 +2,8 @@
 매매 상태 읽기 전용 스냅샷.
 
 main_ai.run_cycle / 주문·청산 함수를 절대 호출하지 않는다.
-reporting.load_trading_stats / summarize_ledger / resolve_report_balances 만 사용한다.
+잔고는 reporting.resolve_report_balances 와 동일 규칙:
+실전(AI_DRY_RUN=false)이면 선물 지갑 조회, 페이퍼면 virtual_balance_*.
 """
 
 from __future__ import annotations
@@ -27,6 +28,16 @@ from reporting import (  # noqa: E402
     resolve_report_balances,
     summarize_ledger,
 )
+
+try:
+    from binance_futures_tools import fetch_futures_usdt_balance_from_env as _fetch_futures_usdt
+except ImportError:
+    _fetch_futures_usdt = None  # type: ignore[assignment]
+
+try:
+    from fx_rates import fetch_usdt_krw as _fetch_usdt_krw
+except ImportError:
+    _fetch_usdt_krw = None  # type: ignore[assignment]
 
 KST = timezone(timedelta(hours=9))
 TRADE_LOG_PATH = _AI / "data" / "virtual_trades.jsonl"
@@ -131,8 +142,36 @@ def _notify_channel_status() -> dict[str, Any]:
     }
 
 
+def _krw_per_usdt() -> float:
+    if _fetch_usdt_krw is not None:
+        try:
+            rate = float(_fetch_usdt_krw())
+            if rate > 0:
+                return rate
+        except Exception:
+            pass
+    return 1380.0
+
+
+def _live_futures_usdt() -> float | None:
+    """main_ai 실전 리포트와 동일한 선물 지갑 조회. 실패 시 None."""
+    if _fetch_futures_usdt is None:
+        return None
+    try:
+        bal = _fetch_futures_usdt()
+    except Exception:
+        return None
+    if bal is None:
+        return None
+    try:
+        value = float(bal)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 def build_status_snapshot() -> dict[str, Any]:
-    """원장·환경변수만 읽는 상태 스냅샷 (쓰기/매매 호출 없음)."""
+    """원장·환경변수(+실전일 때 선물 잔고) 읽기 전용 스냅샷. 매매 호출 없음."""
     now_kst = datetime.now(KST)
     dry_run = _env_bool("AI_DRY_RUN", True)
     loop_seconds = max(1, _env_int("AI_LOOP_SECONDS", 300))
@@ -152,16 +191,21 @@ def build_status_snapshot() -> dict[str, Any]:
         }
 
     summary = summarize_ledger(stats)
+    live_usdt = None if dry_run else _live_futures_usdt()
+    krw_per_usdt = _krw_per_usdt() if not dry_run else 1.0
     balance_krw, balance_usdt, total_profit_pct = resolve_report_balances(
         stats,
-        dry_run=True,  # 조회 봇은 거래소 잔고 API를 치지 않음
-        live_futures_usdt=None,
-        krw_per_usdt=1.0,
+        dry_run=dry_run,
+        live_futures_usdt=live_usdt,
+        krw_per_usdt=krw_per_usdt,
     )
-    # dry_run=True 경로면 원장 잔고 사용 — summarize 와 맞춤
-    balance_krw = summary.balance_krw
-    balance_usdt = summary.balance_usdt
-    total_profit_pct = summary.total_profit_pct
+    used_live = (
+        (not dry_run)
+        and live_usdt is not None
+        and live_usdt > 0
+        and krw_per_usdt > 0
+    )
+    balance_source = "binance_futures" if used_live else "virtual_ledger"
 
     open_pos = stats.get("open_position") if isinstance(stats.get("open_position"), dict) else None
     position: dict[str, Any] | None = None
@@ -199,6 +243,9 @@ def build_status_snapshot() -> dict[str, Any]:
         "has_position": position is not None,
         "balance_krw": balance_krw,
         "balance_usdt": balance_usdt,
+        "balance_source": balance_source,
+        "live_futures_usdt": live_usdt,
+        "krw_per_usdt": krw_per_usdt,
         "total_profit_krw": summary.total_profit_krw,
         "total_profit_usdt": summary.total_profit_usdt,
         "total_profit_pct": total_profit_pct,

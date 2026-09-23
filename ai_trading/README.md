@@ -73,12 +73,16 @@ AI_RUN_ONCE=false
 # === 가상 자산 (Dry-run·원장 기준) ===
 AI_VIRTUAL_INITIAL_KRW=500000
 AI_VIRTUAL_INITIAL_USDT=362
+
+# USDT-M taker 수수료(%). 0.04=0.04%. 페이퍼·실전 청산 PnL에서 왕복 차감.
+BINANCE_TAKER_FEE_PCT=0.04
 AI_PAPER_HOLD_MINUTES=60
 
 # === 진입 게이트 ===
 AI_VOLUME_MIN_RATIO=1.5
 AI_VOLUME_GATE_ENABLED=true
 AI_ATR_MIN_ENTRY_PCT=0.15
+AI_MIN_EMA_GAP_PCT=0.3
 AI_TRADE_ON_WEEKENDS=false
 
 # === 리스크 ===
@@ -178,7 +182,7 @@ py -3 ai_trading\main_ai.py
 ==================================================
 ```
 
-- **실전(`AI_DRY_RUN=false`)**이면 Binance 선물 지갑 USDT를 `실잔고(USDT)`로 표시합니다. 가상 모드는 `가상 잔고(USDT)`입니다.
+- **실전(`AI_DRY_RUN=false`)**이면 Binance 선물 지갑 USDT를 `실잔고(USDT)`로 표시합니다. 가상 모드는 `가상 잔고(USDT)`입니다. 디스코드 `/status`도 `status_query.build_status_snapshot`에서 같은 `resolve_report_balances` + `fetch_futures_usdt_balance_from_env` 규칙을 씁니다.
 - 포지션이 있으면 `open_position`의 코인 수량·진입가·`opened_at_kst`(KST `HH:MM`)를 한 줄에 강조합니다.
 - 포맷 함수: `main_ai._format_cycle_dashboard` (루프 출력은 `run_forever` / `AI_RUN_ONCE` 경로).
 
@@ -264,6 +268,7 @@ KOE205가 발생하면 `KAKAO_REDIRECT_URI`와 카카오 개발자 콘솔 Redire
 - **현재**: `dry_run=false`이면 `binance_futures_tools.futures_market_open_position` → `Client.futures_create_order`(MARKET, `reduceOnly=False`)로 진입하고, `trade_id`는 응답의 **`orderId`** 문자열입니다. 가상 모드는 `order_mode: paper` + `PAPER-…` ID.
 - 편의 함수 **`market_buy_symbol` / `market_sell_symbol_open_short`**는 같은 모듈에서 롱·숏 진입용으로 노출됩니다.
 - 청산 시 `_close_position`은 실전에서 먼저 `market_close_symbol`(시장가·reduceOnly)을 호출한 뒤 원장을 갱신합니다. 거래소 청산 실패 시 카카오 *「실전 청산 실패 알림」* 후 원장·포지션은 유지됩니다.
+- **수수료 회계**: `pnl_usdt`는 왕복 taker를 뺀 **net**입니다. 로그/CSV에 `pnl_usdt_gross`(가격 손익), `fee_usdt`, `pnl_usdt_net`을 함께 남깁니다. 요율은 `BINANCE_TAKER_FEE_PCT`(기본 0.04=0.04%). 실전은 주문 응답 `commission`(없으면 userTrades)을 쓰고, 없으면 같은 요율로 추정합니다. 페이퍼도 동일 요율로 차감합니다. **매매 판단 로직은 이 값과 무관합니다.**
 - 기동 시 `_send_startup_report` 및 매 사이클 `_log_order_execution_setup` 로그로 **`AI_DRY_RUN` 원문·해석값·선물 주문 스택 준비 여부**를 확인할 수 있습니다.
 
 ### 비상 수동 청산 스크립트

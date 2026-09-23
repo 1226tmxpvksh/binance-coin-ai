@@ -173,6 +173,13 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT", interval: str = "15m", limit:
     if bb_upper > bb_lower:
         bb_pos = (last_price - bb_lower) / (bb_upper - bb_lower)
 
+    # 로깅용. 매매 판단(run_cycle / _technical_signal_decision)은 이 값을 읽지 않는다.
+    sma200 = _sma(closes, 200) if len(closes) >= 200 else 0.0
+    sma_slope = 0.0
+    if len(closes) >= 205 and sma200 > 0:
+        sma200_prev = _sma(closes[:-5], 200)
+        sma_slope = sma200 - sma200_prev
+
     snapshot = {
         "symbol": symbol,
         "interval": interval,
@@ -182,6 +189,8 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT", interval: str = "15m", limit:
         "ema20": ema20,
         "ema60": ema60,
         "ema_gap_pct": ema_gap_pct,
+        "sma200": sma200,
+        "sma_slope": sma_slope,
         "atr14": atr14,
         "atr_pct": atr_pct,
         "bb_upper": bb_upper,

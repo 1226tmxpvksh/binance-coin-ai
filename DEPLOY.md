@@ -82,7 +82,7 @@ sudo systemctl enable --now coinbot-discord-bot.service
 journalctl -u coinbot-discord-bot.service -f
 ```
 
-`DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`는 `.env`에 설정. 상세는 [README.md](README.md).
+`DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_AUTHORIZED_USER_ID`는 `.env`에 설정. 상세는 [README.md](README.md). `/setmode`는 `.env`만 바꾸고, 매매 루프 재시작은 SSH에서 `systemctl restart coinbot.service` 합니다.
 
 ---
 

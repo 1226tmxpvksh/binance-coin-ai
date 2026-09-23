@@ -73,6 +73,7 @@ try:
         futures_market_open_position as _futures_market_open_position,
         futures_open_position_rows as _futures_open_position_rows,
         market_close_symbol as _market_close_symbol,
+        resolve_order_commission_usdt as _resolve_order_commission_usdt,
         signed_position_amt_for_symbol as _signed_position_amt_for_symbol,
     )
 except ImportError:
@@ -81,6 +82,7 @@ except ImportError:
     _futures_market_open_position = None  # type: ignore[assignment]
     _futures_open_position_rows = None  # type: ignore[assignment]
     _market_close_symbol = None  # type: ignore[assignment]
+    _resolve_order_commission_usdt = None  # type: ignore[assignment]
     _signed_position_amt_for_symbol = None  # type: ignore[assignment]
 
 try:
@@ -188,6 +190,10 @@ LEARNING_FIELDNAMES = [
     "exit_price",
     "price_move_pct",
     "pnl_usdt",
+    "pnl_usdt_gross",
+    "pnl_usdt_net",
+    "fee_usdt",
+    "fee_source",
     "pnl_krw",
     "market_signature",
     "market_context",
@@ -371,6 +377,67 @@ def _sanitize_env_value(name: str, value: str) -> str:
 
 def _env_str(name: str, default: str) -> str:
     return _sanitize_env_value(name, os.getenv(name, default))
+
+
+def _binance_taker_fee_rate() -> float:
+    """`BINANCE_TAKER_FEE_PCT`(예: 0.04=0.04%)를 소수 요율로 변환."""
+    pct = max(0.0, _env_float("BINANCE_TAKER_FEE_PCT", 0.04))
+    return pct / 100.0
+
+
+def _positive_fee_usdt(value: Any) -> float | None:
+    try:
+        fee = float(value)
+    except (TypeError, ValueError):
+        return None
+    if fee <= 0:
+        return None
+    return fee
+
+
+def _compute_realized_pnl(
+    *,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+    size: float,
+    entry_fee_usdt: float | None = None,
+    exit_fee_usdt: float | None = None,
+    taker_rate: float | None = None,
+) -> Dict[str, Any]:
+    """가격 손익(gross)에서 왕복 taker 수수료를 뺀 net. 판단 로직과 분리된 회계 전용."""
+    side_u = str(side or "HOLD").upper()
+    if side_u == "SELL":
+        pnl_gross = (entry_price - exit_price) * size
+        price_move_pct = ((entry_price - exit_price) / entry_price * 100.0) if entry_price else 0.0
+    else:
+        pnl_gross = (exit_price - entry_price) * size
+        price_move_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price else 0.0
+    rate = float(taker_rate) if taker_rate is not None else _binance_taker_fee_rate()
+    rate = max(0.0, rate)
+    sources: List[str] = []
+    open_fee = _positive_fee_usdt(entry_fee_usdt)
+    if open_fee is None:
+        open_fee = abs(entry_price * size) * rate
+        sources.append("rate_open")
+    else:
+        sources.append("order_open")
+    close_fee = _positive_fee_usdt(exit_fee_usdt)
+    if close_fee is None:
+        close_fee = abs(exit_price * size) * rate
+        sources.append("rate_close")
+    else:
+        sources.append("order_close")
+    fee_usdt = float(open_fee) + float(close_fee)
+    pnl_net = pnl_gross - fee_usdt
+    return {
+        "price_move_pct": price_move_pct,
+        "pnl_usdt_gross": pnl_gross,
+        "fee_usdt": fee_usdt,
+        "fee_source": "+".join(sources) if sources else "rate",
+        "pnl_usdt_net": pnl_net,
+        "pnl_usdt": pnl_net,
+    }
 
 
 def _env_float(name: str, default: float) -> float:
@@ -735,6 +802,39 @@ def _apply_volume_entry_filter(decision: Dict[str, Any], snapshot: Dict[str, Any
     out["reason"] = (
         f"거래량 미동반(Volume {ratio_pct:.0f}% of 7d avg, need ≥{min_ratio * 100:.0f}%)"
         + (f" — {base_reason}" if base_reason and base_reason != "기록 없음" else "")
+    )
+    return out
+
+
+def _min_ema_gap_pct() -> float:
+    """|EMA 갭|(%) 최소값. 이보다 작으면 약추세로 진입 차단."""
+    return max(0.0, _env_float("AI_MIN_EMA_GAP_PCT", 0.3))
+
+
+def _apply_ema_gap_entry_filter(decision: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """미세 EMA 갭을 추세로 오인하는 진입을 HOLD. 페이퍼/실전 공통."""
+    side = str(decision.get("decision", "HOLD")).upper()
+    if side not in {"BUY", "SELL"}:
+        return decision
+    min_pct = _min_ema_gap_pct()
+    if min_pct <= 0:
+        return decision
+    ema_gap_pct = _safe_float(snapshot.get("ema_gap_pct", 0.0))
+    if abs(ema_gap_pct) >= min_pct:
+        return decision
+    out = dict(decision)
+    base_reason = _report_text(decision.get("reason"), "")
+    out["decision"] = "HOLD"
+    out["confidence"] = min(_safe_float(out.get("confidence", 0.0)), 0.35)
+    out["reason"] = (
+        f"EMA 갭 부족으로 진입 스킵 (|{ema_gap_pct:+.3f}%| < {min_pct:.3f}%)"
+        + (f" — {base_reason}" if base_reason and base_reason != "기록 없음" else "")
+    )
+    logger.info(
+        "EMA 갭 부족으로 진입 스킵 side=%s ema_gap_pct=%+.3f%% min=%.3f%%",
+        side,
+        ema_gap_pct,
+        min_pct,
     )
     return out
 
@@ -2111,6 +2211,25 @@ def _snapshot_bucket(value: float, step: float) -> str:
     return f"{bucket:.2f}"
 
 
+def _sma_log_fragment(snapshot: Dict[str, Any]) -> str:
+    """학습 로그용 SMA200 기록. 판단 로직에서는 호출하지 않는다."""
+    sma200 = _safe_float(snapshot.get("sma200", 0.0))
+    slope = _safe_float(snapshot.get("sma_slope", 0.0))
+    price = _safe_float(snapshot.get("price", 0.0))
+    if sma200 <= 0:
+        return "SMA200=NA sma_slope=NA close_vs_sma=NA"
+    vs_pct = ((price - sma200) / sma200) * 100.0
+    return f"SMA200={sma200:.2f} sma_slope={slope:+.4f} close_vs_sma={vs_pct:+.3f}%"
+
+
+def _with_sma_context(market_context: str, snapshot: Dict[str, Any]) -> str:
+    fragment = _sma_log_fragment(snapshot)
+    text = (market_context or "").strip()
+    if fragment in text:
+        return text
+    return f"{text} {fragment}".strip() if text else fragment
+
+
 def _market_signature(snapshot: Dict[str, Any], side: str = "") -> str:
     rsi = _safe_float(snapshot.get("rsi", 50.0))
     bb = _safe_float(snapshot.get("bb_position", 0.5))
@@ -2192,14 +2311,49 @@ def _dedupe_learning_entry(entry: Dict[str, str]) -> Tuple[bool, float]:
     return best_ratio >= 0.8, best_ratio
 
 
+def _ensure_learning_csv_columns() -> None:
+    """기존 학습 CSV 헤더에 gross/net/fee 컬럼이 없으면 한 번 재작성한다."""
+    if not LEARNING_LOG_PATH.exists():
+        return
+    try:
+        with open(LEARNING_LOG_PATH, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            current = list(reader.fieldnames or [])
+            rows = [row for row in reader if row]
+    except OSError:
+        return
+    if current == LEARNING_FIELDNAMES:
+        return
+    try:
+        with open(LEARNING_LOG_PATH, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=LEARNING_FIELDNAMES,
+                extrasaction="ignore",
+                restval="",
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError:
+        return
+    _invalidate_learning_rows_cache()
+
+
 def _append_learning_entry(entry: Dict[str, str]) -> Tuple[bool, float]:
     duplicate, best_ratio = _dedupe_learning_entry(entry)
     if duplicate:
         return False, best_ratio
     LEARNING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     file_exists = LEARNING_LOG_PATH.exists()
+    if file_exists:
+        _ensure_learning_csv_columns()
     with open(LEARNING_LOG_PATH, "a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=LEARNING_FIELDNAMES)
+        writer = csv.DictWriter(
+            f,
+            fieldnames=LEARNING_FIELDNAMES,
+            extrasaction="ignore",
+            restval="",
+        )
         if not file_exists:
             writer.writeheader()
         writer.writerow(entry)
@@ -2230,7 +2384,12 @@ def _prune_learning_log(max_rows: int | None = None) -> int:
     keep = rows[-cap:]
     try:
         with open(LEARNING_LOG_PATH, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=LEARNING_FIELDNAMES)
+            writer = csv.DictWriter(
+                f,
+                fieldnames=LEARNING_FIELDNAMES,
+                extrasaction="ignore",
+                restval="",
+            )
             writer.writeheader()
             writer.writerows(keep)
     except OSError:
@@ -2418,15 +2577,20 @@ def _close_position(
     dry_run: bool = True,
 ) -> Dict[str, Any]:
     sym_ex = str(open_position.get("symbol", "")).strip()
+    close_orders: List[Dict[str, Any]] = []
+    close_client: Any = None
     if (
         not dry_run
         and sym_ex
         and _futures_client_from_env is not None
         and _market_close_symbol is not None
     ):
-        client = _futures_client_from_env()
-        if client is not None:
-            ok, msg = _market_close_symbol(client, sym_ex)
+        close_client = _futures_client_from_env()
+        if close_client is not None:
+            try:
+                ok, msg = _market_close_symbol(close_client, sym_ex, orders_out=close_orders)
+            except TypeError:
+                ok, msg = _market_close_symbol(close_client, sym_ex)
             if not ok:
                 logger.error("실전 청산 실패 %s: %s", sym_ex, msg)
                 _notify_kakao(
@@ -2448,12 +2612,37 @@ def _close_position(
     entry_price = _safe_float(open_position.get("entry_price", 0.0))
     exit_price = _safe_float(snapshot.get("price", 0.0))
     size = _safe_float(open_position.get("position_size", 0.0))
-    if side == "SELL":
-        pnl_usdt = (entry_price - exit_price) * size
-        price_move_pct = ((entry_price - exit_price) / entry_price * 100.0) if entry_price else 0.0
-    else:
-        pnl_usdt = (exit_price - entry_price) * size
-        price_move_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price else 0.0
+    exit_fee_usdt = None
+    if not dry_run and _resolve_order_commission_usdt is not None:
+        close_fee_parts: List[float] = []
+        for order in close_orders:
+            part = _resolve_order_commission_usdt(close_client, sym_ex, order)
+            got = _positive_fee_usdt(part)
+            if got is not None:
+                close_fee_parts.append(got)
+        if close_fee_parts:
+            exit_fee_usdt = sum(close_fee_parts)
+    realized = _compute_realized_pnl(
+        side=side,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        size=size,
+        entry_fee_usdt=_positive_fee_usdt(open_position.get("entry_fee_usdt")),
+        exit_fee_usdt=exit_fee_usdt,
+    )
+    pnl_usdt_gross = float(realized["pnl_usdt_gross"])
+    fee_usdt = float(realized["fee_usdt"])
+    fee_source = str(realized["fee_source"])
+    pnl_usdt = float(realized["pnl_usdt_net"])
+    price_move_pct = float(realized["price_move_pct"])
+    logger.info(
+        "청산 손익 trade_id=%s gross=%.6f fee=%.6f (%s) net=%.6f",
+        open_position.get("trade_id", ""),
+        pnl_usdt_gross,
+        fee_usdt,
+        fee_source,
+        pnl_usdt,
+    )
     pnl_krw = pnl_usdt * krw_per_usdt
     stats["virtual_balance_usdt"] = _safe_float(stats.get("virtual_balance_usdt", 0.0)) + pnl_usdt
     stats["virtual_balance_krw"] = _safe_float(stats.get("virtual_balance_krw", 0.0)) + pnl_krw
@@ -2485,6 +2674,10 @@ def _close_position(
         "exit_price": exit_price,
         "position_size": size,
         "pnl_usdt": pnl_usdt,
+        "pnl_usdt_gross": pnl_usdt_gross,
+        "pnl_usdt_net": pnl_usdt,
+        "fee_usdt": fee_usdt,
+        "fee_source": fee_source,
         "pnl_krw": pnl_krw,
         "price_move_pct": price_move_pct,
         "exit_reason": exit_reason,
@@ -2504,6 +2697,10 @@ def _close_position(
             "exit_price": exit_price,
             "position_size": size,
             "pnl_usdt": pnl_usdt,
+            "pnl_usdt_gross": pnl_usdt_gross,
+            "pnl_usdt_net": pnl_usdt,
+            "fee_usdt": fee_usdt,
+            "fee_source": fee_source,
             "pnl_krw": pnl_krw,
             "price_move_pct": price_move_pct,
             "decision_reason": open_position.get("decision_reason", ""),
@@ -2522,9 +2719,16 @@ def _close_position(
             "exit_price": f"{exit_price:.6f}",
             "price_move_pct": f"{price_move_pct:.4f}",
             "pnl_usdt": f"{pnl_usdt:.6f}",
+            "pnl_usdt_gross": f"{pnl_usdt_gross:.6f}",
+            "pnl_usdt_net": f"{pnl_usdt:.6f}",
+            "fee_usdt": f"{fee_usdt:.6f}",
+            "fee_source": fee_source,
             "pnl_krw": f"{pnl_krw:.2f}",
             "market_signature": _market_signature(entry_snapshot, side),
-            "market_context": reflection.get("market_context", ""),
+            "market_context": _with_sma_context(
+                str(reflection.get("market_context", "")),
+                entry_snapshot,
+            ),
             "failure_reason": reflection.get("failure_reason", ""),
             "reflection_summary": reflection.get("reflection_summary", ""),
             "warning": reflection.get("warning", ""),
@@ -2675,6 +2879,14 @@ def _open_position(
     oid = order.get("orderId")
     trade_id = str(oid) if oid is not None else ""
     entry_px, qty_eff = _live_entry_price_qty(order, snap_price, position_size)
+    entry_fee_usdt = None
+    if _resolve_order_commission_usdt is not None:
+        try:
+            entry_fee_usdt = _positive_fee_usdt(
+                _resolve_order_commission_usdt(client, symbol, order)
+            )
+        except Exception:
+            entry_fee_usdt = None
     tp = float(_build_take_profit(snapshot, decision["decision"]))
     position = {
         "trade_id": trade_id,
@@ -2691,6 +2903,7 @@ def _open_position(
         "position_size": qty_eff,
         "leverage": leverage,
         "notional_usdt": entry_px * qty_eff,
+        "entry_fee_usdt": entry_fee_usdt,
         "decision_reason": str(decision["reason"]),
         "confidence": float(decision["confidence"]),
         "similar_avg_pnl": float(similar_avg_pnl),
@@ -3481,6 +3694,7 @@ def _run_cycle_impl() -> Dict[str, Any]:
     raw_ai_decision = _apply_failure_similarity_guard(raw_ai_decision, memory_similarity, snapshot)
     raw_ai_decision = _apply_atr_entry_filter(raw_ai_decision, snapshot)
     raw_ai_decision = _apply_volume_entry_filter(raw_ai_decision, snapshot)
+    raw_ai_decision = _apply_ema_gap_entry_filter(raw_ai_decision, snapshot)
 
     live_wallet_usdt: float | None = None
     if not dry_run:

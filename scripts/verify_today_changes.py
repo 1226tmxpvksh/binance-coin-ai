@@ -724,6 +724,457 @@ def test_daily_report_survives_exception() -> None:
     ok("daily report exceptions are swallowed; last_report not marked on failure")
 
 
+def test_ema_gap_entry_filter_applies_in_live_env() -> None:
+    """AI_DRY_RUN=false 상태에서도 |EMA갭| < min 이면 HOLD. 설정값 자체는 바꾸지 않는다."""
+    import logging
+    import os
+    import re
+
+    import main_ai as m
+
+    env_path = m.LIVE_DIR / ".env"
+    env_text = env_path.read_text(encoding="utf-8-sig")
+    file_match = re.search(r"^AI_DRY_RUN=(.*)$", env_text, re.M)
+    file_raw = (file_match.group(1).strip().strip("'").strip('"') if file_match else "")
+    if file_raw.lower() not in {"0", "false", "no", "off"}:
+        fail("ema_gap_filter", f"expected .env AI_DRY_RUN=false unchanged, got {file_raw!r}")
+        return
+
+    m._load_env()
+    loaded = str(os.getenv("AI_DRY_RUN", "")).strip()
+    if loaded.lower() not in {"0", "false", "no", "off"}:
+        fail("ema_gap_filter", f"loaded AI_DRY_RUN is not false: {loaded!r}")
+        return
+
+    decision = {"decision": "BUY", "confidence": 0.82, "reason": "추세 정렬"}
+    weak = {"ema_gap_pct": 0.10}
+    strong = {"ema_gap_pct": 0.45}
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = _Capture(level=logging.INFO)
+    m.logger.addHandler(handler)
+    try:
+        with patch.object(m, "_min_ema_gap_pct", return_value=0.3):
+            held = m._apply_ema_gap_entry_filter(dict(decision), weak)
+            passed = m._apply_ema_gap_entry_filter(dict(decision), strong)
+            sell_held = m._apply_ema_gap_entry_filter(
+                {"decision": "SELL", "confidence": 0.8, "reason": "하락 추세"},
+                {"ema_gap_pct": -0.12},
+            )
+        with patch.object(m, "_env_bool", return_value=False), patch.object(
+            m, "_min_ema_gap_pct", return_value=0.3
+        ):
+            live_patched = m._apply_ema_gap_entry_filter(dict(decision), weak)
+    finally:
+        m.logger.removeHandler(handler)
+
+    after_file = env_path.read_text(encoding="utf-8-sig")
+    after_match = re.search(r"^AI_DRY_RUN=(.*)$", after_file, re.M)
+    after_raw = (after_match.group(1).strip().strip("'").strip('"') if after_match else "")
+    if after_raw != file_raw:
+        fail("ema_gap_filter", f".env AI_DRY_RUN mutated: {file_raw!r} -> {after_raw!r}")
+        return
+    if held.get("decision") != "HOLD":
+        fail("ema_gap_filter", f"live env weak gap should HOLD, got {held}")
+        return
+    if "EMA 갭 부족으로 진입 스킵" not in str(held.get("reason", "")):
+        fail("ema_gap_filter", f"missing skip reason: {held.get('reason')!r}")
+        return
+    skip_logs = [msg for msg in records if "EMA 갭 부족으로 진입 스킵" in msg]
+    if not skip_logs:
+        fail("ema_gap_filter", f"skip log not emitted: {records!r}")
+        return
+    if any("(paper)" in msg for msg in skip_logs):
+        fail("ema_gap_filter", f"log still has (paper) label: {skip_logs!r}")
+        return
+    if passed.get("decision") != "BUY":
+        fail("ema_gap_filter", f"strong gap should stay BUY, got {passed}")
+        return
+    if sell_held.get("decision") != "HOLD":
+        fail("ema_gap_filter", f"weak negative gap SELL should HOLD, got {sell_held}")
+        return
+    if live_patched.get("decision") != "HOLD":
+        fail("ema_gap_filter", f"_env_bool=false must still HOLD, got {live_patched}")
+        return
+    ok("ema gap filter HOLDs weak gap with AI_DRY_RUN=false; env value unchanged")
+
+
+def test_taker_fee_accounting_and_18_loss_backfill() -> None:
+    """pnl 회계만: 요율·주문 commission·18건 소급이 수동 계산(-38.31)과 맞는지."""
+    import csv
+    import os
+
+    import main_ai as m
+    from binance_futures_tools import extract_order_commission_usdt
+
+    extracted = extract_order_commission_usdt(
+        {"commission": "0.12", "commissionAsset": "USDT"}
+    )
+    if extracted is None or abs(extracted - 0.12) > 1e-9:
+        fail("taker_fee_extract", f"expected 0.12 from order.commission, got {extracted}")
+        return
+    from_fills = extract_order_commission_usdt(
+        {
+            "commission": "0.12",
+            "commissionAsset": "USDT",
+            "fills": [{"commission": "0.08", "commissionAsset": "USDT"}],
+        }
+    )
+    if from_fills is None or abs(from_fills - 0.08) > 1e-9:
+        fail("taker_fee_extract", f"fills should win without double-count, got {from_fills}")
+        return
+    if extract_order_commission_usdt({"commission": "0.00"}) is not None:
+        fail("taker_fee_extract", "zero commission must be treated as missing")
+        return
+    if extract_order_commission_usdt({"commission": "0.01", "commissionAsset": "BNB"}) is not None:
+        fail("taker_fee_extract", "BNB commission must fall back (None)")
+        return
+    ok("order commission extract uses USDT fills and ignores zero/BNB")
+
+    paper = m._compute_realized_pnl(
+        side="BUY",
+        entry_price=100_000.0,
+        exit_price=100_000.0,
+        size=0.01,
+        taker_rate=0.0004,
+    )
+    if abs(float(paper["fee_usdt"]) - 0.8) > 1e-9:
+        fail("taker_fee_paper", f"flat round-trip fee expected 0.8, got {paper['fee_usdt']}")
+        return
+    if abs(float(paper["pnl_usdt_net"]) + 0.8) > 1e-9:
+        fail("taker_fee_paper", f"net expected -0.8, got {paper['pnl_usdt_net']}")
+        return
+    if paper["pnl_usdt"] != paper["pnl_usdt_net"]:
+        fail("taker_fee_paper", "pnl_usdt must equal net")
+        return
+    if paper["fee_source"] != "rate_open+rate_close":
+        fail("taker_fee_paper", f"unexpected source {paper['fee_source']}")
+        return
+    ok("paper path subtracts the same taker rate on both legs")
+
+    live = m._compute_realized_pnl(
+        side="SELL",
+        entry_price=80_000.0,
+        exit_price=80_000.0,
+        size=0.01,
+        entry_fee_usdt=0.25,
+        exit_fee_usdt=0.31,
+        taker_rate=0.0004,
+    )
+    if abs(float(live["fee_usdt"]) - 0.56) > 1e-9:
+        fail("taker_fee_live", f"actual commissions 0.56 expected, got {live['fee_usdt']}")
+        return
+    if live["fee_source"] != "order_open+order_close":
+        fail("taker_fee_live", f"unexpected source {live['fee_source']}")
+        return
+    mixed = m._compute_realized_pnl(
+        side="BUY",
+        entry_price=50_000.0,
+        exit_price=50_000.0,
+        size=0.01,
+        entry_fee_usdt=0.3,
+        taker_rate=0.0004,
+    )
+    expected_mixed = 0.3 + abs(50_000.0 * 0.01) * 0.0004
+    if abs(float(mixed["fee_usdt"]) - expected_mixed) > 1e-9:
+        fail("taker_fee_live", f"mixed fee expected {expected_mixed}, got {mixed['fee_usdt']}")
+        return
+    ok("live path prefers order commission and estimates only the missing leg")
+
+    csv_path = ROOT / "btc_live_trading" / "ai_learning_logs.csv"
+    if not csv_path.exists():
+        fail("taker_fee_backfill", f"missing {csv_path}")
+        return
+    gross_sum = 0.0
+    net_sum = 0.0
+    fee_sum = 0.0
+    fee_2entry_sum = 0.0
+    n = 0
+    with csv_path.open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            side = str(row.get("side", "")).upper()
+            entry = float(row["entry_price"])
+            exitp = float(row["exit_price"])
+            old_pnl = float(row["pnl_usdt"])
+            dx = (entry - exitp) if side == "SELL" else (exitp - entry)
+            if abs(dx) < 1e-12:
+                fail("taker_fee_backfill", f"zero move on {row.get('trade_id')}")
+                return
+            size = old_pnl / dx
+            realized = m._compute_realized_pnl(
+                side=side,
+                entry_price=entry,
+                exit_price=exitp,
+                size=size,
+                taker_rate=0.0004,
+            )
+            gross_sum += float(realized["pnl_usdt_gross"])
+            net_sum += float(realized["pnl_usdt_net"])
+            fee_sum += float(realized["fee_usdt"])
+            fee_2entry_sum += 2.0 * abs(entry * size) * 0.0004
+            n += 1
+    if n != 18:
+        fail("taker_fee_backfill", f"expected 18 loss rows, got {n}")
+        return
+    if abs(gross_sum + 30.527047) > 0.001:
+        fail("taker_fee_backfill", f"gross sum {gross_sum:.6f} != logged -30.527047")
+        return
+    net_2entry = gross_sum - fee_2entry_sum
+    if abs(net_2entry + 38.31) > 0.01:
+        fail(
+            "taker_fee_backfill",
+            f"2*entry notional net {net_2entry:.6f} != -38.31",
+        )
+        return
+    if abs(net_sum + 38.31) > 0.05:
+        fail(
+            "taker_fee_backfill",
+            f"entry+exit notional net {net_sum:.6f} drifted from -38.31 (fee={fee_sum:.6f})",
+        )
+        return
+    ok(
+        f"18-loss backfill net={net_sum:.4f} USDT (2*entry {net_2entry:.4f}) matches -38.31"
+    )
+
+    now = datetime(2026, 9, 16, 12, 0, tzinfo=KST)
+    stats = {
+        "virtual_balance_usdt": 362.0,
+        "virtual_balance_krw": 500000.0,
+        "total_realized_pnl_usdt": 0.0,
+        "total_realized_pnl_krw": 0.0,
+        "monthly_realized_pnl_usdt": 0.0,
+        "monthly_realized_pnl_krw": 0.0,
+        "trade_count": 0,
+        "monthly_trade_count": 0,
+        "win_count": 0,
+        "monthly_win_count": 0,
+        "loss_count": 0,
+        "monthly_loss_count": 0,
+        "unique_failure_count": 0,
+        "open_position": None,
+    }
+    position = {
+        "trade_id": "PAPER-TEST-FEE",
+        "order_mode": "paper",
+        "symbol": "BTCUSDT",
+        "interval": "15m",
+        "side": "BUY",
+        "opened_at_kst": now.isoformat(),
+        "entry_price": 100000.0,
+        "position_size": 0.01,
+        "decision_reason": "test",
+        "entry_snapshot": {"price": 100000.0, "rsi": 50, "ema20": 1, "ema60": 1, "bb_position": 0.5, "atr_pct": 0.2, "ema_gap_pct": 0.4},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        trade_log = Path(tmp) / "virtual_trades.jsonl"
+        learn_log = Path(tmp) / "ai_learning_logs.csv"
+        with patch.object(m, "TRADE_LOG_PATH", trade_log), patch.object(
+            m, "LEARNING_LOG_PATH", learn_log
+        ), patch.object(m, "_binance_taker_fee_rate", return_value=0.0004), patch(
+            "ai_logic.decision_engine.analyze_trade_failure",
+            return_value={
+                "market_context": "x",
+                "failure_reason": "y",
+                "reflection_summary": "z",
+                "warning": "w",
+            },
+        ), patch.object(
+            m, "analyze_trade_failure",
+            return_value={
+                "market_context": "x",
+                "failure_reason": "y",
+                "reflection_summary": "z",
+                "warning": "w",
+            },
+        ):
+            result = m._close_position(
+                stats=stats,
+                open_position=position,
+                snapshot={"price": 100000.0},
+                now_kst=now,
+                krw_per_usdt=1300.0,
+                model="gpt-4o-mini",
+                exit_reason="test_fee",
+                dry_run=True,
+            )
+    ev = result.get("close_event") or {}
+    if abs(float(ev.get("pnl_usdt_gross", 0)) - 0.0) > 1e-9:
+        fail("taker_fee_close", f"gross expected 0, got {ev.get('pnl_usdt_gross')}")
+        return
+    if abs(float(ev.get("fee_usdt", 0)) - 0.8) > 1e-9:
+        fail("taker_fee_close", f"fee expected 0.8, got {ev.get('fee_usdt')}")
+        return
+    if abs(float(ev.get("pnl_usdt", 0)) + 0.8) > 1e-9:
+        fail("taker_fee_close", f"pnl_usdt(net) expected -0.8, got {ev.get('pnl_usdt')}")
+        return
+    if abs(float(stats["virtual_balance_usdt"]) - (362.0 - 0.8)) > 1e-9:
+        fail("taker_fee_close", f"ledger not updated with net: {stats['virtual_balance_usdt']}")
+        return
+    if stats.get("loss_count") != 1:
+        fail("taker_fee_close", "net loss must count as a loss")
+        return
+    ok("paper _close_position writes gross/net/fee and books net")
+
+    prev = os.getenv("BINANCE_TAKER_FEE_PCT")
+    os.environ["BINANCE_TAKER_FEE_PCT"] = "0.04"
+    try:
+        rate = m._binance_taker_fee_rate()
+    finally:
+        if prev is None:
+            os.environ.pop("BINANCE_TAKER_FEE_PCT", None)
+        else:
+            os.environ["BINANCE_TAKER_FEE_PCT"] = prev
+    if abs(rate - 0.0004) > 1e-12:
+        fail("taker_fee_env", f"0.04% should be 0.0004, got {rate}")
+        return
+    ok("BINANCE_TAKER_FEE_PCT=0.04 maps to rate 0.0004")
+
+
+def test_status_snapshot_and_mode_guards() -> None:
+    """실전 /status 잔고 경로, .env 한 줄 교체, live 확인 만료."""
+    import os
+
+    import mode_control as mc
+    import status_query as sq
+
+    stats = {
+        "initial_balance_krw": 500000.0,
+        "initial_balance_usdt": 362.0,
+        "virtual_balance_krw": 544853.96,
+        "virtual_balance_usdt": 394.0,
+        "total_realized_pnl_krw": 44853.96,
+        "monthly_realized_pnl_krw": 0.0,
+        "monthly_realized_pnl_usdt": 0.0,
+        "trade_count": 0,
+        "win_count": 0,
+        "loss_count": 0,
+        "run_count": 1,
+        "last_cycle_at_kst": "",
+        "open_position": None,
+    }
+    prev_dry = os.getenv("AI_DRY_RUN")
+    os.environ["AI_DRY_RUN"] = "false"
+    try:
+        with patch.object(sq, "load_trading_stats", return_value=stats), patch.object(
+            sq, "_live_futures_usdt", return_value=166.78
+        ), patch.object(sq, "_krw_per_usdt", return_value=1300.0):
+            live_snap = sq.build_status_snapshot()
+    finally:
+        if prev_dry is None:
+            os.environ.pop("AI_DRY_RUN", None)
+        else:
+            os.environ["AI_DRY_RUN"] = prev_dry
+    if abs(float(live_snap.get("balance_usdt") or 0) - 166.78) > 1e-9:
+        fail("status_live_bal", f"live USDT expected 166.78, got {live_snap.get('balance_usdt')}")
+        return
+    if live_snap.get("balance_source") != "binance_futures":
+        fail("status_live_bal", f"source={live_snap.get('balance_source')}")
+        return
+    if abs(float(live_snap.get("balance_krw") or 0) - 166.78 * 1300.0) > 0.01:
+        fail("status_live_bal", f"KRW mismatch {live_snap.get('balance_krw')}")
+        return
+    ok("live /status uses Binance futures wallet, not paper ledger")
+
+    os.environ["AI_DRY_RUN"] = "true"
+    called = {"live": False}
+
+    def _forbid_live() -> float:
+        called["live"] = True
+        return 166.78
+
+    try:
+        with patch.object(sq, "load_trading_stats", return_value=stats), patch.object(
+            sq, "_live_futures_usdt", side_effect=_forbid_live
+        ):
+            paper_snap = sq.build_status_snapshot()
+    finally:
+        if prev_dry is None:
+            os.environ.pop("AI_DRY_RUN", None)
+        else:
+            os.environ["AI_DRY_RUN"] = prev_dry
+    if called["live"]:
+        fail("status_paper_bal", "paper mode must not fetch futures wallet")
+        return
+    if paper_snap.get("balance_source") != "virtual_ledger":
+        fail("status_paper_bal", f"source={paper_snap.get('balance_source')}")
+        return
+    if abs(float(paper_snap.get("balance_krw") or 0) - 544853.96) > 0.01:
+        fail("status_paper_bal", f"paper KRW {paper_snap.get('balance_krw')}")
+        return
+    ok("paper /status keeps virtual_balance and skips exchange fetch")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        env_path = Path(tmp) / ".env"
+        env_path.write_text(
+            "# keep\nOTHER=1\nAI_DRY_RUN=true\nAI_SYMBOL=BTCUSDT\n",
+            encoding="utf-8",
+        )
+        before = env_path.read_text(encoding="utf-8")
+        ok_write, detail = mc.replace_ai_dry_run_line("false", path=env_path)
+        after = env_path.read_text(encoding="utf-8")
+        if not ok_write:
+            fail("mode_env_line", detail)
+            return
+        if "OTHER=1" not in after or "AI_SYMBOL=BTCUSDT" not in after or "# keep" not in after:
+            fail("mode_env_line", "other keys were rewritten")
+            return
+        if "AI_DRY_RUN=false" not in after or "AI_DRY_RUN=true" in after:
+            fail("mode_env_line", f"dry_run not switched: {after!r}")
+            return
+        if after.count("\n") != before.count("\n"):
+            fail("mode_env_line", "line count changed")
+            return
+        if mc.read_dry_run_from_env_file(env_path) is not False:
+            fail("mode_env_line", "file readback is not live")
+            return
+    ok("AI_DRY_RUN line-only replace leaves the rest of .env intact")
+
+    mc.clear_live_confirm()
+    mc.request_live_confirm(99, now=1000.0)
+    if mc.consume_live_confirm(99, now=1031.0) != "expired":
+        fail("mode_confirm", "30s window must expire")
+        return
+    mc.request_live_confirm(99, now=2000.0)
+    if mc.consume_live_confirm(7, now=2001.0) != "missing":
+        fail("mode_confirm", "other user must not confirm")
+        return
+    if mc.consume_live_confirm(99, now=2010.0) != "ok":
+        fail("mode_confirm", "owner confirm inside window failed")
+        return
+    prev_uid = os.getenv("DISCORD_AUTHORIZED_USER_ID")
+    os.environ["DISCORD_AUTHORIZED_USER_ID"] = "42"
+    try:
+        if not mc.is_authorized(42) or mc.is_authorized(7):
+            fail("mode_auth", "authorized id check failed")
+            return
+    finally:
+        if prev_uid is None:
+            os.environ.pop("DISCORD_AUTHORIZED_USER_ID", None)
+        else:
+            os.environ["DISCORD_AUTHORIZED_USER_ID"] = prev_uid
+    ok("live confirm is 30s + same user; unauthorized ids are rejected")
+
+    bot_src = (ROOT / "scripts" / "discord_bot.py").read_text(encoding="utf-8")
+    needed = [
+        'name="status", description="조회 전용, 현재 매매 상태·손익·포지션 확인"',
+        'name="health", description="조회 전용, 봇 프로세스 정상 동작 여부 확인"',
+        'name="mode", description="조회 전용, 현재 페이퍼/실전 모드 확인"',
+        'name="help", description="이 도움말"',
+        "live는 2단계 확인 필요",
+        "_help_embed",
+        "tree.get_commands()",
+    ]
+    missing = [item for item in needed if item not in bot_src]
+    if missing:
+        fail("help_cmds", f"missing {missing}")
+        return
+    ok("/help is generated from CommandTree; descriptions match required text")
+
+
 def main() -> int:
     print("=== verify_today_changes ===")
     test_daily_trade_summary()
@@ -741,6 +1192,9 @@ def main() -> int:
     test_exhausted_blocks_gate_despite_disk_tokens()
     test_recovery_does_not_fake_clear_on_disk_tokens()
     test_invalid_grant_listener_marks_exhausted()
+    test_ema_gap_entry_filter_applies_in_live_env()
+    test_taker_fee_accounting_and_18_loss_backfill()
+    test_status_snapshot_and_mode_guards()
     test_persist_tokens_validates_disk()
     test_omit_refresh_token_preserves_old()
     test_gate_skips_http_refresh()

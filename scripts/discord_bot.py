@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""디스코드 슬래시 명령어 봇 (조회 전용, 매매 루프와 분리).
+"""디스코드 슬래시 명령어 봇 (매매 루프와 분리).
 
-명령어:
-  /status  — 원장 기반 매매 상태 embed
-  /health  — last_cycle_at_kst 기준 지연 의
+조회: /status /health /mode /help
+모드: /setmode /confirm_live  (.env AI_DRY_RUN 한 줄만, 주문 API 없음)
 
 환경변수 (btc_live_trading/.env):
-  DISCORD_BOT_TOKEN   필수
-  DISCORD_GUILD_ID    권장 (길드 즉시 동기화)
+  DISCORD_BOT_TOKEN              필수
+  DISCORD_GUILD_ID               권장 (길드 즉시 동기화)
+  DISCORD_AUTHORIZED_USER_ID     /setmode · /confirm_live 허용 사용자
 
 실행:
   cd ~/Coin && source ~/venv/bin/activate
   python scripts/discord_bot.py
 
-※ 매매/주문/청산/토큰 쓰기 절대 금지. status_query 읽기만 사용.
+※ 매매/주문/청산 함수 호출 금지. 잔고는 status_query 읽기만.
+※ 실전 전환은 30초 /confirm_live 2단계. systemctl 재시작은 안내만.
 """
 
 from __future__ import annotations
@@ -33,6 +34,13 @@ if str(LIVE) not in sys.path:
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(LIVE / ".env", override=True)
+
+try:
+    import discord
+    from discord import app_commands
+except ImportError:  # discord.py 미설치 시 main()에서 안내
+    discord = None  # type: ignore[assignment]
+    app_commands = None  # type: ignore[assignment]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,8 +122,15 @@ def _status_embed(snap: dict):
         ),
         inline=False,
     )
+    source = str(snap.get("balance_source") or "")
+    if source == "binance_futures":
+        bal_name = "실잔고 (Binance USDT-M)"
+    elif snap.get("dry_run"):
+        bal_name = "가상 잔고 (원장)"
+    else:
+        bal_name = "잔고 (원장 폴백 · 선물조회 실패)"
     embed.add_field(
-        name="잔고(원장)",
+        name=bal_name,
         value=f"{_fmt_num(snap.get('balance_krw'))} KRW · {_fmt_num(snap.get('balance_usdt'))} USDT",
         inline=False,
     )
@@ -166,14 +181,76 @@ def _health_embed(health: dict, snap: dict):
     return embed
 
 
+_MUTATING_COMMANDS = {"setmode", "confirm_live"}
+_RESTART_HINT = (
+    "매매 봇(`coinbot.service`)은 재시작해야 새 모드를 읽습니다.\n"
+    "`sudo systemctl restart coinbot.service` 를 SSH에서 실행하세요.\n"
+    "(조회 봇 자동 재시작은 승인 전까지 넣지 않았습니다.)"
+)
+
+
+def _help_embed(tree) -> object:
+    import discord
+
+    commands = list(tree.get_commands())
+    commands.sort(key=lambda c: str(getattr(c, "name", "")))
+    ro_lines: list[str] = []
+    rw_lines: list[str] = []
+    for cmd in commands:
+        name = str(getattr(cmd, "name", "") or "")
+        desc = str(getattr(cmd, "description", "") or "").strip() or "(설명 없음)"
+        line = f"`/{name}` — {desc}"
+        if name in _MUTATING_COMMANDS:
+            rw_lines.append(f"⚠️ {line}")
+        else:
+            ro_lines.append(line)
+    embed = discord.Embed(
+        title="Coin 봇 명령어",
+        description="조회는 누구나, 모드 변경은 등록된 운영자만 가능합니다.",
+        color=0x5865F2,
+    )
+    if ro_lines:
+        embed.add_field(name="조회 전용", value="\n".join(ro_lines), inline=False)
+    if rw_lines:
+        embed.add_field(name="상태 변경", value="\n".join(rw_lines), inline=False)
+    embed.set_footer(text="목록은 등록된 슬래시 명령어에서 자동 생성")
+    return embed
+
+
+def _mode_embed(*, dry_run: bool | None, note: str = ""):
+    import discord
+
+    from mode_control import mode_label
+
+    live = dry_run is False
+    embed = discord.Embed(
+        title=f"모드 · {mode_label(dry_run)}",
+        description="`AI_DRY_RUN` (.env 파일 기준)",
+        color=0xED4245 if live else 0xFEE75C,
+    )
+    embed.add_field(
+        name="값",
+        value=f"`AI_DRY_RUN={'false' if live else 'true' if dry_run else '?'}`",
+        inline=False,
+    )
+    if note:
+        embed.add_field(name="안내", value=note, inline=False)
+    return embed
+
+
+def _deny_text() -> str:
+    from mode_control import authorized_user_id
+
+    if authorized_user_id() is None:
+        return "권한 없음 — `DISCORD_AUTHORIZED_USER_ID` 가 .env 에 없습니다."
+    return "권한 없음"
+
+
 def main() -> int:
     token = _require_token()
     guild_id = _guild_id()
 
-    try:
-        import discord
-        from discord import app_commands
-    except ImportError:
+    if discord is None or app_commands is None:
         print(
             "ERROR: discord.py 가 설치되어 있지 않습니다.\n"
             "  pip install 'discord.py>=2.3.0'",
@@ -181,6 +258,15 @@ def main() -> int:
         )
         return 2
 
+    from mode_control import (
+        CONFIRM_WINDOW_SEC,
+        append_mode_change_event,
+        consume_live_confirm,
+        is_authorized,
+        read_dry_run_from_env_file,
+        replace_ai_dry_run_line,
+        request_live_confirm,
+    )
     from status_query import assess_cycle_health, build_status_snapshot
 
     intents = discord.Intents.default()
@@ -188,7 +274,7 @@ def main() -> int:
     client = discord.Client(intents=intents)
     tree = app_commands.CommandTree(client)
 
-    @tree.command(name="status", description="실시간 매매 상태(원장 읽기 전용)")
+    @tree.command(name="status", description="조회 전용, 현재 매매 상태·손익·포지션 확인")
     async def status_cmd(interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         try:
@@ -198,7 +284,7 @@ def main() -> int:
             logger.exception("/status 실패")
             await interaction.followup.send(f"조회 실패: {type(exc).__name__}", ephemeral=True)
 
-    @tree.command(name="health", description="매매 루프 지연 여부(last_cycle 기준)")
+    @tree.command(name="health", description="조회 전용, 봇 프로세스 정상 동작 여부 확인")
     async def health_cmd(interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         try:
@@ -208,6 +294,126 @@ def main() -> int:
         except Exception as exc:
             logger.exception("/health 실패")
             await interaction.followup.send(f"조회 실패: {type(exc).__name__}", ephemeral=True)
+
+    @tree.command(name="mode", description="조회 전용, 현재 페이퍼/실전 모드 확인")
+    async def mode_cmd(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            dry_run = read_dry_run_from_env_file()
+            await interaction.followup.send(
+                embed=_mode_embed(dry_run=dry_run),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            logger.exception("/mode 실패")
+            await interaction.followup.send(f"조회 실패: {type(exc).__name__}", ephemeral=True)
+
+    @tree.command(
+        name="setmode",
+        description="모드 전환 (live는 2단계 확인 필요, 본인만 실행 가능)",
+    )
+    @app_commands.describe(mode="paper=가상(즉시) / live=실전(확인 필요)")
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="paper", value="paper"),
+            app_commands.Choice(name="live", value="live"),
+        ]
+    )
+    async def setmode_cmd(
+        interaction: discord.Interaction,
+        mode: app_commands.Choice[str],
+    ) -> None:
+        uid = interaction.user.id if interaction.user else None
+        if not is_authorized(uid):
+            await interaction.response.send_message(_deny_text(), ephemeral=True)
+            return
+        target = str(mode.value).strip().lower()
+        current = read_dry_run_from_env_file()
+        if target == "paper":
+            if current is True:
+                await interaction.response.send_message(
+                    embed=_mode_embed(dry_run=True, note="이미 페이퍼입니다."),
+                    ephemeral=True,
+                )
+                return
+            ok, detail = replace_ai_dry_run_line("true")
+            if not ok:
+                await interaction.response.send_message(f"전환 실패: {detail}", ephemeral=True)
+                return
+            append_mode_change_event(
+                previous="live" if current is False else "unknown",
+                next_mode="paper",
+                discord_user_id=uid,
+                extra={"via": "setmode", "env_write": detail},
+            )
+            logger.info("mode change paper by user_id=%s result=%s", uid, detail)
+            await interaction.response.send_message(
+                embed=_mode_embed(
+                    dry_run=True,
+                    note=f".env 를 페이퍼로 바꿨습니다.\n{_RESTART_HINT}",
+                ),
+                ephemeral=True,
+            )
+            return
+        if target == "live":
+            if current is False:
+                await interaction.response.send_message(
+                    embed=_mode_embed(dry_run=False, note="이미 실전입니다."),
+                    ephemeral=True,
+                )
+                return
+            request_live_confirm(int(uid))
+            await interaction.response.send_message(
+                "정말 실전으로 전환하시겠습니까?\n"
+                f"{int(CONFIRM_WINDOW_SEC)}초 안에 `/confirm_live` 를 입력하세요.\n"
+                "시간이 지나면 자동 취소됩니다. 실주문 모드입니다.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message("paper 또는 live 만 선택할 수 있습니다.", ephemeral=True)
+
+    @tree.command(name="confirm_live", description="실전 전환 확인 (30초, 본인만)")
+    async def confirm_live_cmd(interaction: discord.Interaction) -> None:
+        uid = interaction.user.id if interaction.user else None
+        if not is_authorized(uid):
+            await interaction.response.send_message(_deny_text(), ephemeral=True)
+            return
+        state = consume_live_confirm(int(uid))
+        if state == "missing":
+            await interaction.response.send_message(
+                "대기 중인 실전 전환이 없습니다. 먼저 `/setmode live` 를 실행하세요.",
+                ephemeral=True,
+            )
+            return
+        if state == "expired":
+            await interaction.response.send_message(
+                "확인 시간이 지났습니다. `/setmode live` 를 다시 실행하세요.",
+                ephemeral=True,
+            )
+            return
+        current = read_dry_run_from_env_file()
+        ok, detail = replace_ai_dry_run_line("false")
+        if not ok:
+            await interaction.response.send_message(f"전환 실패: {detail}", ephemeral=True)
+            return
+        append_mode_change_event(
+            previous="paper" if current is True else "unknown",
+            next_mode="live",
+            discord_user_id=uid,
+            extra={"via": "confirm_live", "env_write": detail},
+        )
+        logger.info("mode change live by user_id=%s result=%s", uid, detail)
+        await interaction.response.send_message(
+            embed=_mode_embed(
+                dry_run=False,
+                note=f"실전으로 전환했습니다.\n{_RESTART_HINT}",
+            ),
+            ephemeral=True,
+        )
+
+    @tree.command(name="help", description="이 도움말")
+    async def help_cmd(interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(embed=_help_embed(tree), ephemeral=True)
 
     @client.event
     async def on_ready() -> None:
@@ -227,9 +433,9 @@ def main() -> int:
         except Exception:
             logger.exception("슬래시 명령어 동기화 실패")
         user = client.user
-        logger.info("discord_bot ready as %s (읽기 전용, 매매 호출 없음)", user)
+        logger.info("discord_bot ready as %s (매매 호출 없음)", user)
 
-    logger.info("discord_bot 시작 (조회 전용)")
+    logger.info("discord_bot 시작")
     client.run(token, log_handler=None)
     return 0
 
