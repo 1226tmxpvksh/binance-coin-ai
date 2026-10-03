@@ -65,6 +65,7 @@ from reporting import (
     summarize_ledger,
 )
 from risk_guard import assess_trade_risk, ensure_min_stop_gap
+from buy_hold import format_hold_status, load_entry, trading_strategy
 
 try:
     from binance_futures_tools import (
@@ -2105,6 +2106,8 @@ def _format_open_position_console(open_position: Dict[str, Any]) -> str:
 
 
 def _format_cycle_dashboard(report: Dict[str, Any]) -> str:
+    if str(report.get("strategy") or "") == "buy_hold":
+        return "\n" + str(report.get("reason") or "현물 보유")
     market = report.get("market") if isinstance(report.get("market"), dict) else {}
     symbol = str(market.get("symbol", "BTCUSDT"))
     decision = str(report.get("decision", "HOLD")).upper()
@@ -3147,6 +3150,23 @@ def _send_startup_report() -> None:
         return
 
     _load_env()
+    if trading_strategy() != "active":
+        started_at = datetime.now(KST)
+        entry = load_entry()
+        body = "\n".join(
+            [
+                "━━━━━━━━━━━━━━━━━━━━",
+                "현물 보유 모드로 가동했습니다.",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"시스템 가동 시각: {started_at.strftime('%Y-%m-%d %H:%M:%S KST')}",
+                "TRADING_STRATEGY=buy_hold",
+                "진입 기록: 있음" if entry else "진입 기록: 없음",
+                "추가 매수, 매도, AI 호출은 하지 않습니다.",
+            ]
+        )
+        _notify_kakao("현물 보유 모드 시작", body, exempt_daily_limit=True)
+        STARTUP_REPORT_SENT = True
+        return
     if _hydrate_kakao_tokens is not None:
         _hydrate_kakao_tokens()
     health_ok = _check_project_connectivity()
@@ -3284,6 +3304,10 @@ def _graceful_shutdown_work(trigger: Any) -> None:
         return
     _GRACEFUL_SHUTDOWN_ONCE.set()
     _load_env()
+    if trading_strategy() != "active":
+        logger.info("종료 정리(%s): buy_hold — 선물 청산과 원장 포지션 삭제를 하지 않습니다.", trigger)
+        _shutdown_async_kakao()
+        return
     if _hydrate_kakao_tokens is not None:
         _hydrate_kakao_tokens()
     dry_run = _env_bool("AI_DRY_RUN", True)
@@ -3572,8 +3596,59 @@ def run_cycle() -> Dict[str, Any]:
         _CYCLE_LOCK.release()
 
 
+def _run_buy_hold_cycle() -> Dict[str, Any]:
+    """현물 보유. 판단 함수와 선물 주문을 호출하지 않는다."""
+    _load_env()
+    symbol = _env_str("AI_SYMBOL", "BTCUSDT")
+    interval = _env_str("AI_TIMEFRAME", "15m")
+    now_kst = datetime.now(KST)
+    krw_per_usdt = _krw_per_usdt()
+    initial_krw, initial_usdt = _initial_balances(krw_per_usdt)
+    stats = load_trading_stats(
+        initial_balance_krw=initial_krw,
+        initial_balance_usdt=initial_usdt,
+    )
+    stats["run_count"] = _safe_int(stats.get("run_count", 0)) + 1
+    stats["last_cycle_at_kst"] = now_kst.isoformat()
+    entry = load_entry()
+    price = 0.0
+    snapshot: Dict[str, Any] = {"symbol": symbol, "price": 0.0}
+    try:
+        fetched = fetch_market_snapshot(symbol=symbol, interval=interval)
+        if isinstance(fetched, dict):
+            snapshot = fetched
+            price = _safe_float(fetched.get("price"), 0.0)
+    except Exception as exc:
+        logger.warning("buy_hold 시세 조회 실패: %s", type(exc).__name__)
+    body = format_hold_status(entry, price)
+    if entry is None:
+        logger.warning("buy_hold: 진입 기록이 없습니다. scripts/buy_hold_enter.py 전에는 매수하지 않습니다.")
+    else:
+        logger.info("buy_hold 보유 수량=%s 현재가=%s", entry.get("qty_btc"), price)
+    status_report_minutes = _resolve_status_report_minutes()
+    if _should_send_periodic_report(stats, now_kst, status_report_minutes):
+        ok = _notify_kakao("보유 현황", body, daily_digest=True)
+        if ok:
+            stats["last_report_at_kst"] = now_kst.isoformat()
+            logger.info("보유 리포트 발송 완료 (KST %s)", now_kst.strftime("%Y-%m-%d %H:%M"))
+        else:
+            logger.warning("보유 리포트 발송 실패 — 다음 사이클에서 재시도합니다.")
+    save_trading_stats(stats)
+    return {
+        "decision": "HOLD",
+        "reason": body,
+        "confidence": 1.0,
+        "strategy": "buy_hold",
+        "market": snapshot,
+        "dry_run": True,
+        "estimated_tokens_saved": 0,
+    }
+
+
 def _run_cycle_impl() -> Dict[str, Any]:
     _load_env()
+    if trading_strategy() != "active":
+        return _run_buy_hold_cycle()
     if _hydrate_kakao_tokens is not None:
         _hydrate_kakao_tokens()
     if calculate_position_size is None:

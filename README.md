@@ -81,7 +81,7 @@ Coin/
 1. **거래소** — `BINANCE_API_KEY` / `SECRET`  
 2. **OpenAI** — API Key + 진입/모니터 모델명  
 3. **알림** — `NOTIFY_CHANNEL`, Discord 웹훅·봇 토큰, `DISCORD_AUTHORIZED_USER_ID`, `KAKAO_*`(레거시)  
-4. **매매 엔진** — `AI_DRY_RUN`, 심볼, 루프 초, 레버리지, 리스크 비율, 가상원금, `BINANCE_TAKER_FEE_PCT`  
+4. **매매 엔진** — `TRADING_STRATEGY`(`buy_hold` 기본, `active`는 기존 판단), `AI_DRY_RUN`, 심볼, 루프 초, 레버리지, 리스크 비율, 가상원금, `BINANCE_TAKER_FEE_PCT`, `BUY_HOLD_ALLOCATION_PCT`  
 5. **리스크/필터** — ATR, R/R, 거래량 게이트, 오답노트 유사도  
 6. **운영/로그** — 비용 추정, 트레이드/학습 로그 최대 줄 수  
 
