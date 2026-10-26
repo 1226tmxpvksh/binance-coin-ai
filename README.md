@@ -98,6 +98,27 @@ Coin/
 
 한쪽이 죽어도 다른 쪽에 영향 없도록 **분리**되어 있습니다.
 
+종료 알림은 봇 프로세스가 아니라 systemd `ExecStopPost`가 보냅니다. 유닛이 끝난 뒤 `scripts/notify_service_stop.py`가 `btc_live_trading/.env`의 디스코드 웹훅으로 한 건을 보냅니다. 프로세스가 SIGKILL이나 OOM으로 죽어도 systemd가 스크립트를 실행합니다.
+
+| `SERVICE_RESULT` | 알림 |
+|------------------|------|
+| `success` | 정상 종료(수동 stop/restart), 회색 |
+| `exit-code`, `signal`, `oom-kill`, `timeout`, `watchdog` 및 그 외 | 비정상 종료, 빨간색, 원인 값 표시 |
+
+메시지에는 서비스 이름, 종료 시각(KST), 호스트명, `EXIT_CODE`, `EXIT_STATUS`가 들어갑니다. 서버 전원 차단이나 네트워크 단절처럼 머신 자체가 응답하지 않으면 이 알림은 나가지 않습니다. 스크립트는 웹훅이 없거나 전송이 실패해도 종료코드 0으로 끝납니다.
+
+서버 반영은 root가 직접 합니다.
+
+```bash
+sudo cp /home/bot2/Coin/deploy/coinbot.service /etc/systemd/system/coinbot.service
+sudo cp /home/bot2/Coin/deploy/coinbot-discord-bot.service /etc/systemd/system/coinbot-discord-bot.service
+sudo systemctl daemon-reload
+sudo systemctl restart coinbot.service
+sudo systemctl restart coinbot-discord-bot.service
+```
+
+예시 유닛은 `deploy/coinbot.service`, `deploy/coinbot-discord-bot.service`입니다. `ExecStart` 경로는 [DEPLOY.md](DEPLOY.md)의 기존 유닛과 같습니다.
+
 ---
 
 ## 자주 쓰는 명령

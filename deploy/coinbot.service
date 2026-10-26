@@ -1,0 +1,16 @@
+[Unit]
+Description=AI BTC Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=bot2
+WorkingDirectory=/home/bot2/Coin/ai_trading
+ExecStart=/home/bot2/venv/bin/python main_ai.py
+Restart=always
+RestartSec=10
+# 프로세스 종료 후 systemd가 실행. SIGKILL/OOM에도 동작한다.
+ExecStopPost=/home/bot2/venv/bin/python /home/bot2/Coin/scripts/notify_service_stop.py coinbot
+
+[Install]
+WantedBy=multi-user.target
